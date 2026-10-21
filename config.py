@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Load and validate bonsai.toml, and hand values to the shell launcher.
+
+Usage (called by bonsai.sh):
+    config.py --shell        print `KEY=value` lines (shell-quoted) to eval
+    config.py --server-args  print llama-server arguments, one per line
+
+chat.py imports load() directly.
+"""
+from __future__ import annotations
+
+import os
+import shlex
+import sys
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+DEFAULTS: dict = {
+    "paths": {"root": "~/.local/share/bonsai"},
+    "build": {
+        "backend": "vulkan",
+        "repo": "https://github.com/PrismML-Eng/llama.cpp.git",
+        "ref": "prism",
+        "hip_target": "gfx1201",
+        "native": True,
+        "jobs": 0,
+    },
+    "model": {
+        "repo": "prism-ml/Ternary-Bonsai-2-27B-gguf",
+        "packing": "PQ2_0",
+        "vision": False,
+        "mmproj_file": "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+    },
+    "server": {
+        "host": "127.0.0.1",
+        "port": 8091,
+        "gpu_layers": 99,
+        "ctx_size": 65536,
+        "cache_type_k": "f16",
+        "cache_type_v": "f16",
+        "flash_attn": "on",
+        "parallel": 1,
+        "batch_size": 2048,
+        "ubatch_size": 512,
+        "threads": 0,
+        "startup_timeout": 300,
+        "extra_args": [],
+    },
+    "chat": {
+        "system_prompt": "You are a helpful assistant.",
+        "reasoning_effort": "medium",
+        "show_thinking": False,
+        "max_tokens": 16384,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.05,
+        "presence_penalty": 0.0,
+        "show_stats": True,
+    },
+}
+
+BACKENDS = {"vulkan", "hip", "cpu"}
+PACKINGS = {"PQ2_0", "PTQ1_0"}
+EFFORTS = {"none", "medium", "xhigh"}
+KV_TYPES = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
+FA_MODES = {"on", "off", "auto"}
+
+
+class ConfigError(Exception):
+    pass
+
+
+def _merge(base: dict, override: dict) -> dict:
+    out = {}
+    for section, defaults in base.items():
+        user = override.get(section, {})
+        if not isinstance(user, dict):
+            raise ConfigError(f"[{section}] must be a table")
+        unknown = set(user) - set(defaults)
+        if unknown:
+            raise ConfigError(f"unknown key(s) in [{section}]: {', '.join(sorted(unknown))}")
+        out[section] = {**defaults, **user}
+    unknown_sections = set(override) - set(base)
+    if unknown_sections:
+        raise ConfigError(f"unknown section(s): {', '.join(sorted(unknown_sections))}")
+    return out
+
+
+def _check(cond: bool, msg: str) -> None:
+    if not cond:
+        raise ConfigError(msg)
+
+
+def _validate(c: dict) -> None:
+    b, m, s, ch = c["build"], c["model"], c["server"], c["chat"]
+    _check(b["backend"] in BACKENDS, f"build.backend must be one of {sorted(BACKENDS)}")
+    _check(m["packing"] in PACKINGS, f"model.packing must be one of {sorted(PACKINGS)}")
+    _check(ch["reasoning_effort"] in EFFORTS,
+           f"chat.reasoning_effort must be one of {sorted(EFFORTS)} (the model's template rejects 'high'/'low')")
+    _check(s["cache_type_k"] in KV_TYPES and s["cache_type_v"] in KV_TYPES,
+           f"server.cache_type_k/v must be one of {sorted(KV_TYPES)}")
+    _check(s["flash_attn"] in FA_MODES, f"server.flash_attn must be one of {sorted(FA_MODES)}")
+    if s["cache_type_v"] not in ("f16", "f32", "bf16"):
+        _check(s["flash_attn"] != "off", "a quantized V cache needs server.flash_attn = 'on' or 'auto'")
+    _check(1 <= int(s["port"]) <= 65535, "server.port out of range")
+    _check(0 < int(s["ctx_size"]) <= 262144, "server.ctx_size must be 1..262144")
+    _check(int(s["parallel"]) >= 1, "server.parallel must be >= 1")
+    _check(int(s["ubatch_size"]) <= int(s["batch_size"]), "server.ubatch_size must be <= batch_size")
+    _check(isinstance(s["extra_args"], list) and all(isinstance(a, str) for a in s["extra_args"]),
+           "server.extra_args must be a list of strings")
+    _check(int(ch["max_tokens"]) > 0, "chat.max_tokens must be > 0")
+
+
+def load(path: str | os.PathLike | None = None) -> dict:
+    path = Path(path or os.environ.get("BONSAI_CONFIG") or HERE / "bonsai.toml")
+    if not path.exists():
+        raise ConfigError(f"config not found: {path}")
+    with open(path, "rb") as f:
+        try:
+            raw = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise ConfigError(f"{path}: {e}") from e
+    cfg = _merge(DEFAULTS, raw)
+    _validate(cfg)
+
+    # Derived values, so the shell and Python agree on every path.
+    root = Path(os.path.expanduser(cfg["paths"]["root"])).resolve()
+    m = cfg["model"]
+    model_file = f"Ternary-Bonsai-2-27B-{m['packing']}.gguf"
+    cfg["derived"] = {
+        "config_path": str(path.resolve()),
+        "root": str(root),
+        "src_dir": str(root / "llama.cpp"),
+        "build_dir": str(root / "llama.cpp" / f"build-{cfg['build']['backend']}"),
+        "server_bin": str(root / "llama.cpp" / f"build-{cfg['build']['backend']}" / "bin" / "llama-server"),
+        "model_dir": str(root / "models"),
+        "model_file": model_file,
+        "model_path": str(root / "models" / model_file),
+        "model_url": f"https://huggingface.co/{m['repo']}/resolve/main/{model_file}",
+        "mmproj_path": str(root / "models" / m["mmproj_file"]),
+        "mmproj_url": f"https://huggingface.co/{m['repo']}/resolve/main/{m['mmproj_file']}",
+        "log_dir": str(root / "logs"),
+        "history_dir": str(root / "history"),
+        "base_url": f"http://{cfg['server']['host']}:{cfg['server']['port']}",
+    }
+    return cfg
+
+
+def server_args(cfg: dict) -> list[str]:
+    s, d = cfg["server"], cfg["derived"]
+    args = [
+        "--model", d["model_path"],
+        "--host", s["host"],
+        "--port", str(s["port"]),
+        "--n-gpu-layers", str(s["gpu_layers"]),
+        "--ctx-size", str(s["ctx_size"]),
+        "--flash-attn", s["flash_attn"],
+        "--cache-type-k", s["cache_type_k"],
+        "--cache-type-v", s["cache_type_v"],
+        "--parallel", str(s["parallel"]),
+        "--batch-size", str(s["batch_size"]),
+        "--ubatch-size", str(s["ubatch_size"]),
+        "--jinja",
+        # Thinking arrives as a separate `reasoning_content` stream, so the
+        # client can hide or dim it.
+        "--reasoning-format", "deepseek",
+        # The template throws on efforts it doesn't know ("high"); map strays
+        # to medium instead of returning HTTP 500.
+        "--reasoning-effort-allow", "none,medium,xhigh",
+        "--reasoning-effort-fallback", "medium",
+        "--no-webui",
+        # Default CORS is '*', which lets any web page open in your browser
+        # call this server. Only allow localhost pages.
+        "--cors-origins", "localhost",
+    ]
+    if int(s["threads"]) > 0:
+        args += ["--threads", str(s["threads"])]
+    if cfg["model"]["vision"]:
+        args += ["--mmproj", d["mmproj_path"]]
+    args += s["extra_args"]
+    return args
+
+
+def shell_lines(cfg: dict) -> list[str]:
+    b, d, s, m = cfg["build"], cfg["derived"], cfg["server"], cfg["model"]
+    values = {
+        "CFG_BACKEND": b["backend"],
+        "CFG_REPO": b["repo"],
+        "CFG_REF": b["ref"],
+        "CFG_HIP_TARGET": b["hip_target"],
+        "CFG_NATIVE": "ON" if b["native"] else "OFF",
+        "CFG_JOBS": str(b["jobs"] or os.cpu_count() or 4),
+        "CFG_VISION": "1" if m["vision"] else "0",
+        "CFG_MODEL_REPO": m["repo"],
+        "CFG_STARTUP_TIMEOUT": str(s["startup_timeout"]),
+        **{f"CFG_{k.upper()}": str(v) for k, v in d.items()},
+    }
+    return [f"{k}={shlex.quote(v)}" for k, v in values.items()]
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2 or argv[1] not in ("--shell", "--server-args"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        cfg = load()
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return 1
+    lines = shell_lines(cfg) if argv[1] == "--shell" else server_args(cfg)
+    print("\n".join(lines))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

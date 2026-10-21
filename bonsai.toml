@@ -1,0 +1,117 @@
+# bonsai.toml — settings for bonsai.sh / chat.py
+#
+# Lines tagged  PERF  change speed or memory use. Defaults are tuned for an
+# AMD RX 9070 (16 GB VRAM, RDNA4 / gfx1201) on Linux Mint.
+
+[paths]
+# Everything (source, build, weights, logs, chat history) lives under here.
+# A leading ~ is expanded.
+root = "~/.local/share/bonsai"
+
+[build]
+# PERF: GPU backend for the C++ build.
+#   "vulkan" — Mesa RADV driver, no ROCm install needed. Community reports say
+#              it's the less painful route on RDNA4. Default.
+#   "hip"    — ROCm. Can be faster for prompt processing once it works, but
+#              needs the ROCm toolkit (hipcc) installed and matching your kernel.
+#   "cpu"    — fallback only; expect a few tokens/sec.
+backend = "vulkan"
+
+# PrismML's fork — stock llama.cpp can't run Bonsai 2 weights.
+repo = "https://github.com/PrismML-Eng/llama.cpp.git"
+# Branch, tag or commit. "prism" tracks their latest; pin a commit hash here
+# once you find a build you're happy with.
+ref = "prism"
+
+# PERF: AMD GPU architecture for the HIP backend. RX 9070 / 9070 XT = gfx1201.
+# Ignored for vulkan/cpu.
+hip_target = "gfx1201"
+
+# PERF: -march=native for the CPU code paths (AVX-512 on the 9800X3D).
+# Only matters for layers you don't offload; leave on unless you copy the
+# binary to another machine.
+native = true
+
+# Parallel compile jobs. 0 = all cores.
+jobs = 0
+
+[model]
+repo = "prism-ml/Ternary-Bonsai-2-27B-gguf"
+# PERF: packing. Same weights either way.
+#   "PQ2_0"  — 7.21 GB, faster prompt processing. PrismML's default. Default here.
+#   "PTQ1_0" — 5.95 GB, frees ~1.3 GB of VRAM for context.
+packing = "PQ2_0"
+
+# PERF: vision projector (screenshots/images). Costs VRAM and load time;
+# off by default since this setup is for code.
+vision = false
+mmproj_file = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
+
+[server]
+host = "127.0.0.1"   # keep on loopback; there's no auth
+port = 8091
+
+# PERF: layers on the GPU. 99 = all of them. The whole model fits in 16 GB,
+# so lower this only if you hit out-of-memory.
+gpu_layers = 99
+
+# PERF: context window in tokens (max 262144). FP16 KV cache costs ~64 KiB per
+# token: 65536 ≈ 4 GiB, which sits comfortably next to the 7.2 GB weights on a
+# 16 GB card. Raise it if you paste whole repos; lower it if the desktop
+# starts stuttering for VRAM.
+ctx_size = 65536
+
+# PERF: KV cache precision. "f16" is lossless. "q8_0" halves KV memory
+# (doubles the context you can fit) with a small quality cost; needs flash
+# attention on.
+cache_type_k = "f16"
+cache_type_v = "f16"
+
+# PERF: flash attention. "on" is faster and needed for quantized KV. Set
+# "auto" if your Vulkan driver misbehaves.
+flash_attn = "on"
+
+# PERF: one slot = one conversation gets the whole context. More slots split
+# ctx_size between them.
+parallel = 1
+
+# PERF: prompt-processing batch sizes. A bigger ubatch usually speeds up
+# reading long prompts on GPU at the cost of a little VRAM. 512 is safe;
+# try 1024 if prompt processing feels slow.
+batch_size = 2048
+ubatch_size = 512
+
+# CPU threads for whatever runs on CPU. 0 = let llama.cpp decide.
+threads = 0
+
+# Seconds to wait for the model to load before giving up.
+startup_timeout = 300
+
+# Anything else, passed straight through to llama-server.
+extra_args = []
+
+[chat]
+system_prompt = "You are a helpful assistant and an expert software engineer. Be concise and precise."
+
+# PERF: the biggest latency knob. Bonsai 2 thinks before it answers.
+#   "medium" — thinks noticeably less, about as accurate. Default.
+#   "xhigh"  — the model's own default; can think for many thousands of tokens.
+#   "none"   — no thinking; fastest, weakest on hard problems.
+# ("high" and "low" aren't accepted by this model's template.)
+reasoning_effort = "medium"
+
+# Show the model's thinking (dimmed) as it streams. Display only.
+show_thinking = false
+
+# Output cap per reply, thinking included. Too small and replies stop mid-thought.
+max_tokens = 16384
+
+# Sampling. These are PrismML's recommended thinking-mode values.
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.05
+presence_penalty = 0.0
+
+# Print speed and token counts after each reply.
+show_stats = true
