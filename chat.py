@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Terminal chat client for a local llama-server running Bonsai 2 27B.
 
-The heavy lifting (inference) happens in the C++ server; this is just I/O.
-Standard library only, so there's nothing to pip install.
+The heavy lifting (inference) happens in the C++ server; this is just I/O
+plus the tools the model can call on files in your workspace (the directory
+you start it from, or --workspace).
 
+Standard library only, so there's nothing to pip install.
 Type /help at the prompt for commands.
 """
 from __future__ import annotations
 
+import argparse
 import http.client
 import json
 import os
@@ -23,7 +26,9 @@ try:
 except ImportError:  # pragma: no cover
     readline = None
 
+import agent
 import config as bonsai_config
+from tools import Decision, Limits, ToolResult, Toolbox, Workspace, TOOL_SCHEMAS
 
 # ---------------------------------------------------------------- terminal ---
 
@@ -39,6 +44,7 @@ def bold(t: str) -> str: return _c("1", t)
 def cyan(t: str) -> str: return _c("36", t)
 def red(t: str) -> str: return _c("31", t)
 def green(t: str) -> str: return _c("32", t)
+def yellow(t: str) -> str: return _c("33", t)
 
 
 # Readline needs non-printing escapes wrapped in \001..\002 or the cursor drifts.
@@ -53,23 +59,24 @@ Commands:
   /effort none|medium|xhigh
                         how long the model thinks before answering
   /think                toggle showing the model's thinking
+  /tools                toggle file/run tools for this session
   /file PATH [PATH…]    attach file contents to your next message
   /system TEXT          replace the system prompt (clears the conversation)
-  /retry                regenerate the last reply
+  /retry                regenerate the last reply (file changes are not undone)
   /save [PATH]          write the conversation to a Markdown file
   /stats                context usage and last-reply speed
 
 Input:
   \"\"\"                   on its own line starts/ends a multi-line block
-  Ctrl-C                stops a reply mid-stream (that turn is discarded)
+  Ctrl-C                stops the current reply, tool or run (that turn is discarded)
 """
 
-
-# ------------------------------------------------------------------ client ---
 
 class Interrupted(Exception):
     pass
 
+
+# ------------------------------------------------------------------ client ---
 
 class Client:
     def __init__(self, base_url: str):
@@ -117,31 +124,184 @@ class Client:
             conn.close()
 
 
+# -------------------------------------------------------------- terminal UI ---
+
+def _short(value, n: int = 60) -> str:
+    s = value if isinstance(value, str) else json.dumps(value)
+    s = s.replace("\n", "⏎")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def describe_call(name: str, arguments: str) -> str:
+    """One readable line for a tool call, without dumping file contents."""
+    try:
+        args = json.loads(arguments or "{}")
+    except json.JSONDecodeError:
+        return f"{name}({_short(arguments)})"
+    parts = []
+    for k, v in args.items():
+        if k in ("content", "old_string", "new_string") and isinstance(v, str):
+            parts.append(f"{k}=<{len(v.splitlines()) or 1} lines>")
+        else:
+            parts.append(f"{k}={_short(v, 50)}")
+    return f"{name}({', '.join(parts)})"
+
+
+class TerminalUI:
+    """Renders the stream and tool activity (agent.AgentUI)."""
+
+    def __init__(self, show_thinking: bool):
+        self.show_thinking = show_thinking
+        self._reset()
+
+    def _reset(self):
+        self.started = time.monotonic()
+        self.thinking_chars = 0
+        self.thinking_open = False
+        self.status_shown = False
+        self.wrote_text = False
+
+    def _clear_status(self):
+        if self.status_shown:
+            sys.stdout.write("\r\033[K" if USE_COLOR else "\n")
+            self.status_shown = False
+
+    def reasoning(self, text: str) -> None:
+        self.thinking_chars += len(text)
+        if self.show_thinking:
+            if not self.thinking_open:
+                sys.stdout.write(dim("thinking: "))
+                self.thinking_open = True
+            sys.stdout.write(dim(text))
+        else:
+            secs = time.monotonic() - self.started
+            sys.stdout.write(f"\r{dim(f'thinking… {secs:4.0f}s, ~{self.thinking_chars // 4} tokens')}")
+            self.status_shown = True
+        sys.stdout.flush()
+
+    def text(self, text: str) -> None:
+        self._clear_status()
+        if self.thinking_open:
+            sys.stdout.write("\n\n")
+            self.thinking_open = False
+        self.wrote_text = True
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def end_message(self) -> None:
+        self._clear_status()
+        if self.wrote_text or self.thinking_open:
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+        self._reset()
+
+    def tool_call(self, name: str, arguments: str) -> None:
+        print(cyan("● ") + describe_call(name, arguments))
+
+    def tool_result(self, name: str, result: ToolResult) -> None:
+        lines = result.content.splitlines() or [""]
+        first = _short(lines[0], 100)
+        if result.content.startswith("error:"):
+            print("  " + red(first))
+        elif name == "run_file":
+            pass  # the output already streamed live
+        else:
+            extra = f"  (+{len(lines) - 1} lines)" if len(lines) > 1 else ""
+            print("  " + dim(first + extra))
+
+    def notice(self, message: str) -> None:
+        print(yellow(message))
+
+    def run_output(self, line: str) -> None:
+        print(dim("  │ ") + line)
+
+
+class TerminalApprover:
+    """Asks before anything changes on disk or runs (tools.Approver)."""
+
+    MAX_DIFF_LINES = 150
+
+    def approve_change(self, rel_path: str, diff: str, is_new: bool) -> Decision:
+        print()
+        print(bold(("Create " if is_new else "Edit ") + rel_path))
+        lines = diff.splitlines()
+        for line in lines[: self.MAX_DIFF_LINES]:
+            if line.startswith(("+++", "---")):
+                print(dim(line))
+            elif line.startswith("+"):
+                print(green(line))
+            elif line.startswith("-"):
+                print(red(line))
+            elif line.startswith("@@"):
+                print(cyan(line))
+            else:
+                print(line)
+        if len(lines) > self.MAX_DIFF_LINES:
+            print(dim(f"… {len(lines) - self.MAX_DIFF_LINES} more diff lines not shown"))
+        while True:
+            ans = input("Apply? [y]es / [n]o / [a]ll edits this session: ").strip().lower()
+            if ans in ("y", "yes"):
+                return Decision(True)
+            if ans in ("a", "all"):
+                return Decision(True, always=True)
+            if ans in ("n", "no"):
+                return Decision(False, input("Reason for the model (optional): ").strip())
+
+    def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int) -> Decision:
+        print()
+        print(bold(yellow(f"Run {rel_path}?")))
+        for step in steps:
+            print("  $ " + " ".join(step))
+        print(dim(f"  in {cwd}, killed after {timeout}s"))
+        ans = input("Run it? [y/N]: ").strip().lower()
+        if ans in ("y", "yes"):
+            return Decision(True)
+        return Decision(False, input("Reason for the model (optional): ").strip())
+
+
 # -------------------------------------------------------------------- chat ---
 
 class Chat:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, workspace: Path | None, tools_enabled: bool):
         self.cfg = cfg
         ch = cfg["chat"]
         self.client = Client(cfg["derived"]["base_url"])
         self.system_prompt = ch["system_prompt"]
         self.effort = ch["reasoning_effort"]
-        self.show_thinking = ch["show_thinking"]
+        self.ui = TerminalUI(ch["show_thinking"])
         self.messages: list[dict] = []
         self.pending_files: list[tuple[str, str]] = []
-        self.last_stats: dict = {}
+        self.last: agent.TurnResult | None = None
+        self.last_wall = 0.0
         self.ctx_used = 0
+        self.busy = False
         self.history_dir = Path(cfg["derived"]["history_dir"])
         self.history_dir.mkdir(parents=True, exist_ok=True)
 
+        self.toolbox: Toolbox | None = None
+        self.tools_enabled = False
+        if workspace is not None:
+            self.toolbox = Toolbox(
+                Workspace(workspace), TerminalApprover(),
+                Limits.from_config(cfg["tools"]),
+                log_dir=cfg["derived"]["log_dir"],
+                on_output=self.ui.run_output,
+            )
+            self.tools_enabled = tools_enabled
+
     # -- request -------------------------------------------------------------
 
-    def _body(self) -> dict:
+    def _system(self) -> str:
+        parts = [self.system_prompt] if self.system_prompt else []
+        if self.tools_enabled and self.toolbox:
+            parts.append(agent.TOOL_GUIDE.format(root=self.toolbox.ws.root))
+        return "\n\n".join(parts)
+
+    def _body(self, messages: list[dict], with_tools: bool) -> dict:
         ch = self.cfg["chat"]
-        msgs = [{"role": "system", "content": self.system_prompt}] if self.system_prompt else []
-        msgs += self.messages
-        return {
-            "messages": msgs,
+        system = self._system()
+        body = {
+            "messages": ([{"role": "system", "content": system}] if system else []) + messages,
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_tokens": ch["max_tokens"],
@@ -152,103 +312,81 @@ class Chat:
             "presence_penalty": ch["presence_penalty"],
             "reasoning_effort": self.effort,
             # PERF: reuse the KV cache for the unchanged prefix of the
-            # conversation, so each turn only processes the new tokens.
-            # Without this every turn re-reads the whole history.
+            # conversation, so each request only processes the new tokens.
+            # The tool definitions and system prompt sit in that prefix too.
             "cache_prompt": True,
         }
-
-    def _generate(self) -> str | None:
-        """Stream one reply. Returns the answer text, or None if interrupted."""
-        answer: list[str] = []
-        thinking_chars = 0
-        thinking_open = False
-        status_shown = False
-        t0 = time.monotonic()
-        first_token_at = None
-        timings, usage = {}, {}
-
-        def clear_status():
-            nonlocal status_shown
-            if status_shown:
-                sys.stdout.write("\r\033[K" if USE_COLOR else "\n")
-                status_shown = False
-
-        try:
-            for chunk in self.client.stream_chat(self._body()):
-                timings = chunk.get("timings") or timings
-                usage = chunk.get("usage") or usage
-                for choice in chunk.get("choices", []):
-                    delta = choice.get("delta") or {}
-                    think = delta.get("reasoning_content")
-                    text = delta.get("content")
-                    if think:
-                        thinking_chars += len(think)
-                        if self.show_thinking:
-                            if not thinking_open:
-                                sys.stdout.write(dim("thinking: "))
-                                thinking_open = True
-                            sys.stdout.write(dim(think))
-                        else:
-                            secs = time.monotonic() - t0
-                            sys.stdout.write(f"\r{dim(f'thinking… {secs:4.0f}s, ~{thinking_chars // 4} tokens')}")
-                            status_shown = True
-                        sys.stdout.flush()
-                    if text:
-                        if first_token_at is None:
-                            first_token_at = time.monotonic()
-                            clear_status()
-                            if thinking_open:
-                                sys.stdout.write("\n\n")
-                                thinking_open = False
-                        answer.append(text)
-                        sys.stdout.write(text)
-                        sys.stdout.flush()
-        except Interrupted:
-            clear_status()
-            print(red("\n[stopped]"))
-            return None
-        finally:
-            clear_status()
-
-        print()
-        self.last_stats = {
-            "wall_s": time.monotonic() - t0,
-            "ttft_s": (first_token_at - t0) if first_token_at else None,
-            "prompt_n": timings.get("prompt_n"),
-            "prompt_tps": timings.get("prompt_per_second"),
-            "gen_n": timings.get("predicted_n"),
-            "gen_tps": timings.get("predicted_per_second"),
-            "cache_n": timings.get("cache_n"),
-        }
-        if usage:
-            self.ctx_used = usage.get("total_tokens", 0)
-        if self.cfg["chat"]["show_stats"]:
-            self._print_stats(compact=True)
-        text = "".join(answer)
-        if not text.strip():
-            print(dim("(empty reply — if thinking ran long, raise chat.max_tokens or lower /effort)"))
-        return text
+        if self.tools_enabled and self.toolbox:
+            # Tool definitions stay in every request (even with tools switched
+            # off for the post-run explanation) so the cached prefix holds;
+            # "none" stops the model from calling them.
+            body["tools"] = TOOL_SCHEMAS
+            body["tool_choice"] = "auto" if with_tools else "none"
+        return body
 
     def _print_stats(self, compact: bool = False) -> None:
-        s = self.last_stats
         ctx = self.cfg["server"]["ctx_size"] // self.cfg["server"]["parallel"]
         pct = 100 * self.ctx_used / ctx if ctx else 0
         parts = []
-        if s.get("gen_tps"):
-            parts.append(f"{s['gen_tps']:.1f} tok/s")
-        if s.get("gen_n") is not None:
-            parts.append(f"{s['gen_n']} generated")
-        if s.get("prompt_tps") and s.get("prompt_n"):
-            parts.append(f"prompt {s['prompt_n']} @ {s['prompt_tps']:.0f} tok/s")
-        if s.get("cache_n"):
-            parts.append(f"{s['cache_n']} cached")
-        if s.get("ttft_s") is not None:
-            parts.append(f"answer after {s['ttft_s']:.1f}s")
+        t = self.last.timings if self.last else {}
+        if t.get("predicted_per_second"):
+            parts.append(f"{t['predicted_per_second']:.1f} tok/s")
+        if t.get("prompt_n") and t.get("prompt_per_second"):
+            parts.append(f"prompt {t['prompt_n']} @ {t['prompt_per_second']:.0f} tok/s")
+        if self.last and self.last.steps:
+            parts.append(f"{self.last.steps} tool step{'s' * (self.last.steps != 1)}")
+        if self.last:
+            parts.append(f"{self.last_wall:.1f}s")
         parts.append(f"ctx {self.ctx_used:,}/{ctx:,} ({pct:.0f}%)")
         line = " · ".join(parts)
         print(dim(line) if compact else line)
         if pct > 85:
             print(red("context nearly full — /save then /clear soon"))
+
+    # -- turn ----------------------------------------------------------------
+
+    def _reply(self) -> None:
+        print()
+        snapshot = len(self.messages) - 1  # index of this turn's user message
+        started = time.monotonic()
+        self.busy = True
+        try:
+            result = agent.run_turn(
+                self.messages, self._body, self.client.stream_chat,
+                self.toolbox if self.tools_enabled else None, self.ui,
+                max_steps=self.cfg["tools"]["max_steps"],
+            )
+        except Interrupted:
+            self.ui.end_message()
+            print(red("[stopped]"))
+            self._rollback(snapshot)
+        except (RuntimeError, OSError) as e:
+            self.ui.end_message()
+            print(red(f"error: {e}"))
+            if not self.client.healthy():
+                print(red("the server isn't responding — check the server log"))
+            self._rollback(snapshot)
+        else:
+            self.last = result
+            self.last_wall = time.monotonic() - started
+            if result.usage:
+                self.ctx_used = result.usage.get("total_tokens", self.ctx_used)
+            if result.hard_stopped:
+                print(dim("(code ran; tools stay off until your next message)"))
+            if self.cfg["chat"]["show_stats"]:
+                self._print_stats(compact=True)
+            if not result.text.strip():
+                print(dim("(empty reply — if thinking ran long, raise chat.max_tokens or lower /effort)"))
+        finally:
+            self.busy = False
+        print()
+
+    def _rollback(self, snapshot: int) -> None:
+        """Drop the interrupted turn so the history stays well-formed."""
+        changed = any(m.get("role") == "tool" for m in self.messages[snapshot:])
+        del self.messages[snapshot:]
+        if changed:
+            print(dim("note: any file changes made during that turn are still on disk"))
 
     # -- commands ------------------------------------------------------------
 
@@ -273,13 +411,34 @@ class Chat:
         if self.system_prompt:
             lines += ["**System:** " + self.system_prompt, ""]
         for m in self.messages:
-            who = "You" if m["role"] == "user" else "Bonsai"
-            lines += [f"## {who}", "", m["content"], ""]
+            role = m["role"]
+            if role == "user":
+                lines += ["## You", "", m["content"], ""]
+            elif role == "assistant":
+                if m.get("content"):
+                    lines += ["## Bonsai", "", m["content"], ""]
+                for tc in m.get("tool_calls") or []:
+                    fn = tc["function"]
+                    lines += [f"→ `{describe_call(fn['name'], fn['arguments'])}`", ""]
+            elif role == "tool":
+                body = m["content"]
+                if len(body) > 2000:
+                    body = body[:2000] + "\n…"
+                lines += ["```", body, "```", ""]
         try:
             path.write_text("\n".join(lines), encoding="utf-8")
             print(dim(f"saved {path}"))
         except OSError as e:
             print(red(f"save failed: {e}"))
+
+    def _clear(self) -> None:
+        self.messages.clear()
+        self.pending_files.clear()
+        self.ctx_used = 0
+        if self.toolbox:
+            # The model forgot what it read, so it has to read files again
+            # before editing them.
+            self.toolbox.reset()
 
     def command(self, line: str) -> bool:
         """Handle a slash command. Returns False to exit."""
@@ -290,9 +449,7 @@ class Chat:
         if cmd == "help":
             print(HELP)
         elif cmd == "clear":
-            self.messages.clear()
-            self.pending_files.clear()
-            self.ctx_used = 0
+            self._clear()
             print(dim("conversation cleared"))
         elif cmd == "effort":
             if arg in bonsai_config.EFFORTS:
@@ -301,8 +458,14 @@ class Chat:
             else:
                 print(red(f"usage: /effort {'|'.join(sorted(bonsai_config.EFFORTS))}  (now: {self.effort})"))
         elif cmd == "think":
-            self.show_thinking = not self.show_thinking
-            print(dim(f"show thinking: {'on' if self.show_thinking else 'off'}"))
+            self.ui.show_thinking = not self.ui.show_thinking
+            print(dim(f"show thinking: {'on' if self.ui.show_thinking else 'off'}"))
+        elif cmd == "tools":
+            if self.toolbox is None:
+                print(red("tools are unavailable in this session (started with --no-tools)"))
+            else:
+                self.tools_enabled = not self.tools_enabled
+                print(dim(f"tools: {'on' if self.tools_enabled else 'off'}  (workspace {self.toolbox.ws.root})"))
         elif cmd == "file":
             self._attach(arg.split())
         elif cmd == "system":
@@ -310,15 +473,15 @@ class Chat:
                 print(dim(f"system prompt: {self.system_prompt}"))
             else:
                 self.system_prompt = arg
-                self.messages.clear()
-                self.ctx_used = 0
+                self._clear()
                 print(dim("system prompt replaced; conversation cleared"))
         elif cmd == "retry":
-            if self.messages and self.messages[-1]["role"] == "assistant":
-                self.messages.pop()
-                self._reply()
-            else:
+            last_user = max((i for i, m in enumerate(self.messages) if m["role"] == "user"), default=None)
+            if last_user is None or last_user == len(self.messages) - 1:
                 print(red("nothing to retry"))
+            else:
+                self._rollback(last_user + 1)
+                self._reply()
         elif cmd == "save":
             self._save(arg)
         elif cmd == "stats":
@@ -328,21 +491,6 @@ class Chat:
         return True
 
     # -- loop ----------------------------------------------------------------
-
-    def _reply(self) -> None:
-        print()
-        try:
-            text = self._generate()
-        except (RuntimeError, OSError) as e:
-            print(red(f"\nerror: {e}"))
-            if not self.client.healthy():
-                print(red("the server isn't responding — check the server log"))
-            text = None
-        if text is None:
-            self.messages.pop()  # drop the user turn so history stays consistent
-        else:
-            self.messages.append({"role": "assistant", "content": text})
-        print()
 
     def _read_input(self) -> str | None:
         line = input(PROMPT)
@@ -364,8 +512,9 @@ class Chat:
                 pass
             readline.set_history_length(2000)
 
+        tools = f"tools on · {self.toolbox.ws.root}" if self.tools_enabled else "tools off"
         print(bold("Bonsai 2 27B") + dim(f"  ·  {self.cfg['derived']['base_url']}  ·  "
-                                         f"effort {self.effort}  ·  /help for commands"))
+                                         f"effort {self.effort}  ·  {tools}  ·  /help"))
         print()
         try:
             while True:
@@ -398,36 +547,50 @@ class Chat:
                     pass
 
 
-def main() -> int:
+def resolve_workspace(arg: str | None) -> Path:
+    root = Path(os.path.expanduser(arg)) if arg else Path.cwd()
+    root = root.resolve()
+    if not root.is_dir():
+        raise SystemExit(red(f"workspace is not a directory: {root}"))
+    if root == Path(root.anchor):
+        raise SystemExit(red("refusing to use the filesystem root as the workspace; "
+                             "cd into a project or pass --workspace"))
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Chat with the local Bonsai server.")
+    ap.add_argument("--workspace", "-w", help="directory the model's tools may access (default: current directory)")
+    ap.add_argument("--no-tools", action="store_true", help="plain chat: no file or run tools at all")
+    args = ap.parse_args(argv)
+
     try:
         cfg = bonsai_config.load()
     except bonsai_config.ConfigError as e:
         print(red(f"config error: {e}"), file=sys.stderr)
         return 1
 
-    # Ctrl-C during a reply raises Interrupted inside the stream loop; at the
-    # prompt, input() gets a normal KeyboardInterrupt.
+    workspace = None if args.no_tools else resolve_workspace(args.workspace)
+    if workspace is not None and workspace == Path.home().resolve():
+        print(yellow(f"warning: the workspace is your whole home directory ({workspace}); "
+                     "consider starting from a project folder"))
+
+    chat = Chat(cfg, workspace, tools_enabled=cfg["tools"]["enabled"])
+
+    # Ctrl-C while a turn is in progress (streaming, a tool, an approval
+    # prompt or a run) cancels the turn; at the prompt it just clears the line.
     def on_sigint(signum, frame):
-        if frame is not None and any(
-            f.f_code.co_name == "_generate" for f in _walk(frame)
-        ):
+        if chat.busy:
             raise Interrupted()
         raise KeyboardInterrupt()
 
     signal.signal(signal.SIGINT, on_sigint)
 
-    chat = Chat(cfg)
     if not chat.client.healthy():
         print(red(f"no server at {cfg['derived']['base_url']} — start it with ./bonsai.sh"), file=sys.stderr)
         return 1
     chat.run()
     return 0
-
-
-def _walk(frame):
-    while frame is not None:
-        yield frame
-        frame = frame.f_back
 
 
 if __name__ == "__main__":

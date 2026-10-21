@@ -60,6 +60,16 @@ DEFAULTS: dict = {
         "presence_penalty": 0.0,
         "show_stats": True,
     },
+    "tools": {
+        "enabled": True,
+        "approve_edits": "ask",
+        "max_steps": 25,
+        "max_read_lines": 400,
+        "max_output_chars": 20000,
+        "max_list_entries": 300,
+        "max_grep_matches": 100,
+        "run_timeout": 120,
+    },
 }
 
 BACKENDS = {"vulkan", "hip", "cpu"}
@@ -67,6 +77,7 @@ PACKINGS = {"PQ2_0", "PTQ1_0"}
 EFFORTS = {"none", "medium", "xhigh"}
 KV_TYPES = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
 FA_MODES = {"on", "off", "auto"}
+EDIT_APPROVALS = {"ask", "auto"}
 
 
 class ConfigError(Exception):
@@ -112,6 +123,12 @@ def _validate(c: dict) -> None:
     _check(isinstance(s["extra_args"], list) and all(isinstance(a, str) for a in s["extra_args"]),
            "server.extra_args must be a list of strings")
     _check(int(ch["max_tokens"]) > 0, "chat.max_tokens must be > 0")
+    t = c["tools"]
+    _check(t["approve_edits"] in EDIT_APPROVALS,
+           f"tools.approve_edits must be one of {sorted(EDIT_APPROVALS)} (running code always asks)")
+    for key in ("max_steps", "max_read_lines", "max_output_chars", "max_list_entries",
+                "max_grep_matches", "run_timeout"):
+        _check(isinstance(t[key], int) and t[key] > 0, f"tools.{key} must be a positive integer")
 
 
 def load(path: str | os.PathLike | None = None) -> dict:
