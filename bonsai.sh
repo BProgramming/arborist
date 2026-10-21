@@ -245,18 +245,24 @@ start_server() {
 }
 
 report_offload() {
-  # Surface the lines that tell you whether the GPU is actually doing the work.
-  local dev offload
-  dev="$(grep -m1 -iE 'ggml_vulkan: 0 =|ROCm devices|found [0-9]+ ROCm' "$SERVER_LOG" || true)"
-  offload="$(grep -m1 -E 'offloaded [0-9]+/[0-9]+ layers' "$SERVER_LOG" || true)"
-  [[ -n "$dev" ]] && info "${dev#*: }"
-  if [[ -n "$offload" ]]; then
+  # Surface the line that tells you whether the GPU is actually doing the work.
+  # (The fork logs the GPU's name only at debug level, so this is the one to use.)
+  [[ "$CFG_BACKEND" == cpu ]] && return 0
+  local offload="" _
+  # The server writes its log from a background thread; give it a moment.
+  for _ in {1..20}; do
+    offload="$(grep -m1 -E 'offloaded [0-9]+/[0-9]+ layers' "$SERVER_LOG" || true)"
+    [[ -n "$offload" ]] && break
+    sleep 0.25
+  done
+  if [[ -z "$offload" ]]; then
+    info "couldn't find the layer-offload line in the server log; if replies run at only a few"
+    info "tokens/sec, the GPU isn't being used (see $SERVER_LOG)"
+  elif [[ "$offload" =~ offloaded\ ([0-9]+)/([0-9]+) ]] && ((BASH_REMATCH[1] < BASH_REMATCH[2])); then
+    warn "only ${BASH_REMATCH[1]} of ${BASH_REMATCH[2]} layers are on the GPU — expect a large slowdown."
+    warn "Lower server.ctx_size or use the PTQ1_0 packing."
+  else
     info "${offload##*: }"
-    if [[ "$offload" =~ offloaded\ ([0-9]+)/([0-9]+) ]] && ((BASH_REMATCH[1] < BASH_REMATCH[2])); then
-      warn "not every layer is on the GPU — expect a large slowdown. Lower server.ctx_size or use the PTQ1_0 packing."
-    fi
-  elif [[ "$CFG_BACKEND" != cpu ]]; then
-    warn "couldn't confirm GPU offload; check $SERVER_LOG"
   fi
 }
 
