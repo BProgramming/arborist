@@ -1,0 +1,48 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Toolchains for the run_file tests. Rust (rustc/cargo) is preinstalled
+      # on GitHub's Ubuntu runners; tests for anything missing skip themselves.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: dart-lang/setup-dart@v1
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Show toolchains
+        run: |
+          python --version; node --version; rustc --version; cargo --version; dart --version
+
+      - name: Run tests
+        run: python -m pytest -v
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint bonsai.sh
+        run: shellcheck -S warning bonsai.sh

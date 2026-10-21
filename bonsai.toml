@@ -115,3 +115,27 @@ presence_penalty = 0.0
 
 # Print speed and token counts after each reply.
 show_stats = true
+
+[tools]
+# Let the model read, search, edit and create files in the directory you start
+# the chat from, and run single .py/.rs/.dart/.js/.ts files. /tools toggles
+# this mid-chat.
+enabled = true
+
+# Edits and new files: "ask" shows a diff and waits for y/n/a (a = yes to all
+# edits for the rest of the session); "auto" applies them without asking.
+# Running code ALWAYS asks first; that isn't configurable.
+approve_edits = "ask"
+
+# Tool round-trips allowed per message before the model must wrap up.
+max_steps = 25
+
+# PERF: everything a tool returns stays in the context window. These caps stop
+# one big file or search from eating it. ~4 characters per token.
+max_read_lines = 400
+max_output_chars = 20000
+max_list_entries = 300
+max_grep_matches = 100
+
+# Seconds a run (compile + execute) may take before it's killed.
+run_timeout = 120

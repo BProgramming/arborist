@@ -2,6 +2,8 @@
 # bonsai.sh — build, download and chat with Bonsai 2 27B locally.
 #
 #   ./bonsai.sh            set up anything missing, start the server, open a chat
+#                          (tools work on the current directory; pass
+#                          --workspace DIR or --no-tools to change that)
 #   ./bonsai.sh setup      build + download only
 #   ./bonsai.sh server     run the server in the foreground (for other clients)
 #   ./bonsai.sh update     pull the latest fork and rebuild
@@ -288,7 +290,7 @@ cmd_chat() {
   # Ctrl-C belongs to the chat client (it stops a reply); keep it from
   # killing this script while chat.py runs.
   trap '' INT
-  "$PY" "$HERE/chat.py" || true
+  "$PY" "$HERE/chat.py" "$@" || true
   trap 'exit 130' INT
 }
 
@@ -323,15 +325,22 @@ cmd_status() {
 main() {
   load_config
   STARTED_SERVER=0
-  case "${1:-chat}" in
-    chat)    cmd_chat ;;
+  local cmd="${1:-chat}"
+  # Options with no command go to the chat: ./bonsai.sh --workspace ~/proj
+  if [[ "$cmd" == -* && "$cmd" != -h && "$cmd" != --help ]]; then
+    cmd=chat
+  elif (($#)); then
+    shift
+  fi
+  case "$cmd" in
+    chat)    cmd_chat "$@" ;;
     setup)   setup; step "Ready. Run ./bonsai.sh to chat." ;;
     server)  cmd_server ;;
     update)  check_deps; fetch_source 1; build 1 ;;
     rebuild) check_deps; fetch_source 0; build 1 ;;
     status)  cmd_status ;;
     stop)    stop_server; info "stopped" ;;
-    -h|--help|help) sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+    -h|--help|help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command: $1 (try --help)" ;;
   esac
 }
