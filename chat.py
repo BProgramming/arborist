@@ -553,7 +553,7 @@ class Chat:
         print(dim(f"Model: Bonsai 2 27B"))
         print(dim(f"Server: {self.cfg['derived']['base_url']}"))
         print(dim(f"Effort: {self.effort}"))
-        print(dim(f"Tools: " + {"ON" if self.tools_enabled else "OFF"}))
+        print(dim(f"Tools: {"ON" if self.tools_enabled else "OFF"}"))
 
         try:
             while True:
