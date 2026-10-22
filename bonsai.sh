@@ -240,7 +240,9 @@ start_server() {
     sleep 1
     ((waited += 1))
   done
-  printf '\r    Loading model… Done.'
+  # \033[K clears the rest of the progress line; \n ends it so the next
+  # message starts on its own line.
+  printf '\r\033[K    Loading model… Done.\n'
   report_offload
 }
 
@@ -251,7 +253,8 @@ report_offload() {
   local offload="" _
   # The server writes its log from a background thread; give it a moment.
   for _ in {1..20}; do
-    offload="$(grep -m1 -E 'Offloaded [0-9]+/[0-9]+ layers' "$SERVER_LOG" || true)."
+    # Lowercase on purpose: this matches llama.cpp's own log text, not ours.
+    offload="$(grep -m1 -E 'offloaded [0-9]+/[0-9]+ layers' "$SERVER_LOG" || true)"
     [[ -n "$offload" ]] && break
     sleep 0.25
   done
