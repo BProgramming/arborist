@@ -550,9 +550,10 @@ class Chat:
                 pass
             readline.set_history_length(2000)
 
-        tools = "Tools:ON" if self.tools_enabled else "Tools:OFF"
-        model = "Bonsai 2 27B"
-        print(dim(f"Model:") + bold(f"{model}") + dim(f" · Server:{self.cfg['derived']['base_url']} · Effort:{self.effort} · {tools}\n"))
+        print(dim(f"Model: Bonsai 2 27B"))
+        print(dim(f"Server: {self.cfg['derived']['base_url']}"))
+        print(dim(f"Effort: {self.effort}"))
+        print(dim(f"Tools: " + {"ON" if self.tools_enabled else "OFF"}))
 
         try:
             while True:
