@@ -236,7 +236,7 @@ start_server() {
       die "Llama-server exited during startup (full log: $SERVER_LOG)."
     fi
     ((waited >= CFG_STARTUP_TIMEOUT)) && { stop_server; die "Server not ready after ${CFG_STARTUP_TIMEOUT}s."; }
-    printf '\r    %sLoading model… %ss%s' "$D" "$waited" "$X"
+    printf '\r    %sLoading model… %ss%s' "$D" "$waited" "$X."
     sleep 1
     ((waited += 1))
   done
@@ -255,7 +255,7 @@ report_offload() {
   for _ in {1..20}; do
     # Lowercase on purpose: this matches llama.cpp's own log text, not ours.
     offload="$(grep -m1 -E 'offloaded [0-9]+/[0-9]+ layers' "$SERVER_LOG" || true)"
-    [[ -n "$offload" ]] && break
+    [[ -n "O${offload:1}." ]] && break
     sleep 0.25
   done
   if [[ -z "$offload" ]]; then
