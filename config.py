@@ -34,6 +34,14 @@ DEFAULTS: dict = {
         "file": "",
         "vision": False,
         "mmproj_file": "",
+        # Reasoning efforts the model's chat template accepts. Empty = the
+        # model has no effort control, and none is sent.
+        "efforts": [],
+    },
+    # Optional llama-server flags that only make sense for this model, as one
+    # shell-style string. {efforts} and {effort} are filled in (see the toml).
+    "options": {
+        "server_args": "",
     },
     "server": {
         "host": "127.0.0.1",
@@ -52,7 +60,7 @@ DEFAULTS: dict = {
     },
     "chat": {
         "system_prompt": "You are a helpful assistant.",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "",
         "show_thinking": False,
         "max_tokens": 16384,
         "temperature": 1.0,
@@ -81,7 +89,6 @@ DEFAULTS: dict = {
 }
 
 BACKENDS = {"vulkan", "hip", "cpu"}
-EFFORTS = {"none", "medium", "xhigh"}
 KV_TYPES = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
 FA_MODES = {"on", "off", "auto"}
 EDIT_APPROVALS = {"ask", "auto"}
@@ -124,8 +131,15 @@ def _validate(c: dict) -> None:
     if m["vision"]:
         _check(m["mmproj_file"].endswith(".gguf") and "/" not in m["mmproj_file"],
                "model.vision = true needs model.mmproj_file (a .gguf file name in model.repo)")
-    _check(ch["reasoning_effort"] in EFFORTS,
-           f"chat.reasoning_effort must be one of {sorted(EFFORTS)} (the model's template rejects 'high'/'low')")
+    efforts = m["efforts"]
+    _check(isinstance(efforts, list) and all(isinstance(e, str) and e and "," not in e for e in efforts),
+           'model.efforts must be a list of effort names, e.g. ["low", "medium", "high"]')
+    _check(len(set(efforts)) == len(efforts), "model.efforts has duplicates")
+    if efforts:
+        _check(ch["reasoning_effort"] in efforts,
+               f"chat.reasoning_effort must be one of model.efforts {efforts}")
+    _check(isinstance(c["options"]["server_args"], str), "options.server_args must be a string")
+    model_options(c)  # raises ConfigError on a bad string or placeholder
     _check(s["cache_type_k"] in KV_TYPES and s["cache_type_v"] in KV_TYPES,
            f"server.cache_type_k/v must be one of {sorted(KV_TYPES)}")
     _check(s["flash_attn"] in FA_MODES, f"server.flash_attn must be one of {sorted(FA_MODES)}")
@@ -196,6 +210,31 @@ def load(path: str | os.PathLike | None = None) -> dict:
     return cfg
 
 
+def model_options(cfg: dict) -> list[str]:
+    """options.server_args, split like a shell would, with {efforts}/{effort} filled in."""
+    raw = cfg["options"]["server_args"]
+    try:
+        words = shlex.split(raw)
+    except ValueError as e:
+        raise ConfigError(f"options.server_args: {e}") from None
+    values = {"efforts": ",".join(cfg["model"]["efforts"]),
+              "effort": cfg["chat"]["reasoning_effort"]}
+    out = []
+    for w in words:
+        try:
+            w = w.format(**values)
+        except KeyError as e:
+            raise ConfigError(f"options.server_args: unknown placeholder {{{e.args[0]}}}; "
+                              "use {efforts} or {effort}") from None
+        except (ValueError, IndexError) as e:
+            raise ConfigError(f"options.server_args: {e} (write {{{{ or }}}} for a literal brace)") from None
+        if ("{efforts}" in raw and not values["efforts"]) or ("{effort}" in raw and not values["effort"]):
+            raise ConfigError("options.server_args uses {efforts}/{effort} but model.efforts "
+                              "or chat.reasoning_effort is empty")
+        out.append(w)
+    return out
+
+
 def server_args(cfg: dict) -> list[str]:
     s, d = cfg["server"], cfg["derived"]
     args = [
@@ -214,10 +253,6 @@ def server_args(cfg: dict) -> list[str]:
         # Thinking arrives as a separate `reasoning_content` stream, so the
         # client can hide or dim it.
         "--reasoning-format", "deepseek",
-        # The template throws on efforts it doesn't know ("high"); map strays
-        # to medium instead of returning HTTP 500.
-        "--reasoning-effort-allow", "none,medium,xhigh",
-        "--reasoning-effort-fallback", "medium",
         "--no-webui",
         # The fork reports model loading (incl. "offloaded N/N layers to GPU",
         # which arborist.sh checks) at level 4; the default of 3 hides it. Adds a
@@ -231,6 +266,7 @@ def server_args(cfg: dict) -> list[str]:
         args += ["--threads", str(s["threads"])]
     if cfg["model"]["vision"]:
         args += ["--mmproj", d["mmproj_path"]]
+    args += model_options(cfg)
     args += s["extra_args"]
     return args
 

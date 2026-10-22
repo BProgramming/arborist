@@ -58,8 +58,7 @@ Commands:
   /help                 this list
   /exit, /quit          leave (Ctrl-D works too)
   /clear                forget the conversation (keeps the system prompt)
-  /effort none|medium|xhigh
-                        how long the model thinks before answering
+  /effort LEVEL         how long the model thinks (levels: model.efforts)
   /think                toggle showing the model's thinking
   /tools                toggle file, run and web tools for this session
   /file PATH [PATH…]    attach file contents to your next message
@@ -442,7 +441,8 @@ class Chat:
         ch = cfg["chat"]
         self.client = Client(cfg["derived"]["base_url"])
         self.system_prompt = ch["system_prompt"]
-        self.effort = ch["reasoning_effort"]
+        self.efforts: list[str] = cfg["model"]["efforts"]
+        self.effort = ch["reasoning_effort"] if self.efforts else ""
         self.ui = TerminalUI(ch["show_thinking"])
         self.messages: list[dict] = []
         self.pending_files: list[tuple[str, str]] = []
@@ -505,12 +505,13 @@ class Chat:
             "top_k": ch["top_k"],
             "min_p": ch["min_p"],
             "presence_penalty": ch["presence_penalty"],
-            "reasoning_effort": self.effort,
             # PERF: reuse the KV cache for the unchanged prefix of the
             # conversation, so each request only processes the new tokens.
             # The tool definitions and system prompt sit in that prefix too.
             "cache_prompt": True,
         }
+        if self.effort:
+            body["reasoning_effort"] = self.effort
         tools = self.agent_tools
         if tools:
             # Tool definitions stay in every request (even with tools switched
@@ -683,11 +684,13 @@ class Chat:
             self._clear()
             print(dim("conversation cleared"))
         elif cmd == "effort":
-            if arg in model_config.EFFORTS:
+            if not self.efforts:
+                print(red(f"{self.model_name} has no effort levels (model.efforts is empty)"))
+            elif arg in self.efforts:
                 self.effort = arg
                 print(dim(f"reasoning effort: {arg}"))
             else:
-                print(red(f"usage: /effort {'|'.join(sorted(model_config.EFFORTS))}  (now: {self.effort})"))
+                print(red(f"usage: /effort {'|'.join(self.efforts)}  (now: {self.effort})"))
         elif cmd == "think":
             self.ui.show_thinking = not self.ui.show_thinking
             print(dim(f"show thinking: {'on' if self.ui.show_thinking else 'off'}"))
@@ -747,7 +750,7 @@ class Chat:
 
         print(dim(f"    Model:  {self.model_name}"))
         print(dim(f"    Server: {self.cfg['derived']['base_url']}"))
-        print(dim(f"    Effort: {self.effort}"))
+        print(dim(f"    Effort: {self.effort or 'n/a'}"))
         print(dim(f"    Tools:  {'ON' if self.tools_enabled else 'OFF'}"))
         n = len(self.memory.entries())
         print(dim(f"    Memory: {n} note{'s' * (n != 1)}"))

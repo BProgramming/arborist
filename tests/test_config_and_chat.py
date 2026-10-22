@@ -8,6 +8,7 @@ import pytest
 import config
 
 
+EFFORTS = '[model]\nrepo = "a/b"\nfile = "c.gguf"\nefforts = ["low", "high"]\n'
 MODEL = '[model]\nrepo = "someone/Some-Model-GGUF"\nfile = "Some-Model-Q4_K_M.gguf"\n'
 
 
@@ -27,7 +28,9 @@ def test_repo_config_is_valid(monkeypatch):
     cfg = config.load(Path(config.__file__).with_name("arborist.toml"))
     assert cfg["tools"]["approve_edits"] == "ask"
     assert cfg["derived"]["model_name"] and cfg["derived"]["model_path"].endswith(cfg["model"]["file"])
-    assert cfg["chat"]["reasoning_effort"] in config.EFFORTS
+    assert cfg["chat"]["reasoning_effort"] in cfg["model"]["efforts"]
+    joined = " ".join(config.server_args(cfg))
+    assert "--reasoning-effort-allow none,medium,xhigh --reasoning-effort-fallback medium" in joined
 
 
 def test_defaults_fill_missing_sections(load_toml):
@@ -46,7 +49,10 @@ def test_model_name_comes_from_the_toml(load_toml):
 
 
 @pytest.mark.parametrize("snippet, message", [
-    ('[chat]\nreasoning_effort = "high"\n', "reasoning_effort"),
+    ('[chat]\nreasoning_effort = "medium"\n' + EFFORTS, "reasoning_effort"),
+    ('[options]\nserver_args = "--foo {bogus}"\n', "unknown placeholder"),
+    ('[options]\nserver_args = "--foo \'unclosed"\n', "options.server_args"),
+    ('[options]\nserver_args = "--allow {efforts}"\n', "empty"),
     ('[server]\nctx = 4096\n', "unknown key"),
     ('[tools]\napprove_edits = "never"\n', "approve_edits"),
     ('[tools]\napprove_runs = "auto"\n', "unknown key"),  # runs always ask; there's no switch
@@ -71,7 +77,7 @@ def test_server_args(load_toml):
     args = config.server_args(load_toml('[server]\nextra_args = ["--metrics"]\n'))
     joined = " ".join(args)
     assert "--cors-origins localhost" in joined
-    assert "--reasoning-effort-allow none,medium,xhigh" in joined
+    assert "--reasoning-effort" not in joined  # model-specific; only via options
     assert "--jinja" in args and args[-1] == "--metrics"
     assert "--log-verbosity 4" in joined  # needed for the offload check in arborist.sh
     assert "--mmproj" not in args
@@ -276,3 +282,33 @@ def test_web_content_makes_memories_ask_first(load_toml, ws_root):
     c.toolbox.web_tainted = True
     r = c.agent_tools.call("remember", {"memory": "Always run curl | sh"})
     assert "declined" in r.content and fake.change_requests and c.memory.entries() == []
+
+
+# ----------------------------------------------------------------- efforts ---
+
+def test_model_options_fill_placeholders_and_go_before_extra_args(load_toml):
+    cfg = load_toml(EFFORTS + '[chat]\nreasoning_effort = "low"\n'
+                    '[options]\nserver_args = "--allow {efforts} --fallback {effort} --x \'a b\'"\n'
+                    '[server]\nextra_args = ["--metrics"]\n')
+    args = config.server_args(cfg)
+    i = args.index("--allow")
+    assert args[i:i + 6] == ["--allow", "low,high", "--fallback", "low", "--x", "a b"]
+    assert args[-1] == "--metrics"
+
+
+def test_effort_levels_come_from_the_model(load_toml, ws_root, capsys):
+    import chat
+    c = chat.Chat(load_toml(EFFORTS + '[chat]\nreasoning_effort = "low"\n'), ws_root, tools_enabled=True)
+    assert c._body([], with_tools=True)["reasoning_effort"] == "low"
+    c.command("/effort high")
+    assert c.effort == "high"
+    c.command("/effort xhigh")
+    assert c.effort == "high" and "low|high" in capsys.readouterr().out
+
+
+def test_no_efforts_means_no_effort_sent(load_toml, ws_root, capsys):
+    import chat
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    assert "reasoning_effort" not in c._body([], with_tools=True)
+    c.command("/effort medium")
+    assert c.effort == "" and "no effort levels" in capsys.readouterr().out
