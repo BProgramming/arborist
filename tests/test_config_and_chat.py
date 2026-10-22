@@ -263,12 +263,12 @@ def test_memory_command_searches(load_toml, ws_root, capsys):
     c.memory.add("Son is learning PyGame")
     c.memory.add("Prefers concise answers")
     capsys.readouterr()
-    assert c.command("/memory pygame")
+    assert c.command("/recall pygame")
     out = capsys.readouterr().out
     assert "PyGame" in out and "concise" not in out and "1 match" in out
-    c.command("/memory nothing-here")
+    c.command("/recall nothing-here")
     assert "no memories mention" in capsys.readouterr().out
-    c.command("/memory")
+    c.command("/recall")
     assert "2 memories in" in capsys.readouterr().out
 
 
