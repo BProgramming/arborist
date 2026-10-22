@@ -44,5 +44,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Lint bonsai.sh
-        run: shellcheck -S warning bonsai.sh
+      - name: Lint arborist.sh
+        run: shellcheck -S warning arborist.sh

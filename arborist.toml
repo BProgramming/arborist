@@ -1,11 +1,13 @@
-# bonsai.toml — settings for bonsai.sh / chat.py
+# arborist.toml — settings for arborist.sh / chat.py
 #
 # Lines tagged  PERF  change speed or memory use. Defaults are tuned for an
 # AMD RX 9070 (16 GB VRAM, RDNA4 / gfx1201) on Linux Mint.
 
 [paths]
-# Everything (source, build, weights, logs, chat history) lives under here.
-# A leading ~ is expanded.
+# Everything (source, build, weights, logs, chat history, memory) lives under
+# here. A leading ~ is expanded. (Kept at the old bonsai path so an existing
+# build and download are reused; the default for a fresh config is
+# ~/.local/share/arborist.)
 root = "~/.local/share/bonsai"
 
 [build]
@@ -36,16 +38,39 @@ native = true
 jobs = 0
 
 [model]
+# Shown in the chat banner and saved transcripts. Leave empty to use the file
+# name.
+name = "Bonsai 2 27B"
+
+# Hugging Face repo and the .gguf file in it to download and serve. Point
+# these at any GGUF model the llama.cpp build above can run.
 repo = "prism-ml/Ternary-Bonsai-2-27B-gguf"
-# PERF: packing. Same weights either way.
-#   "PQ2_0"  — 7.21 GB, faster prompt processing. PrismML's default. Default here.
-#   "PTQ1_0" — 5.95 GB, frees ~1.3 GB of VRAM for context.
-packing = "PQ2_0"
+# PERF: for Bonsai 2 the packing is in the file name. Same weights either way.
+#   Ternary-Bonsai-2-27B-PQ2_0.gguf  — 7.21 GB, faster prompt processing. PrismML's default.
+#   Ternary-Bonsai-2-27B-PTQ1_0.gguf — 5.95 GB, frees ~1.3 GB of VRAM for context.
+file = "Ternary-Bonsai-2-27B-PQ2_0.gguf"
+
+# Reasoning efforts this model's chat template accepts; /effort and
+# chat.reasoning_effort must use one of these. Leave empty ([]) for a model
+# without effort control, and no effort is sent.
+# Bonsai 2's template accepts only these three ("high" and "low" throw).
+efforts = ["none", "medium", "xhigh"]
 
 # PERF: vision projector (screenshots/images). Costs VRAM and load time;
 # off by default since this setup is for code.
 vision = false
 mmproj_file = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
+
+[options]
+# Optional llama-server flags that belong to this model rather than to your
+# hardware, as one string (quote with "..." like a shell). Swap them out with
+# the model. Placeholders: {efforts} = model.efforts joined with commas,
+# {effort} = chat.reasoning_effort. Leave "" for none. (For flags that don't
+# depend on the model, use server.extra_args.)
+#
+# Bonsai 2 (PrismML fork): the template throws on efforts it doesn't know, so
+# restrict them, and map strays to the default instead of an HTTP 500.
+server_args = "--reasoning-effort-allow {efforts} --reasoning-effort-fallback {effort}"
 
 [server]
 host = "127.0.0.1"   # keep on loopback; there's no auth
@@ -93,11 +118,11 @@ extra_args = []
 [chat]
 system_prompt = "You are a helpful assistant and an expert software engineer. Be concise and precise."
 
-# PERF: the biggest latency knob. Bonsai 2 thinks before it answers.
+# PERF: the biggest latency knob. Must be one of model.efforts (ignored if
+# that's empty). For Bonsai 2, which thinks before it answers:
 #   "medium" — thinks noticeably less, about as accurate. Default.
 #   "xhigh"  — the model's own default; can think for many thousands of tokens.
 #   "none"   — no thinking; fastest, weakest on hard problems.
-# ("high" and "low" aren't accepted by this model's template.)
 reasoning_effort = "medium"
 
 # Show the model's thinking (dimmed) as it streams. Display only.

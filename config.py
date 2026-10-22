@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Load and validate bonsai.toml, and hand values to the shell launcher.
+"""Load and validate arborist.toml, and hand values to the shell launcher.
 
-Usage (called by bonsai.sh):
+Usage (called by arborist.sh):
     config.py --shell        print `KEY=value` lines (shell-quoted) to eval
     config.py --server-args  print llama-server arguments, one per line
 
@@ -18,7 +18,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 DEFAULTS: dict = {
-    "paths": {"root": "~/.local/share/bonsai"},
+    "paths": {"root": "~/.local/share/arborist"},
     "build": {
         "backend": "vulkan",
         "repo": "https://github.com/PrismML-Eng/llama.cpp.git",
@@ -27,11 +27,21 @@ DEFAULTS: dict = {
         "native": True,
         "jobs": 0,
     },
+    # No default model: the toml has to say what to download and run.
     "model": {
-        "repo": "prism-ml/Ternary-Bonsai-2-27B-gguf",
-        "packing": "PQ2_0",
+        "name": "",
+        "repo": "",
+        "file": "",
         "vision": False,
-        "mmproj_file": "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+        "mmproj_file": "",
+        # Reasoning efforts the model's chat template accepts. Empty = the
+        # model has no effort control, and none is sent.
+        "efforts": [],
+    },
+    # Optional llama-server flags that only make sense for this model, as one
+    # shell-style string. {efforts} and {effort} are filled in (see the toml).
+    "options": {
+        "server_args": "",
     },
     "server": {
         "host": "127.0.0.1",
@@ -50,7 +60,7 @@ DEFAULTS: dict = {
     },
     "chat": {
         "system_prompt": "You are a helpful assistant.",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "",
         "show_thinking": False,
         "max_tokens": 16384,
         "temperature": 1.0,
@@ -79,8 +89,6 @@ DEFAULTS: dict = {
 }
 
 BACKENDS = {"vulkan", "hip", "cpu"}
-PACKINGS = {"PQ2_0", "PTQ1_0"}
-EFFORTS = {"none", "medium", "xhigh"}
 KV_TYPES = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
 FA_MODES = {"on", "off", "auto"}
 EDIT_APPROVALS = {"ask", "auto"}
@@ -114,9 +122,24 @@ def _check(cond: bool, msg: str) -> None:
 def _validate(c: dict) -> None:
     b, m, s, ch = c["build"], c["model"], c["server"], c["chat"]
     _check(b["backend"] in BACKENDS, f"build.backend must be one of {sorted(BACKENDS)}")
-    _check(m["packing"] in PACKINGS, f"model.packing must be one of {sorted(PACKINGS)}")
-    _check(ch["reasoning_effort"] in EFFORTS,
-           f"chat.reasoning_effort must be one of {sorted(EFFORTS)} (the model's template rejects 'high'/'low')")
+    for key in ("name", "repo", "file", "mmproj_file"):
+        _check(isinstance(m[key], str), f"model.{key} must be a string")
+    _check(m["repo"].count("/") == 1, 'model.repo must be a Hugging Face repo id, e.g. "owner/name-gguf"')
+    _check(m["file"].endswith(".gguf") and "/" not in m["file"],
+           'model.file must be a .gguf file name in model.repo, e.g. "Model-Q4_K_M.gguf"')
+    _check(isinstance(m["vision"], bool), "model.vision must be true or false")
+    if m["vision"]:
+        _check(m["mmproj_file"].endswith(".gguf") and "/" not in m["mmproj_file"],
+               "model.vision = true needs model.mmproj_file (a .gguf file name in model.repo)")
+    efforts = m["efforts"]
+    _check(isinstance(efforts, list) and all(isinstance(e, str) and e and "," not in e for e in efforts),
+           'model.efforts must be a list of effort names, e.g. ["low", "medium", "high"]')
+    _check(len(set(efforts)) == len(efforts), "model.efforts has duplicates")
+    if efforts:
+        _check(ch["reasoning_effort"] in efforts,
+               f"chat.reasoning_effort must be one of model.efforts {efforts}")
+    _check(isinstance(c["options"]["server_args"], str), "options.server_args must be a string")
+    model_options(c)  # raises ConfigError on a bad string or placeholder
     _check(s["cache_type_k"] in KV_TYPES and s["cache_type_v"] in KV_TYPES,
            f"server.cache_type_k/v must be one of {sorted(KV_TYPES)}")
     _check(s["flash_attn"] in FA_MODES, f"server.flash_attn must be one of {sorted(FA_MODES)}")
@@ -150,7 +173,7 @@ def _validate(c: dict) -> None:
 
 
 def load(path: str | os.PathLike | None = None) -> dict:
-    path = Path(path or os.environ.get("BONSAI_CONFIG") or HERE / "bonsai.toml")
+    path = Path(path or os.environ.get("ARBORIST_CONFIG") or HERE / "arborist.toml")
     if not path.exists():
         raise ConfigError(f"config not found: {path}")
     with open(path, "rb") as f:
@@ -164,13 +187,15 @@ def load(path: str | os.PathLike | None = None) -> dict:
     # Derived values, so the shell and Python agree on every path.
     root = Path(os.path.expanduser(cfg["paths"]["root"])).resolve()
     m = cfg["model"]
-    model_file = f"Ternary-Bonsai-2-27B-{m['packing']}.gguf"
+    model_file = m["file"]
     cfg["derived"] = {
         "config_path": str(path.resolve()),
         "root": str(root),
         "src_dir": str(root / "llama.cpp"),
         "build_dir": str(root / "llama.cpp" / f"build-{cfg['build']['backend']}"),
         "server_bin": str(root / "llama.cpp" / f"build-{cfg['build']['backend']}" / "bin" / "llama-server"),
+        # What the chat calls the model; the file name if the toml gives none.
+        "model_name": m["name"].strip() or Path(model_file).stem,
         "model_dir": str(root / "models"),
         "model_file": model_file,
         "model_path": str(root / "models" / model_file),
@@ -179,9 +204,35 @@ def load(path: str | os.PathLike | None = None) -> dict:
         "mmproj_url": f"https://huggingface.co/{m['repo']}/resolve/main/{m['mmproj_file']}",
         "log_dir": str(root / "logs"),
         "history_dir": str(root / "history"),
+        "memory_path": str(root / "memory" / "memory.md"),
         "base_url": f"http://{cfg['server']['host']}:{cfg['server']['port']}",
     }
     return cfg
+
+
+def model_options(cfg: dict) -> list[str]:
+    """options.server_args, split like a shell would, with {efforts}/{effort} filled in."""
+    raw = cfg["options"]["server_args"]
+    try:
+        words = shlex.split(raw)
+    except ValueError as e:
+        raise ConfigError(f"options.server_args: {e}") from None
+    values = {"efforts": ",".join(cfg["model"]["efforts"]),
+              "effort": cfg["chat"]["reasoning_effort"]}
+    out = []
+    for w in words:
+        try:
+            w = w.format(**values)
+        except KeyError as e:
+            raise ConfigError(f"options.server_args: unknown placeholder {{{e.args[0]}}}; "
+                              "use {efforts} or {effort}") from None
+        except (ValueError, IndexError) as e:
+            raise ConfigError(f"options.server_args: {e} (write {{{{ or }}}} for a literal brace)") from None
+        if ("{efforts}" in raw and not values["efforts"]) or ("{effort}" in raw and not values["effort"]):
+            raise ConfigError("options.server_args uses {efforts}/{effort} but model.efforts "
+                              "or chat.reasoning_effort is empty")
+        out.append(w)
+    return out
 
 
 def server_args(cfg: dict) -> list[str]:
@@ -202,13 +253,9 @@ def server_args(cfg: dict) -> list[str]:
         # Thinking arrives as a separate `reasoning_content` stream, so the
         # client can hide or dim it.
         "--reasoning-format", "deepseek",
-        # The template throws on efforts it doesn't know ("high"); map strays
-        # to medium instead of returning HTTP 500.
-        "--reasoning-effort-allow", "none,medium,xhigh",
-        "--reasoning-effort-fallback", "medium",
         "--no-webui",
         # The fork reports model loading (incl. "offloaded N/N layers to GPU",
-        # which bonsai.sh checks) at level 4; the default of 3 hides it. Adds a
+        # which arborist.sh checks) at level 4; the default of 3 hides it. Adds a
         # few lines per request to the log, nothing per token.
         "--log-verbosity", "4",
         # Default CORS is '*', which lets any web page open in your browser
@@ -219,6 +266,7 @@ def server_args(cfg: dict) -> list[str]:
         args += ["--threads", str(s["threads"])]
     if cfg["model"]["vision"]:
         args += ["--mmproj", d["mmproj_path"]]
+    args += model_options(cfg)
     args += s["extra_args"]
     return args
 
