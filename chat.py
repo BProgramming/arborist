@@ -17,6 +17,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -59,7 +60,7 @@ Commands:
   /effort none|medium|xhigh
                         how long the model thinks before answering
   /think                toggle showing the model's thinking
-  /tools                toggle file/run tools for this session
+  /tools                toggle file, run and web tools for this session
   /file PATH [PATH…]    attach file contents to your next message
   /system TEXT          replace the system prompt (clears the conversation)
   /retry                regenerate the last reply (file changes are not undone)
@@ -69,11 +70,15 @@ Commands:
 Input:
   \"\"\"                   on its own line starts/ends a multi-line block
   Ctrl-C                stops the current reply, tool or run (that turn is discarded)
+  A line starting with / is a command only if its first word has no other /,
+  so pasting a path like /etc/hosts sends it as a message. Use // to send a
+  message that starts with a command word (//help me → "/help me").
 """
 
 
-class Interrupted(Exception):
-    pass
+class Interrupted(BaseException):
+    """Ctrl-C during a turn. A BaseException (like KeyboardInterrupt) so that
+    the catch-all error handling in tools and turns lets it through."""
 
 
 # ------------------------------------------------------------------ client ---
@@ -118,7 +123,10 @@ class Client:
                 data = line[5:].strip()
                 if data == "[DONE]":
                     return
-                yield json.loads(data)
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError:
+                    raise RuntimeError(f"malformed data from the server: {data[:200]!r}") from None
         finally:
             # Closing mid-stream tells llama-server to stop generating.
             conn.close()
@@ -247,6 +255,16 @@ class TerminalApprover:
             if ans in ("n", "no"):
                 return Decision(False, input("Reason for the model (optional): ").strip())
 
+    def approve_fetch(self, host: str, url: str) -> Decision:
+        print()
+        print(bold(yellow(f"Allow web access to {host}?")))
+        print("  " + url)
+        print(dim("  approving covers this site for the rest of the session"))
+        ans = input("Fetch? [y/N]: ").strip().lower()
+        if ans in ("y", "yes"):
+            return Decision(True)
+        return Decision(False, input("Reason for the model (optional): ").strip())
+
     def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int) -> Decision:
         print()
         print(bold(yellow(f"Run {rel_path}?")))
@@ -286,6 +304,7 @@ class Chat:
                 Limits.from_config(cfg["tools"]),
                 log_dir=cfg["derived"]["log_dir"],
                 on_output=self.ui.run_output,
+                on_notice=self.ui.notice,
             )
             self.tools_enabled = tools_enabled
 
@@ -320,7 +339,7 @@ class Chat:
             # Tool definitions stay in every request (even with tools switched
             # off for the post-run explanation) so the cached prefix holds;
             # "none" stops the model from calling them.
-            body["tools"] = TOOL_SCHEMAS
+            body["tools"] = self.toolbox.schemas
             body["tool_choice"] = "auto" if with_tools else "none"
         return body
 
@@ -366,10 +385,19 @@ class Chat:
             if not self.client.healthy():
                 print(red("the server isn't responding — check the server log"))
             self._rollback(snapshot)
+        except Exception as e:
+            # Anything else is a bug here, not in the model. Keep the session.
+            self.ui.end_message()
+            log = self._log_error()
+            print(red(f"internal error: {type(e).__name__}: {e}"))
+            print(dim(f"traceback written to {log}; the conversation is intact, minus this turn"))
+            self._rollback(snapshot)
         else:
             self.last = result
             self.last_wall = time.monotonic() - started
             if result.usage:
+                # Size of the last request (prompt + reply). Slightly high for
+                # the next turn, since the template drops old replies' thinking.
                 self.ctx_used = result.usage.get("total_tokens", self.ctx_used)
             if result.hard_stopped:
                 print(dim("(code ran; tools stay off until your next message)"))
@@ -380,6 +408,16 @@ class Chat:
         finally:
             self.busy = False
         print()
+
+    def _log_error(self) -> Path | str:
+        try:
+            path = Path(self.cfg["derived"]["log_dir"]) / "chat-errors.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S}\n{traceback.format_exc()}\n")
+            return path
+        except OSError:
+            return "(couldn't write the log)"
 
     def _rollback(self, snapshot: int) -> None:
         """Drop the interrupted turn so the history stays well-formed."""
@@ -528,10 +566,12 @@ class Chat:
                     break
                 if line is None or not line.strip():
                     continue
-                if line.startswith("/"):
+                if is_command(line):
                     if not self.command(line.strip()):
                         break
                     continue
+                if line.startswith("//"):
+                    line = line[1:]
                 content = line
                 if self.pending_files:
                     parts = [f"<file path=\"{p}\">\n{t}\n</file>" for p, t in self.pending_files]
@@ -545,6 +585,14 @@ class Chat:
                     readline.write_history_file(hist)
                 except OSError:
                     pass
+
+
+def is_command(line: str) -> bool:
+    """'/clear' is a command; '/etc/hosts …' and '//help' are messages."""
+    if not line.startswith("/") or line.startswith("//"):
+        return False
+    first = line.split(maxsplit=1)[0]
+    return len(first) > 1 and "/" not in first[1:]
 
 
 def resolve_workspace(arg: str | None) -> Path:

@@ -358,11 +358,14 @@ def _plan_dart(path: Path, root: Path, build_dir: Path) -> RunPlan:
 # ------------------------------------------------------------- execution ---
 
 def execute(plan: RunPlan, log_dir: Path, timeout: int,
-            on_output: Callable[[str], None]) -> RunOutcome:
-    """Run each step with a shared timeout; combined output goes to a log file."""
+            on_output: Callable[[str], None], name: str = "run") -> RunOutcome:
+    """Run each step with a shared timeout; combined output goes to a log file.
+
+    `name` (usually the source file's stem) labels the log file.
+    """
     runs = log_dir / "runs"
     runs.mkdir(parents=True, exist_ok=True)
-    name = Path(plan.steps[-1][-1]).stem if plan.steps else "run"
+    name = re.sub(r"[^\w.-]", "_", name) or "run"
     log_path = runs / f"{datetime.now():%Y%m%d-%H%M%S}-{name}.log"
     # A compile step (rustc -o OUT) needs its output directory to exist.
     for step in plan.steps:

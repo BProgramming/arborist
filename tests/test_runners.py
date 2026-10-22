@@ -228,3 +228,22 @@ class TestDart:
         write(ws_root, "bin/main.dart", "void main() {}\n")
         report = make_toolbox().call("check_dependencies", {"path": "bin/main.dart"}).content
         assert "dart pub get" in report
+
+
+def test_run_output_fits_the_limit_and_keeps_its_instructions(ws_root, make_toolbox):
+    write(ws_root, "noisy.py", "for i in range(5000):\n    print('line', i)\n")
+    tb = make_toolbox(max_output_chars=2000)
+    _, result = check_and_run(tb, "noisy.py")
+    assert len(result.content) <= 2000
+    assert result.content.rstrip().endswith("Don't call any more tools.")
+    assert "line 4999" in result.content  # the end of the log is kept
+
+
+@needs("cargo")
+def test_cargo_run_log_is_named_after_the_file(ws_root, make_toolbox):
+    write(ws_root, "Cargo.toml", '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n')
+    write(ws_root, "src/main.rs", 'fn main() { println!("ok"); }\n')
+    tb = make_toolbox(run_timeout=180)
+    check_and_run(tb, "src/main.rs")
+    logs = [p.name for p in (tb.log_dir / "runs").glob("*.log")]
+    assert len(logs) == 1 and logs[0].endswith("-main.log")
