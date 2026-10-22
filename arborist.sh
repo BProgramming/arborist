@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# bonsai.sh — build, download and chat with Bonsai 2 27B locally.
+# arborist.sh — build, download and chat with a local GGUF model.
 #
-#   ./bonsai.sh            set up anything missing, start the server, open a chat
+#   ./arborist.sh          set up anything missing, start the server, open a chat
 #                          (tools work on the current directory; pass
 #                          --workspace DIR or --no-tools to change that)
-#   ./bonsai.sh setup      build + download only
-#   ./bonsai.sh server     run the server in the foreground (for other clients)
-#   ./bonsai.sh update     pull the latest fork and rebuild
-#   ./bonsai.sh rebuild    rebuild from the current source
-#   ./bonsai.sh status     show what's installed and whether a server is up
-#   ./bonsai.sh stop       stop a server this script left running
+#   ./arborist.sh setup    build + download only
+#   ./arborist.sh server   run the server in the foreground (for other clients)
+#   ./arborist.sh update   pull the latest fork and rebuild
+#   ./arborist.sh rebuild  rebuild from the current source
+#   ./arborist.sh status   show what's installed and whether a server is up
+#   ./arborist.sh stop     stop a server this script left running
 #
-# Settings live in bonsai.toml (or point BONSAI_CONFIG at another file).
-# Inference runs in C++ (PrismML's llama.cpp fork); config + chat are Python.
+# Settings, including which model, live in arborist.toml (or point
+# ARBORIST_CONFIG at another file). Inference runs in C++ (llama.cpp, or the
+# fork named in the toml); config + chat are Python.
 
 set -Eeuo pipefail
 
@@ -90,7 +91,7 @@ build_stamp() {
 fetch_source() {
   local update="${1:-0}"
   if [[ ! -d "$CFG_SRC_DIR/.git" ]]; then
-    step "Cloning PrismML llama.cpp fork ($CFG_REF)..."
+    step "Cloning $CFG_REPO ($CFG_REF)..."
     git clone --filter=blob:none "$CFG_REPO" "$CFG_SRC_DIR"
     update=1
   fi
@@ -103,7 +104,9 @@ fetch_source() {
 }
 
 build() {
-  local force="${1:-0}" stamp_file="$CFG_BUILD_DIR/.bonsai-stamp"
+  local force="${1:-0}" stamp_file="$CFG_BUILD_DIR/.build-stamp"
+  # Carry over the stamp from before the rename so it doesn't force a rebuild.
+  [[ -f "$CFG_BUILD_DIR/.bonsai-stamp" ]] && mv "$CFG_BUILD_DIR/.bonsai-stamp" "$stamp_file"
   if ((!force)) && [[ -x "$CFG_SERVER_BIN" && -f "$stamp_file" ]] \
      && [[ "$(cat "$stamp_file")" == "$(build_stamp)" ]]; then
     info "Llama-server is built and current (running via $CFG_BACKEND)."
@@ -320,9 +323,9 @@ cmd_status() {
     printf '%sbinary%s   Not built\n' "$B" "$X"
   fi
   if [[ -f "$CFG_MODEL_PATH" ]]; then
-    printf '%smodel%s    %s (%s)\n' "$B" "$X" "$CFG_MODEL_FILE" "$(du -h "$CFG_MODEL_PATH" | cut -f1)"
+    printf '%smodel%s    %s — %s (%s)\n' "$B" "$X" "$CFG_MODEL_NAME" "$CFG_MODEL_FILE" "$(du -h "$CFG_MODEL_PATH" | cut -f1)"
   else
-    printf '%smodel%s    Not downloaded\n' "$B" "$X"
+    printf '%smodel%s    %s — not downloaded\n' "$B" "$X" "$CFG_MODEL_NAME"
   fi
   if server_up; then
     printf '%sserver%s   %sUp%s at %s\n' "$B" "$X" "$G" "$X" "$CFG_BASE_URL"
@@ -335,7 +338,7 @@ main() {
   load_config
   STARTED_SERVER=0
   local cmd="${1:-chat}"
-  # Options with no command go to the chat: ./bonsai.sh --workspace ~/proj
+  # Options with no command go to the chat: ./arborist.sh --workspace ~/proj
   if [[ "$cmd" == -* && "$cmd" != -h && "$cmd" != --help ]]; then
     cmd=chat
   elif (($#)); then
@@ -343,13 +346,13 @@ main() {
   fi
   case "$cmd" in
     chat)    cmd_chat "$@" ;;
-    setup)   setup; step "Ready. Run ./bonsai.sh to chat." ;;
+    setup)   setup; step "Ready. Run ./arborist.sh to chat." ;;
     server)  cmd_server ;;
     update)  check_deps; fetch_source 1; build 1 ;;
     rebuild) check_deps; fetch_source 0; build 1 ;;
     status)  cmd_status ;;
     stop)    stop_server; info "Stopped" ;;
-    -h|--help|help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+    -h|--help|help) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
     *) die "Unknown command: $1 (try --help)." ;;
   esac
 }
