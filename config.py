@@ -69,6 +69,12 @@ DEFAULTS: dict = {
         "max_list_entries": 300,
         "max_grep_matches": 100,
         "run_timeout": 120,
+        "web_enabled": True,
+        "web_allowed_hosts": [],
+        "web_page_chars": 12000,
+        "web_max_pages": 25,
+        "web_max_depth": 2,
+        "web_timeout": 15,
     },
 }
 
@@ -127,8 +133,20 @@ def _validate(c: dict) -> None:
     _check(t["approve_edits"] in EDIT_APPROVALS,
            f"tools.approve_edits must be one of {sorted(EDIT_APPROVALS)} (running code always asks)")
     for key in ("max_steps", "max_read_lines", "max_output_chars", "max_list_entries",
-                "max_grep_matches", "run_timeout"):
-        _check(isinstance(t[key], int) and t[key] > 0, f"tools.{key} must be a positive integer")
+                "max_grep_matches", "run_timeout", "web_page_chars", "web_max_pages", "web_timeout"):
+        _check(isinstance(t[key], int) and not isinstance(t[key], bool) and t[key] > 0,
+               f"tools.{key} must be a positive integer")
+    # Below this a run's log has no room next to its header and instructions.
+    _check(t["max_output_chars"] >= 2000, "tools.max_output_chars must be at least 2000")
+    _check(t["web_page_chars"] <= t["max_output_chars"],
+           "tools.web_page_chars must not exceed tools.max_output_chars")
+    _check(isinstance(t["web_max_depth"], int) and 0 <= t["web_max_depth"] <= 5,
+           "tools.web_max_depth must be 0..5")
+    _check(t["web_max_pages"] <= 200, "tools.web_max_pages must be at most 200")
+    _check(isinstance(t["web_enabled"], bool), "tools.web_enabled must be true or false")
+    _check(isinstance(t["web_allowed_hosts"], list) and all(
+        isinstance(h, str) and h and "/" not in h for h in t["web_allowed_hosts"]),
+        "tools.web_allowed_hosts must be a list of host names, e.g. [\"docs.python.org\"]")
 
 
 def load(path: str | os.PathLike | None = None) -> dict:
@@ -189,6 +207,10 @@ def server_args(cfg: dict) -> list[str]:
         "--reasoning-effort-allow", "none,medium,xhigh",
         "--reasoning-effort-fallback", "medium",
         "--no-webui",
+        # The fork reports model loading (incl. "offloaded N/N layers to GPU",
+        # which bonsai.sh checks) at level 4; the default of 3 hides it. Adds a
+        # few lines per request to the log, nothing per token.
+        "--log-verbosity", "4",
         # Default CORS is '*', which lets any web page open in your browser
         # call this server. Only allow localhost pages.
         "--cors-origins", "localhost",
