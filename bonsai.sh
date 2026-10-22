@@ -255,7 +255,7 @@ report_offload() {
   for _ in {1..20}; do
     # Lowercase on purpose: this matches llama.cpp's own log text, not ours.
     offload="$(grep -m1 -E 'offloaded [0-9]+/[0-9]+ layers' "$SERVER_LOG" || true)"
-    [[ -n "O${offload:1}." ]] && break
+    [[ -n "$offload" ]] && break
     sleep 0.25
   done
   if [[ -z "$offload" ]]; then
@@ -264,7 +264,8 @@ report_offload() {
     warn "Only ${BASH_REMATCH[1]} of ${BASH_REMATCH[2]} layers are on the GPU — expect a large slowdown."
     warn "Lower server.ctx_size or use the PTQ1_0 packing."
   else
-    info "${offload##*: }"
+    local clean_text="offloaded${offload#*offloaded}"
+    info "O${clean_text:1}."
   fi
 }
 
