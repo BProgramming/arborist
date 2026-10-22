@@ -139,3 +139,17 @@ max_grep_matches = 100
 
 # Seconds a run (compile + execute) may take before it's killed.
 run_timeout = 120
+
+# Web: fetch_url reads one page; crawl_docs follows links under the same
+# directory of a docs site. The first request to each site asks you first
+# (web_allowed_hosts skips that). Private/LAN addresses are always refused,
+# and once a page is in the conversation, edits ask again even in "auto" mode.
+web_enabled = true
+web_allowed_hosts = []          # e.g. ["docs.python.org", "doc.rust-lang.org"]
+
+# PERF: characters of a page returned per fetch_url call (~4 chars/token).
+web_page_chars = 12000
+# Hard caps on a crawl, whatever the model asks for.
+web_max_pages = 25
+web_max_depth = 2
+web_timeout = 15                # seconds per request

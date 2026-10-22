@@ -234,3 +234,57 @@ class TestDispatch:
         write(ws_root, "big.txt", "x" * 5000)
         out = make_toolbox(max_output_chars=1000).call("read_file", {"path": "big.txt"}).content
         assert len(out) < 1200 and "characters omitted" in out
+
+
+# ------------------------------------------- robustness (from Bonsai's review) ---
+
+class TestRobustness:
+    @pytest.mark.parametrize("args, message", [
+        ({"offset": "abc"}, "offset must be a whole number"),
+        ({"offset": True}, "offset must be a whole number"),
+        ({"limit": -5}, "limit must be at least 1"),
+        ({"limit": "lots"}, "limit must be a whole number"),
+        ({"offset": None}, "offset must be a whole number"),
+    ])
+    def test_bad_numbers_are_errors_not_crashes(self, ws_root, make_toolbox, args, message):
+        write(ws_root, "a.py", "one\ntwo\n")
+        out = make_toolbox().call("read_file", {"path": "a.py", **args}).content
+        assert out.startswith("error:") and message in out
+
+    def test_numeric_strings_and_zero_offset_are_accepted(self, ws_root, make_toolbox):
+        write(ws_root, "a.py", "\n".join(str(i) for i in range(1, 11)))
+        out = make_toolbox().call("read_file", {"path": "a.py", "offset": "0", "limit": "2"}).content
+        assert "[lines 1-2 of 10" in out
+
+    def test_non_object_arguments(self, make_toolbox):
+        tb = make_toolbox()
+        assert "couldn't parse" in tb.call("read_file", [("path", "a.py"), 3]).content
+        assert "couldn't parse" in tb.call("read_file", "null").content
+
+    def test_a_bug_in_a_tool_is_contained_and_logged(self, make_toolbox, monkeypatch):
+        tb = make_toolbox()
+        monkeypatch.setattr(tb, "tool_list_files", lambda **kw: 1 / 0)
+        out = tb.call("list_files", {}).content
+        assert out.startswith("error: internal error in list_files (ZeroDivisionError")
+        assert "ZeroDivisionError" in (tb.log_dir / "tool-errors.log").read_text()
+
+    def test_ctrl_c_is_not_swallowed(self, make_toolbox, monkeypatch):
+        class FakeInterrupt(BaseException):
+            pass
+
+        def boom(**kw):
+            raise FakeInterrupt()
+
+        tb = make_toolbox()
+        monkeypatch.setattr(tb, "tool_list_files", boom)
+        with pytest.raises(FakeInterrupt):
+            tb.call("list_files", {})
+
+
+@pytest.mark.parametrize("size, limit", [(5000, 1000), (10**6, 2000), (2001, 2000), (500, 100)])
+def test_truncate_never_exceeds_the_limit(size, limit):
+    from tools import _truncate
+    text = "".join(chr(97 + i % 26) for i in range(size))
+    out = _truncate(text, limit)
+    assert len(out) <= limit and "characters omitted" in out
+    assert out.endswith(text[-10:])
