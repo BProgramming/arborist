@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover
     readline = None
 
 import agent
-import config as bonsai_config
+import config as model_config
 from tools import Decision, Limits, ToolResult, Toolbox, Workspace, TOOL_SCHEMAS
 
 # ---------------------------------------------------------------- terminal ---
@@ -407,7 +407,7 @@ class Chat:
     def _save(self, arg: str) -> None:
         path = Path(os.path.expanduser(arg)) if arg else \
             self.history_dir / f"chat-{datetime.now():%Y%m%d-%H%M%S}.md"
-        lines = [f"# Bonsai chat — {datetime.now():%Y-%m-%d %H:%M}", ""]
+        lines = [f"# Agent chat — {datetime.now():%Y-%m-%d %H:%M}", ""]
         if self.system_prompt:
             lines += ["**System:** " + self.system_prompt, ""]
         for m in self.messages:
@@ -416,7 +416,7 @@ class Chat:
                 lines += ["## You", "", m["content"], ""]
             elif role == "assistant":
                 if m.get("content"):
-                    lines += ["## Bonsai", "", m["content"], ""]
+                    lines += ["## Agent", "", m["content"], ""]
                 for tc in m.get("tool_calls") or []:
                     fn = tc["function"]
                     lines += [f"→ `{describe_call(fn['name'], fn['arguments'])}`", ""]
@@ -452,11 +452,11 @@ class Chat:
             self._clear()
             print(dim("conversation cleared"))
         elif cmd == "effort":
-            if arg in bonsai_config.EFFORTS:
+            if arg in model_config.EFFORTS:
                 self.effort = arg
                 print(dim(f"reasoning effort: {arg}"))
             else:
-                print(red(f"usage: /effort {'|'.join(sorted(bonsai_config.EFFORTS))}  (now: {self.effort})"))
+                print(red(f"usage: /effort {'|'.join(sorted(model_config.EFFORTS))}  (now: {self.effort})"))
         elif cmd == "think":
             self.ui.show_thinking = not self.ui.show_thinking
             print(dim(f"show thinking: {'on' if self.ui.show_thinking else 'off'}"))
@@ -512,10 +512,10 @@ class Chat:
                 pass
             readline.set_history_length(2000)
 
-        tools = f"tools on · {self.toolbox.ws.root}" if self.tools_enabled else "tools off"
-        print(bold("Bonsai 2 27B") + dim(f"  ·  {self.cfg['derived']['base_url']}  ·  "
-                                         f"effort {self.effort}  ·  {tools}  ·  /help"))
-        print()
+        tools = "Tools:ON" if self.tools_enabled else "Tools:OFF"
+        model = "Bonsai 2 27B"
+        print(dim(f"Model:") + bold(f"{model}") + dim(f" · Server:{self.cfg['derived']['base_url']} · Effort:{self.effort} · {tools}\n"))
+
         try:
             while True:
                 try:
@@ -559,14 +559,14 @@ def resolve_workspace(arg: str | None) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Chat with the local Bonsai server.")
+    ap = argparse.ArgumentParser(description="Chat with the local LLM server.")
     ap.add_argument("--workspace", "-w", help="directory the model's tools may access (default: current directory)")
     ap.add_argument("--no-tools", action="store_true", help="plain chat: no file or run tools at all")
     args = ap.parse_args(argv)
 
     try:
-        cfg = bonsai_config.load()
-    except bonsai_config.ConfigError as e:
+        cfg = model_config.load()
+    except model_config.ConfigError as e:
         print(red(f"config error: {e}"), file=sys.stderr)
         return 1
 

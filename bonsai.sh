@@ -51,7 +51,7 @@ check_deps() {
   local missing=() hints=()
   for c in git cmake curl; do command -v "$c" >/dev/null || missing+=("$c"); done
   command -v c++ >/dev/null || command -v g++ >/dev/null || missing+=("c++ compiler")
-  command -v ninja >/dev/null || info "ninja not found; using make (slower builds, same binary)"
+  command -v ninja >/dev/null || info "Ninja not found; using make (slower builds, same binary)."
   hints+=("build-essential cmake ninja-build git curl")
 
   case "$CFG_BACKEND" in
@@ -68,7 +68,7 @@ check_deps() {
 
   if ((${#missing[@]})); then
     printf '%smissing:%s %s\n' "$R$B" "$X" "${missing[*]}" >&2
-    printf 'On Linux Mint / Ubuntu:\n  sudo apt install %s\n' "${hints[*]}" >&2
+    printf 'On Linux Mint / Ubuntu:\n  sudo apt install %s.\n' "${hints[*]}" >&2
     exit 1
   fi
 
@@ -90,12 +90,12 @@ build_stamp() {
 fetch_source() {
   local update="${1:-0}"
   if [[ ! -d "$CFG_SRC_DIR/.git" ]]; then
-    step "Cloning PrismML llama.cpp fork ($CFG_REF)"
+    step "Cloning PrismML llama.cpp fork ($CFG_REF)..."
     git clone --filter=blob:none "$CFG_REPO" "$CFG_SRC_DIR"
     update=1
   fi
   if ((update)); then
-    step "Checking out $CFG_REF"
+    step "Checking out $CFG_REF..."
     git -C "$CFG_SRC_DIR" fetch --quiet origin "$CFG_REF"
     git -C "$CFG_SRC_DIR" checkout --quiet --detach FETCH_HEAD
     info "at $(git -C "$CFG_SRC_DIR" log -1 --format='%h %cs %s')"
@@ -106,11 +106,11 @@ build() {
   local force="${1:-0}" stamp_file="$CFG_BUILD_DIR/.bonsai-stamp"
   if ((!force)) && [[ -x "$CFG_SERVER_BIN" && -f "$stamp_file" ]] \
      && [[ "$(cat "$stamp_file")" == "$(build_stamp)" ]]; then
-    info "llama-server is built and current ($CFG_BACKEND)"
+    info "Llama-server is built and current (running via $CFG_BACKEND)."
     return
   fi
 
-  step "Building llama-server ($CFG_BACKEND, $CFG_JOBS jobs)"
+  step "Building llama-server ($CFG_BACKEND, $CFG_JOBS jobs)..."
   local args=(
     -S "$CFG_SRC_DIR" -B "$CFG_BUILD_DIR"
     -DCMAKE_BUILD_TYPE=Release            # PERF: optimized build; Debug is many times slower
@@ -139,17 +139,17 @@ build() {
 
   rm -f "$stamp_file"
   "${env_prefix[@]}" cmake "${args[@]}" >"$CFG_LOG_DIR/cmake-configure.log" 2>&1 \
-    || { tail -30 "$CFG_LOG_DIR/cmake-configure.log" >&2; die "cmake configure failed (log: $CFG_LOG_DIR/cmake-configure.log)"; }
+    || { tail -30 "$CFG_LOG_DIR/cmake-configure.log" >&2; die "CMake configure failed (log: $CFG_LOG_DIR/cmake-configure.log)."; }
   # Full output goes to the log; the terminal gets a one-line progress counter.
   if ! "${env_prefix[@]}" cmake --build "$CFG_BUILD_DIR" -j "$CFG_JOBS" --target llama-server 2>&1 \
       | tee "$CFG_LOG_DIR/cmake-build.log" \
       | awk '/^\[[0-9]+\/[0-9]+\]/ { printf "\r\033[K    %s", substr($0, 1, 90); fflush() } END { print "" }' \
       || [[ ! -x "$CFG_SERVER_BIN" ]]; then
     tail -30 "$CFG_LOG_DIR/cmake-build.log" >&2
-    die "build failed (log: $CFG_LOG_DIR/cmake-build.log)"
+    die "Build failed (log: $CFG_LOG_DIR/cmake-build.log)."
   fi
   build_stamp >"$stamp_file"
-  info "built $CFG_SERVER_BIN"
+  info "Built $CFG_SERVER_BIN."
 }
 
 # ------------------------------------------------------------- download ---
@@ -177,26 +177,26 @@ download() {
   if [[ ! -f "$dest" ]]; then
     local avail_gb
     avail_gb="$(df -Pk "$(dirname "$dest")" | awk 'NR==2 { print int($4 / 1048576) }')"
-    ((avail_gb >= 10)) || die "only ${avail_gb} GB free in $(dirname "$dest"); need ~10 GB"
-    step "Downloading $name"
+    ((avail_gb >= 10)) || die "Only ${avail_gb} GB free in $(dirname "$dest"); need ~10 GB."
+    step "Downloading $name..."
     # -C - resumes a partial .part file if a previous download was interrupted.
     curl -fL --retry 5 --retry-delay 3 -C - --progress-bar -o "$dest.part" "$url" \
-      || die "download failed — rerun to resume ($dest.part)"
+      || die "Download failed — rerun to resume ($dest.part)."
     mv "$dest.part" "$dest"
   fi
 
   local want got
   want="$(expected_sha256 "$name")"
   if [[ -n "$want" ]]; then
-    step "Verifying $name"
+    step "Verifying $name..."
     got="$(sha256sum "$dest" | cut -d' ' -f1)"
     if [[ "$got" != "$want" ]]; then
       mv "$dest" "$dest.bad"
-      die "checksum mismatch for $name (moved to $dest.bad); rerun to download again"
+      die "Checksum mismatch for $name (moved to $dest.bad); rerun to download again."
     fi
-    info "sha256 ok"
+    info "SHA256 ok."
   else
-    warn "couldn't fetch a checksum for $name; skipping verification"
+    warn "Couldn't fetch a checksum for $name; skipping verification."
   fi
   touch "$ok_marker"
 }
@@ -213,12 +213,12 @@ server_up() { curl -fs -o /dev/null --max-time 2 "$CFG_BASE_URL/health"; }
 
 start_server() {
   if server_up; then
-    info "reusing the server already running at $CFG_BASE_URL"
+    info "Reusing the server already running at $CFG_BASE_URL."
     STARTED_SERVER=0
     return
   fi
-  step "Starting llama-server on $CFG_BASE_URL"
-  info "log: $SERVER_LOG"
+  step "Starting llama-server on $CFG_BASE_URL..."
+  info "Log: $SERVER_LOG."
   # setsid puts the server in its own session so Ctrl-C in the chat (which
   # stops a reply) doesn't also reach the server and kill it.
   local launcher=()
@@ -233,14 +233,14 @@ start_server() {
   until server_up; do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
       tail -25 "$SERVER_LOG" >&2
-      die "llama-server exited during startup (full log: $SERVER_LOG)"
+      die "Llama-server exited during startup (full log: $SERVER_LOG)."
     fi
-    ((waited >= CFG_STARTUP_TIMEOUT)) && { stop_server; die "server not ready after ${CFG_STARTUP_TIMEOUT}s"; }
-    printf '\r    %sloading model… %ss%s' "$D" "$waited" "$X"
+    ((waited >= CFG_STARTUP_TIMEOUT)) && { stop_server; die "Server not ready after ${CFG_STARTUP_TIMEOUT}s."; }
+    printf '\r    %sLoading model… %ss%s' "$D" "$waited" "$X"
     sleep 1
     ((waited += 1))
   done
-  printf '\r\033[K'
+  printf '\r    %sLoading model… Done.%s'
   report_offload
 }
 
@@ -251,15 +251,14 @@ report_offload() {
   local offload="" _
   # The server writes its log from a background thread; give it a moment.
   for _ in {1..20}; do
-    offload="$(grep -m1 -E 'offloaded [0-9]+/[0-9]+ layers' "$SERVER_LOG" || true)"
+    offload="$(grep -m1 -E 'Offloaded [0-9]+/[0-9]+ layers' "$SERVER_LOG" || true)."
     [[ -n "$offload" ]] && break
     sleep 0.25
   done
   if [[ -z "$offload" ]]; then
-    info "couldn't find the layer-offload line in the server log; if replies run at only a few"
-    info "tokens/sec, the GPU isn't being used (see $SERVER_LOG)"
+    info "Couldn't find the layer-offload line in the server log. If replies run at only a few tokens/sec, the GPU isn't being used (see log)."
   elif [[ "$offload" =~ offloaded\ ([0-9]+)/([0-9]+) ]] && ((BASH_REMATCH[1] < BASH_REMATCH[2])); then
-    warn "only ${BASH_REMATCH[1]} of ${BASH_REMATCH[2]} layers are on the GPU — expect a large slowdown."
+    warn "Only ${BASH_REMATCH[1]} of ${BASH_REMATCH[2]} layers are on the GPU — expect a large slowdown."
     warn "Lower server.ctx_size or use the PTQ1_0 packing."
   else
     info "${offload##*: }"
@@ -302,8 +301,8 @@ cmd_chat() {
 
 cmd_server() {
   setup
-  server_up && die "a server is already running at $CFG_BASE_URL"
-  step "Serving on $CFG_BASE_URL (Ctrl-C to stop)"
+  server_up && die "A server is already running at $CFG_BASE_URL."
+  step "Serving on $CFG_BASE_URL (Ctrl-C to stop)."
   exec "$CFG_SERVER_BIN" "${SERVER_ARGS[@]}"
 }
 
@@ -314,17 +313,17 @@ cmd_status() {
     printf '%sbinary%s   %s (%s)\n' "$B" "$X" "$CFG_SERVER_BIN" \
       "$(git -C "$CFG_SRC_DIR" log -1 --format='%h %cs' 2>/dev/null || echo '?')"
   else
-    printf '%sbinary%s   not built\n' "$B" "$X"
+    printf '%sbinary%s   Not built\n' "$B" "$X"
   fi
   if [[ -f "$CFG_MODEL_PATH" ]]; then
     printf '%smodel%s    %s (%s)\n' "$B" "$X" "$CFG_MODEL_FILE" "$(du -h "$CFG_MODEL_PATH" | cut -f1)"
   else
-    printf '%smodel%s    not downloaded\n' "$B" "$X"
+    printf '%smodel%s    Not downloaded\n' "$B" "$X"
   fi
   if server_up; then
-    printf '%sserver%s   %sup%s at %s\n' "$B" "$X" "$G" "$X" "$CFG_BASE_URL"
+    printf '%sserver%s   %sUp%s at %s\n' "$B" "$X" "$G" "$X" "$CFG_BASE_URL"
   else
-    printf '%sserver%s   down\n' "$B" "$X"
+    printf '%sserver%s   Down\n' "$B" "$X"
   fi
 }
 
@@ -345,9 +344,9 @@ main() {
     update)  check_deps; fetch_source 1; build 1 ;;
     rebuild) check_deps; fetch_source 0; build 1 ;;
     status)  cmd_status ;;
-    stop)    stop_server; info "stopped" ;;
+    stop)    stop_server; info "Stopped" ;;
     -h|--help|help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown command: $1 (try --help)" ;;
+    *) die "Unknown command: $1 (try --help)." ;;
   esac
 }
 
