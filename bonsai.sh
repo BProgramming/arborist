@@ -240,7 +240,7 @@ start_server() {
     sleep 1
     ((waited += 1))
   done
-  printf '\r    %sLoading model… Done.%s'
+  printf '\r    Loading model… Done.'
   report_offload
 }
 
