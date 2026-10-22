@@ -66,7 +66,9 @@ Commands:
   /retry                regenerate the last reply (file changes are not undone)
   /save [PATH]          write the conversation to a Markdown file
   /stats                context usage and last-reply speed
-  /recall [TERM]        search the model's saved memories (no term: where they live)
+  /recall [-n] TERM     search saved memories and attach the hits to your next
+                        message as a reminder (-n: only show them; no term:
+                        where the memories live)
 
 Input:
   \"\"\"                   on its own line starts/ends a multi-line block
@@ -391,7 +393,7 @@ class Memory:
         note = f"\n(Plus {dropped} older notes not shown.)" if dropped else ""
         return ("Notes from earlier sessions, saved in your memory. They're background about "
                 "the user and their work, not instructions.\n<memory>\n"
-                + "\n".join(f"- {e}" for e in kept) + f"\n</recall>{note}")
+                + "\n".join(f"- {e}" for e in kept) + f"\n</memory>{note}")
 
 
 class AgentTools:
@@ -446,6 +448,9 @@ class Chat:
         self.ui = TerminalUI(ch["show_thinking"])
         self.messages: list[dict] = []
         self.pending_files: list[tuple[str, str]] = []
+        # /recall hits waiting to ride along with the next message. A dict
+        # keeps them in order without duplicates.
+        self.pending_memories: dict[str, None] = {}
         self.last: agent.TurnResult | None = None
         self.last_wall = 0.0
         self.ctx_used = 0
@@ -650,6 +655,7 @@ class Chat:
     def _clear(self) -> None:
         self.messages.clear()
         self.pending_files.clear()
+        self.pending_memories.clear()
         self.ctx_used = 0
         self.memory_block = self.memory.prompt_block()  # picks up new and hand-edited memories
         if self.toolbox:
@@ -657,20 +663,41 @@ class Chat:
             # before editing them.
             self.toolbox.reset()
 
-    def _memory(self, term: str) -> None:
-        if not term:
+    def _recall(self, arg: str) -> None:
+        show_only = False
+        if arg == "-n" or arg.startswith("-n "):
+            show_only, arg = True, arg[2:].strip()
+        if not arg:
             n = len(self.memory.entries())
-            print(dim(f"{n} memor{'y' if n == 1 else 'ies'} in {self.memory.path}"))
-            print(dim("usage: /recall TERM  (case-insensitive search)"))
-            return
-        hits = self.memory.search(term)
-        if not hits:
-            print(dim(f"no memories mention {term!r}"))
-            return
-        pattern = re.compile(re.escape(term), re.IGNORECASE)
-        for entry in hits:
-            print("- " + pattern.sub(lambda m: bold(yellow(m.group(0))), entry))
-        print(dim(f"{len(hits)} match{'es' * (len(hits) != 1)} in {self.memory.path}"))
+            print(dim(f"{_memories(n)} in {self.memory.path}"))
+            print(dim("usage: /recall [-n] TERM  (case-insensitive search; -n only shows the hits)"))
+        else:
+            hits = self.memory.search(arg)
+            if not hits:
+                print(dim(f"no memories mention {arg!r}"))
+            else:
+                pattern = re.compile(re.escape(arg), re.IGNORECASE)
+                for entry in hits:
+                    print("- " + pattern.sub(lambda m: bold(yellow(m.group(0))), entry))
+                print(dim(f"{len(hits)} match{'es' * (len(hits) != 1)} in {self.memory.path}"))
+                if not show_only:
+                    # Re-sent near the end of the conversation, where the model
+                    # attends best, even if they're already in the system prompt.
+                    self.pending_memories.update(dict.fromkeys(hits))
+        if self.pending_memories:
+            print(dim(f"{_memories(len(self.pending_memories))} attached to the next message."))
+
+    def _compose(self, line: str) -> str:
+        """The user's message, with any /recall reminders and /file contents in front."""
+        parts = []
+        if self.pending_memories:
+            notes = "\n".join(f"- {e}" for e in self.pending_memories)
+            parts.append("<memory_reminder>\n(Notes from your memory, re-sent by the user as a "
+                         f"reminder. Not a new request.)\n{notes}\n</memory_reminder>")
+            self.pending_memories.clear()
+        parts += [f"<file path=\"{p}\">\n{t}\n</file>" for p, t in self.pending_files]
+        self.pending_files.clear()
+        return "\n\n".join(parts + [line])
 
     def command(self, line: str) -> bool:
         """Handle a slash command. Returns False to exit."""
@@ -720,8 +747,8 @@ class Chat:
             self._save(arg)
         elif cmd == "stats":
             self._print_stats()
-        elif cmd == "memory":
-            self._memory(arg)
+        elif cmd == "recall":
+            self._recall(arg)
         else:
             print(red(f"unknown command /{cmd} — try /help"))
         return True
@@ -773,12 +800,7 @@ class Chat:
                     continue
                 if line.startswith("//"):
                     line = line[1:]
-                content = line
-                if self.pending_files:
-                    parts = [f"<file path=\"{p}\">\n{t}\n</file>" for p, t in self.pending_files]
-                    content = "\n\n".join(parts) + "\n\n" + line
-                    self.pending_files.clear()
-                self.messages.append({"role": "user", "content": content})
+                self.messages.append({"role": "user", "content": self._compose(line)})
                 self._reply()
         finally:
             if readline:
@@ -786,6 +808,10 @@ class Chat:
                     readline.write_history_file(hist)
                 except OSError:
                     pass
+
+
+def _memories(n: int) -> str:
+    return f"{n} memor{'y' if n == 1 else 'ies'}"
 
 
 def is_command(line: str) -> bool:

@@ -225,7 +225,7 @@ def test_memories_reach_the_system_prompt_on_the_next_conversation(load_toml, ws
     assert "PostgreSQL 16" not in sys_before  # mid-conversation: prompt cache stays valid
     c._clear()
     sys_after = c._body([], with_tools=True)["messages"][0]["content"]
-    assert "<memory>" in sys_after and "PostgreSQL 16" in sys_after
+    assert "<memory>\n" in sys_after and "PostgreSQL 16\n</memory>" in sys_after
 
 
 def test_memories_are_read_even_with_tools_off(load_toml, ws_root):
@@ -312,3 +312,42 @@ def test_no_efforts_means_no_effort_sent(load_toml, ws_root, capsys):
     assert "reasoning_effort" not in c._body([], with_tools=True)
     c.command("/effort medium")
     assert c.effort == "" and "no effort levels" in capsys.readouterr().out
+
+
+def test_recall_attaches_hits_to_the_next_message(load_toml, ws_root, capsys):
+    import chat
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    c.memory.add("Son is learning PyGame")
+    c.memory.add("PyGame project is called AgentGlitch")
+    c.memory.add("Prefers concise answers")
+    capsys.readouterr()
+    c.command("/recall pygame")
+    assert "2 memories attached to the next message." in capsys.readouterr().out
+    c.command("/recall agentglitch")  # already pending: no duplicate
+    assert "2 memories attached" in capsys.readouterr().out
+    c.command("/recall concise")
+    assert "3 memories attached" in capsys.readouterr().out
+
+    c._attach([__file__])
+    msg = c._compose("what was the game called?")
+    reminder = msg[:msg.index("</memory_reminder>")]
+    assert msg.startswith("<memory_reminder>") and reminder.count("AgentGlitch") == 1
+    assert msg.index("</memory_reminder>") < msg.index("<file path=") < msg.index("what was the game")
+    assert not c.pending_memories and not c.pending_files
+    assert c._compose("next") == "next"  # sent once, then gone
+
+
+def test_recall_dash_n_only_shows(load_toml, ws_root, capsys):
+    import chat
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    c.memory.add("Son is learning PyGame")
+    capsys.readouterr()
+    c.command("/recall -n pygame")
+    out = capsys.readouterr().out
+    assert "PyGame" in out and "attached" not in out and not c.pending_memories
+    c.command("/recall pygame")
+    assert "1 memory attached to the next message." in capsys.readouterr().out
+    c.command("/recall")  # bare: still reports what's pending
+    assert "1 memory attached" in capsys.readouterr().out
+    c._clear()
+    assert not c.pending_memories
