@@ -500,7 +500,8 @@ def environment_facts(workspace: Path, env_vars: list[str]) -> list[str]:
 # -------------------------------------------------------------------- chat ---
 
 class Chat:
-    def __init__(self, cfg: dict, workspace: Path | None, tools_enabled: bool):
+    def __init__(self, cfg: dict, workspace: Path | None, tools_enabled: bool,
+                 fix_tests: bool = False):
         self.cfg = cfg
         ch = cfg["chat"]
         self.client = Client(cfg["derived"]["base_url"])
@@ -551,6 +552,7 @@ class Chat:
                 on_output=self.ui.run_output,
                 on_notice=self.ui.notice,
                 checkpoints=self.checkpoints,
+                fix_tests=fix_tests,
             )
             self.tools_enabled = tools_enabled
 
@@ -577,7 +579,7 @@ class Chat:
         parts = [self.system_prompt] if self.system_prompt else []
         env = [self.date_line]
         if self.tools_enabled and self.toolbox:
-            parts.append(agent.TOOL_GUIDE.format(root=self.toolbox.ws.root))
+            parts.append(agent.tool_guide(self.toolbox.ws.root, self.toolbox.fix_tests))
             parts.append(MEMORY_GUIDE)
             if self._env_facts is None:
                 self._env_facts = environment_facts(self.toolbox.ws.root, self.cfg["chat"]["env_vars"])
@@ -1024,7 +1026,9 @@ class Chat:
         print(dim(f"    Model:  {self.model_name}"))
         print(dim(f"    Server: {self.cfg['derived']['base_url']}"))
         print(dim(f"    Effort: {self.effort or 'n/a'}"))
-        print(dim(f"    Tools:  {'ON' if self.tools_enabled else 'OFF'}"))
+        print(dim(f"    Tools:  {'ON' if self.tools_enabled else 'OFF'}"
+                  + ("  (fix mode: the model fixes and re-runs failing tests)"
+                     if self.toolbox and self.toolbox.fix_tests else "")))
         n = len(self.memory.entries())
         print(dim(f"    Memory: {n} note{'s' * (n != 1)}"))
 
@@ -1083,6 +1087,9 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Chat with the local LLM server.")
     ap.add_argument("--workspace", "-w", help="directory the model's tools may access (default: current directory)")
     ap.add_argument("--no-tools", action="store_true", help="plain chat: no file or run tools at all")
+    ap.add_argument("--fix", "-f", action="store_true",
+                    help="let the model fix failing tests and re-run them in the same turn "
+                         "(each test run still asks first)")
     args = ap.parse_args(argv)
 
     try:
@@ -1096,7 +1103,7 @@ def main(argv: list[str] | None = None) -> int:
         print(yellow(f"warning: the workspace is your whole home directory ({workspace}); "
                      "consider starting from a project folder"))
 
-    chat = Chat(cfg, workspace, tools_enabled=cfg["tools"]["enabled"])
+    chat = Chat(cfg, workspace, tools_enabled=cfg["tools"]["enabled"], fix_tests=args.fix)
 
     # Ctrl-C while a turn is in progress (streaming, a tool, an approval
     # prompt or a run) cancels the turn; at the prompt it just clears the line.

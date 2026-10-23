@@ -273,8 +273,11 @@ class Toolbox:
                  log_dir: str | os.PathLike | None = None,
                  on_output: Callable[[str], None] | None = None,
                  on_notice: Callable[[str], None] | None = None,
-                 checkpoints: "Checkpoints | None" = None):
+                 checkpoints: "Checkpoints | None" = None,
+                 fix_tests: bool = False):
         self.ws = workspace
+        # --fix: a test run doesn't end the turn; the model fixes and re-runs.
+        self.fix_tests = fix_tests
         self.checkpoints = checkpoints
         self._turn_label = ""
         self._checkpointed = False  # this turn already has its snapshot
@@ -319,9 +322,12 @@ class Toolbox:
 
     @property
     def schemas(self) -> list[dict]:
-        if self.limits.web_enabled:
-            return TOOL_SCHEMAS
-        return [t for t in TOOL_SCHEMAS if t["function"]["name"] not in WEB_TOOLS]
+        schemas = TOOL_SCHEMAS if self.limits.web_enabled else \
+            [t for t in TOOL_SCHEMAS if t["function"]["name"] not in WEB_TOOLS]
+        if self.fix_tests:
+            schemas = [RUN_TESTS_FIX_SCHEMA if t["function"]["name"] == "run_tests" else t
+                       for t in schemas]
+        return schemas
 
     @property
     def names(self) -> list[str]:
@@ -635,11 +641,21 @@ class Toolbox:
         notes = "".join(f"note: {w}\n" for w in plan.warnings)
         header = (f"Tests for {rel} {status}, {outcome.duration:.1f}s. Full log: {outcome.log_path}\n"
                   f"{notes}--- {'summary' if passed else 'failures and summary'} ---\n")
-        footer = ("\n--- end ---\nNow explain the result for the user: what passed, what failed "
-                  "and why, and what you'd change. Don't call any more tools.")
+        if not self.fix_tests:
+            footer = ("\n--- end ---\nNow explain the result for the user: what passed, what failed "
+                      "and why, and what you'd change. Don't call any more tools.")
+        elif passed:
+            footer = ("\n--- end ---\nThe tests pass. Tell the user what you changed to get here "
+                      "and stop. Don't call any more tools.")
+        else:
+            footer = ("\n--- end ---\nFix mode: find the cause of these failures, fix it with "
+                      "edit_file, then call run_tests again. If you can't see how to fix it, stop "
+                      "and explain instead.")
         room = max(self.limits.max_output_chars - len(header) - len(footer), 200)
         body = runners.focus_test_output(log, passed)
-        return ToolResult(header + _truncate(body, room) + footer, hard_stop=True)
+        # In fix mode a failure keeps the turn going; a pass still ends it.
+        hard_stop = not self.fix_tests or passed
+        return ToolResult(header + _truncate(body, room) + footer, hard_stop=hard_stop)
 
     # fetch_url / crawl_docs -----------------------------------------------
 
@@ -844,6 +860,15 @@ TOOL_SCHEMAS = [
          "max_depth": {"type": "integer", "description": "How many links away from the start to go"}},
         ["url"]),
 ]
+
+_RUN_TESTS = next(t for t in TOOL_SCHEMAS if t["function"]["name"] == "run_tests")
+RUN_TESTS_FIX_SCHEMA = _fn(
+    "run_tests",
+    "Run the project's tests (pytest or unittest, cargo test, dart/flutter test, npm test or "
+    "node --test, picked from the project files). The user must approve each run. Returns the "
+    "failures and the summary. Fix mode is on: if tests fail, fix the cause and call run_tests "
+    "again; once they pass, report and stop.",
+    _RUN_TESTS["function"]["parameters"]["properties"], [])
 
 TOOL_NAMES = [t["function"]["name"] for t in TOOL_SCHEMAS]
 WEB_TOOLS = {"fetch_url", "crawl_docs"}

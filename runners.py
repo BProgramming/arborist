@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import Callable
 
 RUNNABLE = {".py", ".rs", ".dart", ".js", ".ts"}
+
+# Python decides whether a cached .pyc is stale from the source's size and
+# mtime (whole seconds). An edit that keeps the size, made within a second of
+# a run (exactly what an edit-and-rerun loop does), would run the old code.
+# So arborist's own Python runs don't write bytecode caches at all.
+PYTHON_ENV = {"PYTHONDONTWRITEBYTECODE": "1"}
 PROBE_TIMEOUT = 20  # seconds, for version checks and dependency probes
 
 
@@ -32,6 +38,7 @@ class RunPlan:
     checked: list[str] = field(default_factory=list)      # what passed, for the report
     warnings: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)     # non-empty means "don't run"
+    env: dict[str, str] = field(default_factory=dict)     # added to the environment for the run
 
     @property
     def ok(self) -> bool:
@@ -198,6 +205,7 @@ def _plan_python(path: Path, root: Path, build_dir: Path) -> RunPlan:
     else:
         plan.checked.append("no third-party imports")
     plan.steps = [[interp, "-u", str(path)]]
+    plan.env = dict(PYTHON_ENV)
     return plan
 
 
@@ -417,7 +425,7 @@ def plan_tests(target: Path, root: Path, build_dir: Path) -> RunPlan:
 
 
 def _tests_python(target: Path, project: Path, rel: str, root: Path, build_dir: Path) -> RunPlan:
-    plan = RunPlan(cwd=project)
+    plan = RunPlan(cwd=project, env=dict(PYTHON_ENV))
     interp = python_for_dir(project, root)
     version = _version([interp, "--version"]) if interp else None
     if not version:
@@ -605,7 +613,7 @@ def execute(plan: RunPlan, log_dir: Path, timeout: int,
             if remaining <= 0:
                 timed_out = True
                 break
-            exit_code, timed_out = _run_step(step, plan.cwd, remaining, log, on_output)
+            exit_code, timed_out = _run_step(step, plan.cwd, remaining, log, on_output, plan.env)
             if timed_out or exit_code != 0:
                 break
         footer = (f"[timed out after {timeout}s]" if timed_out else f"[exit code {exit_code}]")
@@ -614,11 +622,13 @@ def execute(plan: RunPlan, log_dir: Path, timeout: int,
     return RunOutcome(exit_code, timed_out, time.monotonic() - start, log_path)
 
 
-def _run_step(cmd: list[str], cwd: Path, timeout: float, log, on_output) -> tuple[int | None, bool]:
+def _run_step(cmd: list[str], cwd: Path, timeout: float, log, on_output,
+              env: dict[str, str] | None = None) -> tuple[int | None, bool]:
     try:
         # New session: Ctrl-C at the terminal doesn't reach it directly, and on
         # timeout or interrupt we can kill the whole process group.
-        proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(cmd, cwd=cwd, env={**os.environ, **env} if env else None,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, errors="replace",
                                 bufsize=1, start_new_session=True)
     except OSError as e:

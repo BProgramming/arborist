@@ -153,3 +153,96 @@ def test_cargo_test_end_to_end(ws_root, make_toolbox):
     res = make_toolbox(run_timeout=300).call("run_tests", {})
     assert "failed" in res.content.splitlines()[0]
     assert "adds" in res.content and "assertion" in res.content
+
+
+# ---------------------------------------------------------------- fix mode ---
+
+def test_fix_mode_keeps_the_turn_going_on_failure(ws_root, make_toolbox):
+    pytest.importorskip("pytest")
+    write(ws_root, "test_math.py", FAILING)
+    tb = make_toolbox()
+    tb.fix_tests = True
+    res = tb.call("run_tests", {})
+    assert not res.hard_stop and "Fix mode: find the cause" in res.content
+
+
+def test_fix_mode_still_stops_on_a_pass_or_a_refusal(ws_root, make_toolbox):
+    pytest.importorskip("pytest")
+    write(ws_root, "test_ok.py", PASSING)
+    tb = make_toolbox(FakeApprover(run=[Decision(True), Decision(False)]))
+    tb.fix_tests = True
+    passed = tb.call("run_tests", {})
+    assert passed.hard_stop and "The tests pass" in passed.content
+    assert tb.call("run_tests", {}).hard_stop  # declined
+
+
+def test_fix_mode_changes_the_schema_and_guide(ws_root, make_toolbox):
+    import agent
+    tb = make_toolbox()
+    normal = next(t for t in tb.schemas if t["function"]["name"] == "run_tests")
+    tb.fix_tests = True
+    fixing = next(t for t in tb.schemas if t["function"]["name"] == "run_tests")
+    assert "you must explain the result and stop" in normal["function"]["description"]
+    assert "Fix mode is on" in fixing["function"]["description"]
+    assert "Fix mode is on for tests" in agent.tool_guide("/p", fix_tests=True)
+    assert "Fix mode" not in agent.tool_guide("/p")
+
+
+def test_fix_loop_end_to_end(ws_root, make_toolbox):
+    """read → test (fails) → fix → test (passes) → report, all in one turn."""
+    pytest.importorskip("pytest")
+    from test_agent import FakeModel, NullUI, run, text_reply, tool_reply
+    write(ws_root, "calc.py", "def add(a, b):\n    return a - b\n")
+    write(ws_root, "test_calc.py", "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n")
+    approver = FakeApprover()
+    tb = make_toolbox(approver)
+    tb.fix_tests = True
+    model = FakeModel(
+        tool_reply(("run_tests", {})),
+        tool_reply(("read_file", {"path": "calc.py"})),
+        tool_reply(("edit_file", {"path": "calc.py", "old_string": "a - b", "new_string": "a + b"})),
+        tool_reply(("run_tests", {})),
+        text_reply("Fixed: add() subtracted. Tests pass."),
+        text_reply("should never be requested"))
+    result, _ = run(model, tb)
+    assert result.text == "Fixed: add() subtracted. Tests pass."
+    assert result.hard_stopped  # the passing run ended tool use
+    assert len(approver.run_requests) == 2  # each run was approved separately
+    assert [r["with_tools"] for r in model.requests] == [True, True, True, True, False]
+
+
+def test_without_fix_mode_a_failure_ends_the_turn(ws_root, make_toolbox):
+    pytest.importorskip("pytest")
+    from test_agent import FakeModel, run, text_reply, tool_reply
+    write(ws_root, "test_math.py", FAILING)
+    model = FakeModel(tool_reply(("run_tests", {})), text_reply("one test fails because…"))
+    result, _ = run(model, make_toolbox())
+    assert result.hard_stopped and model.requests[-1]["with_tools"] is False
+
+
+def test_fix_flag_on_the_command_line(monkeypatch):
+    import chat
+    seen = {}
+
+    def fake_chat(cfg, workspace, tools_enabled, fix_tests=False):
+        seen["fix"] = fix_tests
+        raise SystemExit(0)
+
+    monkeypatch.setattr(chat, "Chat", fake_chat)
+    for argv, expected in ((["--fix"], True), (["-f"], True), ([], False)):
+        with pytest.raises(SystemExit):
+            chat.main(argv + ["--workspace", "."])
+        assert seen["fix"] is expected
+
+
+def test_a_same_size_edit_right_after_a_run_is_not_stale(ws_root, make_toolbox):
+    """Python's .pyc check uses size + whole-second mtime; arborist's runs
+    mustn't leave caches that make a quick same-size fix invisible."""
+    pytest.importorskip("pytest")
+    write(ws_root, "calc.py", "def add(a, b):\n    return a - b\n")
+    write(ws_root, "test_calc.py", "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n")
+    tb = make_toolbox()
+    assert "failed" in tb.call("run_tests", {}).content.splitlines()[0]
+    write(ws_root, "calc.py", "def add(a, b):\n    return a + b\n")  # same size, same second
+    assert "passed" in tb.call("run_tests", {}).content.splitlines()[0]
+    assert not (ws_root / "__pycache__").exists()
