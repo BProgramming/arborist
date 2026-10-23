@@ -35,7 +35,7 @@ import agent
 import compaction
 import config as model_config
 import runners
-from checkpoints import CheckpointError, Checkpoints
+from checkpoints import CheckpointError, Checkpoints, prune_store
 from tools import IGNORED_DIRS, Decision, Limits, ToolResult, Toolbox, Workspace, TOOL_SCHEMAS
 
 # ---------------------------------------------------------------- terminal ---
@@ -1097,6 +1097,22 @@ def is_command(line: str) -> bool:
     return len(first) > 1 and "/" not in first[1:]
 
 
+def prune_old_checkpoints(cfg: dict) -> None:
+    """Startup housekeeping: drop checkpoints past tools.checkpoint_days."""
+    t = cfg["tools"]
+    if not t["checkpoints"] or not t["checkpoint_days"]:
+        return
+    try:
+        removed, stores = prune_store(Path(cfg["derived"]["checkpoint_dir"]), t["checkpoint_days"])
+    except (OSError, CheckpointError) as e:
+        print(dim(f"couldn't prune old checkpoints: {e}"))
+        return
+    if removed or stores:
+        extra = f", {stores} workspace store{'s' * (stores != 1)} removed" if stores else ""
+        print(dim(f"pruned {removed} checkpoint{'s' * (removed != 1)} older than "
+                  f"{t['checkpoint_days']} days{extra}"))
+
+
 def resolve_workspace(arg: str | None) -> Path:
     root = Path(os.path.expanduser(arg)) if arg else Path.cwd()
     root = root.resolve()
@@ -1126,6 +1142,7 @@ def main(argv: list[str] | None = None) -> int:
                      "consider starting from a project folder"))
 
     chat = Chat(cfg, workspace, tools_enabled=cfg["tools"]["enabled"])
+    prune_old_checkpoints(cfg)
 
     # Ctrl-C while a turn is in progress (streaming, a tool, an approval
     # prompt or a run) cancels the turn; at the prompt it just clears the line.

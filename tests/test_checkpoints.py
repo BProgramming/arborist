@@ -150,3 +150,115 @@ def test_a_broken_checkpoint_never_blocks_the_edit(ws_root, make_toolbox):
     res = tb.call("edit_file", {"path": "a.py", "old_string": "v1", "new_string": "v2"})
     assert res.content.startswith("updated") and (ws_root / "a.py").read_text() == "v2\n"
     assert any("couldn't save a checkpoint (disk full)" in n for n in tb.notices)
+
+
+# ------------------------------------------------------------------ pruning ---
+
+from datetime import datetime, timedelta  # noqa: E402
+
+from checkpoints import prune_store  # noqa: E402
+
+
+def aged_snapshot(cps, label, days_ago, kind="turn"):
+    """A checkpoint dated `days_ago` days back."""
+    cps._ensure()
+    cps._stage()
+    when = int((datetime.now() - timedelta(days=days_ago)).timestamp())
+    cps._git("commit", "--quiet", "--no-verify", "--allow-empty", "-m", f"[{kind}] {label}",
+             extra_env={"GIT_COMMITTER_DATE": f"{when} +0000", "GIT_AUTHOR_DATE": f"{when} +0000"})
+    return cps._git("rev-parse", "HEAD").stdout.decode().strip()
+
+
+def test_old_checkpoints_are_dropped_and_recent_ones_still_restore(ws_root, cps, tmp_path):
+    write(ws_root, "a.py", "v1\n")
+    old1 = aged_snapshot(cps, "ancient", 30)
+    write(ws_root, "a.py", "v2\n")
+    aged_snapshot(cps, "old", 20)
+    write(ws_root, "a.py", "v3\n")
+    aged_snapshot(cps, "recent", 2)
+    write(ws_root, "a.py", "v4\n")
+    cps.snapshot("today")
+    write(ws_root, "a.py", "v5\n")
+
+    assert prune_store(tmp_path / "store", 14) == (2, 0)
+    assert [c.label for c in cps.list()] == ["today", "recent"]
+    # The kept checkpoints still hold the right files.
+    cp, _ = cps.latest_different()
+    cps.restore(cp.sha)
+    assert (ws_root / "a.py").read_text() == "v4\n"
+    cps.restore(cps.find(cps.list()[-1].short).sha)
+    assert (ws_root / "a.py").read_text() == "v3\n"
+    # And the old commits are really gone from the store.
+    with pytest.raises(Exception):
+        cps._git("cat-file", "-e", old1)
+
+
+def test_undo_chain_survives_the_rewrite(ws_root, cps, tmp_path):
+    write(ws_root, "a.py", "1\n")
+    aged_snapshot(cps, "ancient", 30)
+    write(ws_root, "a.py", "2\n")
+    cps.snapshot("turn one")
+    write(ws_root, "a.py", "3\n")
+    cps.snapshot("turn two")
+    write(ws_root, "a.py", "4\n")
+    cp, _ = cps.latest_different()
+    cps.restore(cp.sha)  # back to "turn two"; a safety snapshot points at it
+
+    prune_store(tmp_path / "store", 14)
+    safety = cps.list()[0]
+    assert safety.kind == "safety" and safety.restored == cps.list()[1].sha
+    # The next /undo still goes further back, not forward.
+    cp, _ = cps.latest_different()
+    assert cp.label == "turn one"
+
+
+def test_a_store_with_nothing_recent_is_deleted_and_recreated(ws_root, cps, tmp_path):
+    write(ws_root, "a.py", "x\n")
+    aged_snapshot(cps, "old", 20)
+    assert prune_store(tmp_path / "store", 14) == (1, 1)
+    assert not cps.git_dir.exists()
+    cps.snapshot("fresh start")
+    assert [c.label for c in cps.list()] == ["fresh start"]
+
+
+def test_a_deleted_workspaces_store_is_removed(ws_root, cps, tmp_path):
+    import shutil
+    write(ws_root, "a.py", "x\n")
+    cps.snapshot("recent")
+    shutil.rmtree(ws_root)
+    assert prune_store(tmp_path / "store", 14) == (0, 1)
+    assert not cps.git_dir.exists()
+
+
+def test_pruning_never_touches_project_repos_or_unknown_dirs(ws_root, cps, tmp_path):
+    # The project's own repo, with an old commit.
+    subprocess.run(["git", "init", "-q", str(ws_root)], check=True)
+    write(ws_root, "a.py", "x\n")
+    old = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S")
+    env = {"GIT_COMMITTER_DATE": old, "GIT_AUTHOR_DATE": old, "GIT_AUTHOR_NAME": "me",
+           "GIT_AUTHOR_EMAIL": "me@x", "GIT_COMMITTER_NAME": "me", "GIT_COMMITTER_EMAIL": "me@x",
+           "PATH": __import__("os").environ["PATH"]}
+    subprocess.run(["git", "-C", str(ws_root), "add", "-A"], check=True, env=env)
+    subprocess.run(["git", "-C", str(ws_root), "commit", "-qm", "my work"], check=True, env=env)
+    before = subprocess.run(["git", "-C", str(ws_root), "log", "--format=%H"],
+                            capture_output=True, text=True).stdout
+    # A stray directory in the store that isn't one of ours, and a real old store.
+    stray = tmp_path / "store" / "someone-else.git"
+    stray.mkdir(parents=True)
+    (stray / "HEAD").write_text("ref: refs/heads/main\n")
+    aged_snapshot(cps, "old", 30)
+
+    prune_store(tmp_path / "store", 14)
+    after = subprocess.run(["git", "-C", str(ws_root), "log", "--format=%H"],
+                           capture_output=True, text=True).stdout
+    assert after == before and "my work" in subprocess.run(
+        ["git", "-C", str(ws_root), "log", "--format=%s"], capture_output=True, text=True).stdout
+    assert stray.exists()
+    assert not cps.git_dir.exists()
+
+
+def test_zero_days_keeps_everything(ws_root, cps, tmp_path):
+    write(ws_root, "a.py", "x\n")
+    aged_snapshot(cps, "ancient", 400)
+    assert prune_store(tmp_path / "store", 0) == (0, 0)
+    assert len(cps.list()) == 1

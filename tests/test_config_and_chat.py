@@ -523,3 +523,19 @@ def test_long_session_stays_inside_a_small_window(load_toml, ws_root, monkeypatc
     assert summaries, "older turns should have been summarised"
     assert c.messages[0]["content"].startswith("<earlier_conversation_summary>")
     assert c.messages[-1] == {"role": "assistant", "content": "Read it."}
+
+
+def test_checkpoint_days_is_validated_and_startup_prune_reports(load_toml, ws_root, capsys, monkeypatch):
+    import chat
+    with pytest.raises(config.ConfigError, match="checkpoint_days"):
+        load_toml('[tools]\ncheckpoint_days = -1\n')
+    cfg = load_toml()
+    assert cfg["tools"]["checkpoint_days"] == 14
+    monkeypatch.setattr(chat, "prune_store", lambda store, days: (5, 1))
+    chat.prune_old_checkpoints(cfg)
+    assert "pruned 5 checkpoints older than 14 days, 1 workspace store removed" in capsys.readouterr().out
+    called = []
+    monkeypatch.setattr(chat, "prune_store", lambda store, days: called.append(days) or (0, 0))
+    chat.prune_old_checkpoints(load_toml('[tools]\ncheckpoint_days = 0\n'))
+    chat.prune_old_checkpoints(load_toml('[tools]\ncheckpoints = false\n'))
+    assert called == []

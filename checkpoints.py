@@ -9,6 +9,11 @@ directories the tools skip.
 A snapshot is taken before the first change or run of each turn. Restoring
 one first takes a "safety" snapshot of the current state, so an undo can be
 undone too.
+
+Old checkpoints are pruned when arborist starts (prune_store): anything
+older than tools.checkpoint_days goes, and a store is deleted outright once
+nothing in it is recent or its workspace no longer exists. Only directories
+carrying arborist's marker file are ever touched.
 """
 from __future__ import annotations
 
@@ -18,10 +23,11 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 GIT_TIMEOUT = 60  # seconds; a huge workspace is better skipped than waited on
+MARKER = "arborist-workspace"  # file in every store: the workspace it belongs to
 
 
 class CheckpointError(Exception):
@@ -58,10 +64,11 @@ class Checkpoints:
 
     # -- plumbing -------------------------------------------------------------
 
-    def _git(self, *args: str, stdin: bytes | None = None) -> subprocess.CompletedProcess:
+    def _git(self, *args: str, stdin: bytes | None = None,
+             extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         env.update(GIT_DIR=str(self.git_dir), GIT_WORK_TREE=str(self.root),
-                   GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+                   GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", **(extra_env or {}))
         cmd = ["git",
                # Identity, signing and hooks from the user's global config
                # don't belong on these private commits.
@@ -94,7 +101,7 @@ class Checkpoints:
             "# arborist checkpoints: never snapshot these\n"
             + "".join(f"{d}/\n" for d in sorted(self.exclude)) + ".arborist-logs/\n",
             encoding="utf-8")
-        (self.git_dir / "arborist-workspace").write_text(str(self.root) + "\n", encoding="utf-8")
+        (self.git_dir / MARKER).write_text(str(self.root) + "\n", encoding="utf-8")
 
     def _stage(self) -> None:
         self._git("add", "--all", "--ignore-errors", "--", ".")
@@ -192,6 +199,76 @@ class Checkpoints:
             self._git("checkout", sha, "--pathspec-from-file=-", "--pathspec-file-nul", stdin=paths)
         self._stage()
         return changes, safety
+
+
+    # -- pruning ------------------------------------------------------------
+
+    def prune(self, cutoff: datetime) -> int:
+        """Drop checkpoints older than `cutoff`. Returns how many went.
+
+        History is linear, so the kept checkpoints are re-chained onto a new
+        root (same trees, messages and dates) and the rest is garbage
+        collected. If nothing is recent, the whole store is deleted."""
+        cps = self.list(limit=1_000_000)  # newest first
+        keep = [c for c in cps if c.when >= cutoff]
+        dropped = len(cps) - len(keep)
+        if not dropped:
+            return 0
+        if not keep:
+            shutil.rmtree(self.git_dir)
+            return dropped
+        new_sha: dict[str, str] = {}
+        parent = None
+        for cp in reversed(keep):  # oldest first
+            info = self._git("log", "-1", "--format=%T%x00%ad%x00%cd%x00%B", "--date=raw",
+                             cp.sha).stdout.decode(errors="replace")
+            tree, author_date, commit_date, message = info.split("\0", 3)
+            # A safety snapshot names the checkpoint it restored; follow the rewrite.
+            message = re.sub(r"^restored: ([0-9a-f]+)$",
+                             lambda m: f"restored: {new_sha.get(m[1], m[1])}",
+                             message.strip(), flags=re.MULTILINE)
+            args = ["commit-tree", tree, "-m", message] + (["-p", parent] if parent else [])
+            parent = self._git(*args, extra_env={"GIT_AUTHOR_DATE": author_date,
+                                                 "GIT_COMMITTER_DATE": commit_date}
+                               ).stdout.decode().strip()
+            new_sha[cp.sha] = parent
+        self._git("update-ref", "HEAD", parent)
+        self._git("reflog", "expire", "--expire=now", "--all")
+        self._git("gc", "--prune=now", "--quiet")
+        return dropped
+
+
+def prune_store(store: Path, max_age_days: int, now: datetime | None = None) -> tuple[int, int]:
+    """Prune every workspace's checkpoints under `store`.
+
+    Returns (checkpoints removed, whole stores deleted). Stores whose
+    workspace no longer exists are deleted. Anything without arborist's
+    marker file is left alone."""
+    store = Path(store)
+    if max_age_days <= 0 or not store.is_dir() or shutil.which("git") is None:
+        return 0, 0
+    cutoff = (now or datetime.now()) - timedelta(days=max_age_days)
+    removed = stores = 0
+    for d in sorted(store.glob("*.git")):
+        marker = d / MARKER
+        if not d.is_dir() or not marker.is_file():
+            continue
+        root = Path(marker.read_text(encoding="utf-8").strip())
+        cps = Checkpoints(root, store)
+        if cps.git_dir != d:
+            continue  # not laid out the way we'd have made it; don't guess
+        if not root.is_dir():
+            shutil.rmtree(d)
+            stores += 1
+            continue
+        try:
+            n = cps.prune(cutoff)
+        except CheckpointError:
+            continue  # leave a store we can't read as it is
+        removed += n
+        if n and not d.exists():
+            stores += 1
+    return removed, stores
 
 
 def _prune_empty_dirs(d: Path, root: Path) -> None:

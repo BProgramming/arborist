@@ -188,6 +188,10 @@ max_repeat_calls = 3
 # Uses a private git repository under paths.root; a project's own repo is
 # never touched. Needs git.
 checkpoints = true
+# Checkpoints older than this many days are deleted when arborist starts, and
+# a workspace's checkpoint store goes entirely once none are left or the
+# workspace folder no longer exists. 0 keeps them forever.
+checkpoint_days = 14
 
 # Web: fetch_url reads one page; crawl_docs follows links under the same
 # directory of a docs site. The first request to each site asks you first

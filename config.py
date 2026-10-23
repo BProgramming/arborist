@@ -87,6 +87,7 @@ DEFAULTS: dict = {
         "max_consecutive_errors": 4,
         "max_repeat_calls": 3,
         "checkpoints": True,
+        "checkpoint_days": 14,
         "web_enabled": True,
         "web_allowed_hosts": [],
         "web_page_chars": 12000,
@@ -192,6 +193,8 @@ def _validate(c: dict) -> None:
         _check(isinstance(t[key], int) and not isinstance(t[key], bool) and t[key] >= 0,
                f"tools.{key} must be a whole number (0 turns the check off)")
     _check(isinstance(t["checkpoints"], bool), "tools.checkpoints must be true or false")
+    _check(isinstance(t["checkpoint_days"], int) and not isinstance(t["checkpoint_days"], bool)
+           and t["checkpoint_days"] >= 0, "tools.checkpoint_days must be a whole number (0 keeps them forever)")
     _check(isinstance(ch["env_vars"], list) and all(
         isinstance(v, str) and v.replace("_", "").isalnum() for v in ch["env_vars"]),
         'chat.env_vars must be a list of variable names, e.g. ["VIRTUAL_ENV"]')
