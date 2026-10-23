@@ -123,7 +123,7 @@ def test_describe_call_hides_file_contents():
 
 @pytest.mark.parametrize("line, expected", [
     ("/clear", True), ("/effort xhigh", True), ("/file a.py b.py", True),
-    ("/etc/hosts has a weird entry", False), ("/home/brent/x.py: why does this fail?", False),
+    ("/etc/hosts has a weird entry", False), ("/home/user/x.py: why does this fail?", False),
     ("//help me with this", False), ("/", False), ("hello /clear", False),
 ])
 def test_is_command(line, expected):
@@ -231,10 +231,10 @@ def test_memories_reach_the_system_prompt_on_the_next_conversation(load_toml, ws
 def test_memories_are_read_even_with_tools_off(load_toml, ws_root):
     import chat
     cfg = load_toml()
-    chat.Memory(cfg["derived"]["memory_path"]).add("Lives in Toronto")
+    chat.Memory(cfg["derived"]["memory_path"]).add("Prefers tabs over spaces")
     c = chat.Chat(cfg, None, tools_enabled=True)
     body = c._body([], with_tools=True)
-    assert "tools" not in body and "Lives in Toronto" in body["messages"][0]["content"]
+    assert "tools" not in body and "Prefers tabs over spaces" in body["messages"][0]["content"]
 
 
 def test_memory_prompt_keeps_the_newest_when_too_long(tmp_path, monkeypatch):
@@ -318,12 +318,12 @@ def test_recall_attaches_hits_to_the_next_message(load_toml, ws_root, capsys):
     import chat
     c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
     c.memory.add("Son is learning PyGame")
-    c.memory.add("PyGame project is called AgentGlitch")
+    c.memory.add("PyGame project is called StarHopper")
     c.memory.add("Prefers concise answers")
     capsys.readouterr()
     c.command("/recall pygame")
     assert "2 memories attached to the next message." in capsys.readouterr().out
-    c.command("/recall agentglitch")  # already pending: no duplicate
+    c.command("/recall starhopper")  # already pending: no duplicate
     assert "2 memories attached" in capsys.readouterr().out
     c.command("/recall concise")
     assert "3 memories attached" in capsys.readouterr().out
@@ -331,7 +331,7 @@ def test_recall_attaches_hits_to_the_next_message(load_toml, ws_root, capsys):
     c._attach([__file__])
     msg = c._compose("what was the game called?")
     reminder = msg[:msg.index("</memory_reminder>")]
-    assert msg.startswith("<memory_reminder>") and reminder.count("AgentGlitch") == 1
+    assert msg.startswith("<memory_reminder>") and reminder.count("StarHopper") == 1
     assert msg.index("</memory_reminder>") < msg.index("<file path=") < msg.index("what was the game")
     assert not c.pending_memories and not c.pending_files
     assert c._compose("next") == "next"  # sent once, then gone
@@ -539,3 +539,10 @@ def test_checkpoint_days_is_validated_and_startup_prune_reports(load_toml, ws_ro
     chat.prune_old_checkpoints(load_toml('[tools]\ncheckpoint_days = 0\n'))
     chat.prune_old_checkpoints(load_toml('[tools]\ncheckpoints = false\n'))
     assert called == []
+
+
+def test_hip_backend_needs_a_target(load_toml):
+    with pytest.raises(config.ConfigError, match="hip_target"):
+        load_toml('[build]\nbackend = "hip"\n')
+    assert load_toml('[build]\nbackend = "hip"\nhip_target = "gfx1100"\n')["build"]["hip_target"] == "gfx1100"
+    assert load_toml()["build"]["hip_target"] == ""  # vulkan/cpu don't need one

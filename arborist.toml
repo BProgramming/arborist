@@ -5,10 +5,8 @@
 
 [paths]
 # Everything (source, build, weights, logs, chat history, memory) lives under
-# here. A leading ~ is expanded. (Kept at the old bonsai path so an existing
-# build and download are reused; the default for a fresh config is
-# ~/.local/share/arborist.)
-root = "~/.local/share/bonsai"
+# here. A leading ~ is expanded.
+root = "~/.local/share/arborist"
 
 [build]
 # PERF: GPU backend for the C++ build.
