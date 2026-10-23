@@ -8,9 +8,8 @@ tests, and look things up on the web, asking you before anything that changes
 a file, runs code, or goes online.
 
 This is a personal project, built over a few days for my own PC (Linux Mint,
-AMD RX 9070 16 GB, running PrismML's Bonsai 2 27B). It isn't a product, and
-nothing here is novel. It's here in case you want to fiddle with your own
-version. Fork it, gut it, ship it — see [License](#license).
+AMD RX 9070 16 GB, running PrismML's Bonsai 2 27B). It's here in case you want
+to fiddle with your own version, see [License](#license).
 
 ## Requirements
 
