@@ -105,8 +105,6 @@ fetch_source() {
 
 build() {
   local force="${1:-0}" stamp_file="$CFG_BUILD_DIR/.build-stamp"
-  # Carry over the stamp from before the rename so it doesn't force a rebuild.
-  [[ -f "$CFG_BUILD_DIR/.bonsai-stamp" ]] && mv "$CFG_BUILD_DIR/.bonsai-stamp" "$stamp_file"
   if ((!force)) && [[ -x "$CFG_SERVER_BIN" && -f "$stamp_file" ]] \
      && [[ "$(cat "$stamp_file")" == "$(build_stamp)" ]]; then
     info "Llama-server is built and current (running via $CFG_BACKEND)."

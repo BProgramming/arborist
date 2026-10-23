@@ -23,6 +23,7 @@ class FakeApprover:
         self.change_requests: list[tuple[str, str, bool]] = []
         self.run_requests: list[tuple[str, list[list[str]], str, int]] = []
         self.fetch_requests: list[tuple[str, str]] = []
+        self.fetch_details: list[tuple[str, str]] = []  # (reason, scope)
 
     def approve_change(self, rel_path, diff, is_new):
         self.change_requests.append((rel_path, diff, is_new))
@@ -32,8 +33,9 @@ class FakeApprover:
         self.run_requests.append((rel_path, steps, cwd, timeout))
         return self.run_answers.pop(0) if self.run_answers else Decision(True)
 
-    def approve_fetch(self, host, url):
+    def approve_fetch(self, host, url, reason="", scope=""):
         self.fetch_requests.append((host, url))
+        self.fetch_details.append((reason, scope))
         return self.fetch_answers.pop(0) if self.fetch_answers else Decision(True)
 
 

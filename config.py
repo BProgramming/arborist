@@ -21,9 +21,11 @@ DEFAULTS: dict = {
     "paths": {"root": "~/.local/share/arborist"},
     "build": {
         "backend": "vulkan",
-        "repo": "https://github.com/PrismML-Eng/llama.cpp.git",
-        "ref": "prism",
-        "hip_target": "gfx1201",
+        "repo": "https://github.com/ggml-org/llama.cpp.git",
+        "ref": "master",
+        # AMD GPU architecture for the HIP backend (e.g. "gfx1201"); required
+        # only when backend = "hip".
+        "hip_target": "",
         "native": True,
         "jobs": 0,
     },
@@ -140,6 +142,9 @@ def _check(cond: bool, msg: str) -> None:
 def _validate(c: dict) -> None:
     b, m, s, ch = c["build"], c["model"], c["server"], c["chat"]
     _check(b["backend"] in BACKENDS, f"build.backend must be one of {sorted(BACKENDS)}")
+    if b["backend"] == "hip":
+        _check(isinstance(b["hip_target"], str) and b["hip_target"].startswith("gfx"),
+               'build.backend = "hip" needs build.hip_target, e.g. "gfx1201" (see rocminfo)')
     for key in ("name", "repo", "file", "mmproj_file"):
         _check(isinstance(m[key], str), f"model.{key} must be a string")
     _check(m["repo"].count("/") == 1, 'model.repo must be a Hugging Face repo id, e.g. "owner/name-gguf"')

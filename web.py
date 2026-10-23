@@ -8,7 +8,8 @@ Safety, since this hands outside text to a model that can edit your files:
   * http/https only; hosts that resolve to private, loopback or link-local
     addresses are refused (so a page can't point it at your router, your
     LAN, or the llama-server itself). The check happens again on redirects.
-  * Every host needs approval before the first request to it (see Toolbox).
+  * Every request is checked with the Toolbox before it's sent, so each visit
+    can need its own approval (see Toolbox._allow).
   * Crawls stay on one host under one path prefix, obey robots.txt, pause
     between requests and stop at a page cap.
 """
@@ -266,11 +267,13 @@ class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
 
 
 class Fetcher:
-    """Fetches and caches pages. `allow_host` is asked before contacting a host."""
+    """Fetches and caches pages. `allow` is called with every URL before it's
+    requested (redirect targets and robots.txt included) and raises WebError
+    to stop it. Cached pages aren't requested again, so they aren't checked."""
 
-    def __init__(self, allow_host: Callable[[str], None], timeout: float = 15,
+    def __init__(self, allow: Callable[[str], None], timeout: float = 15,
                  allow_private: bool = False, max_bytes: int = MAX_BYTES):
-        self.allow_host = allow_host
+        self.allow = allow
         self.timeout = timeout
         self.allow_private = allow_private
         self.max_bytes = max_bytes
@@ -279,7 +282,7 @@ class Fetcher:
 
     def _check(self, url: str) -> None:
         parts = urlsplit(url)
-        self.allow_host(host_of(url))
+        self.allow(url)
         check_address(parts.hostname, parts.port, self.allow_private)
 
     def _open(self, url: str):
