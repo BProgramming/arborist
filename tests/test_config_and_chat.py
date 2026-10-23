@@ -351,3 +351,191 @@ def test_recall_dash_n_only_shows(load_toml, ws_root, capsys):
     assert "1 memory attached" in capsys.readouterr().out
     c._clear()
     assert not c.pending_memories
+
+
+# --------------------------------------------------------- harness upgrades ---
+
+@pytest.mark.parametrize("snippet, message", [
+    ('[compaction]\nthreshold = 1.5\n', "compaction.threshold"),
+    ('[compaction]\nthreshold = 0.5\ntarget = 0.6\n', "target must be below"),
+    ('[compaction]\nkeep_turns = 0\n', "keep_turns"),
+    ('[compaction]\nsummary_effort = "low"\n', "summary_effort"),
+    ('[tools]\nmax_repeat_calls = -1\n', "max_repeat_calls"),
+    ('[tools]\ncheckpoints = "yes"\n', "checkpoints"),
+    ('[tools]\ntest_timeout = 0\n', "test_timeout"),
+    ('[chat]\nenv_vars = ["PATH; rm -rf"]\n', "env_vars"),
+])
+def test_new_settings_are_validated(load_toml, snippet, message):
+    with pytest.raises(config.ConfigError, match=message):
+        load_toml(snippet)
+
+
+def test_environment_is_in_the_system_prompt_and_stable(load_toml, ws_root, monkeypatch):
+    import chat
+    monkeypatch.setenv("VIRTUAL_ENV", "/home/me/proj/.venv")
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    first = c._body([], with_tools=True)["messages"][0]["content"]
+    assert "Environment:\n- Current date and time: " in first
+    assert "as of the start of this conversation" in first
+    assert "- OS: " in first and "- Toolchains: " in first
+    assert "- $VIRTUAL_ENV=/home/me/proj/.venv" in first
+    # Byte-identical on the next request, so the server's prompt cache holds.
+    assert c._body([], with_tools=True)["messages"][0]["content"] == first
+
+
+def test_plain_chat_still_gets_the_date_but_not_the_machine(load_toml):
+    import chat
+    system = chat.Chat(load_toml(), None, tools_enabled=True)._system()
+    assert "Current date and time" in system and "Toolchains" not in system
+
+
+def test_date_line_format():
+    from datetime import datetime, timedelta, timezone
+    import chat
+    now = datetime(2026, 10, 22, 19, 54, tzinfo=timezone(timedelta(hours=-4), "EDT"))
+    assert chat.date_line(now) == ("- Current date and time: Thursday, October 22, 2026, 19:54 EDT "
+                                   "(UTC-04:00), as of the start of this conversation")
+
+
+def test_unlisted_env_vars_stay_out(load_toml, ws_root, monkeypatch):
+    import chat
+    monkeypatch.setenv("API_TOKEN", "sk-secret")
+    system = chat.Chat(load_toml(), ws_root, tools_enabled=True)._system()
+    assert "sk-secret" not in system
+
+
+def test_failed_turn_restores_history_even_after_compaction(load_toml, ws_root, capsys):
+    import chat
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    earlier = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "ok"}]
+    c.messages = earlier + [{"role": "user", "content": "this turn"}]
+
+    def compact_then_fail(messages, force=False):
+        messages[:] = [{"role": "user", "content": "<summary/> this turn"}]
+        raise RuntimeError("server went away")
+
+    c.compactor.maybe_compact = compact_then_fail
+    c.client.healthy = lambda: True
+    c._reply(label="this turn")
+    assert c.messages == earlier
+
+
+def test_summarize_sends_a_tool_free_request(load_toml, ws_root):
+    import chat
+    c = chat.Chat(load_toml(EFFORTS + '[chat]\nreasoning_effort = "high"\n[compaction]\nsummary_effort = "low"\n'), ws_root, tools_enabled=True)
+    sent = []
+
+    def fake_stream(body):
+        sent.append(body)
+        yield {"choices": [{"delta": {"reasoning_content": "hmm"}}]}
+        yield {"choices": [{"delta": {"content": "Goal: "}}]}
+        yield {"choices": [{"delta": {"content": "fix it."}}]}
+
+    c.client.stream_chat = fake_stream
+    assert c._summarize("USER:\nfix it") == "Goal: fix it."
+    body = sent[0]
+    assert "tools" not in body and body["reasoning_effort"] == "low"
+    assert "<transcript>\nUSER:\nfix it\n</transcript>" in body["messages"][1]["content"]
+
+
+def test_undo_command_restores_and_tells_the_model(load_toml, ws_root, monkeypatch, capsys):
+    import shutil
+    import chat
+    if shutil.which("git") is None:
+        pytest.skip("git not installed")
+    (ws_root / "a.py").write_text("v1\n")
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    c.toolbox.approver = __import__("conftest").FakeApprover()
+    c.toolbox.begin_turn("bump the version")
+    c.toolbox.call("read_file", {"path": "a.py"})
+    c.toolbox.call("edit_file", {"path": "a.py", "old_string": "v1", "new_string": "v2"})
+
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    c.command("/undo")
+    out = capsys.readouterr().out
+    assert "before: bump the version" in out and "restore a.py" in out
+    assert (ws_root / "a.py").read_text() == "v1\n"
+    # The model hears about it with the next message, and has to re-read.
+    composed = c._compose("now what?")
+    assert composed.startswith("<note>\nThe user restored") and "a.py" in composed
+    assert "read a.py with read_file" in c.toolbox.call(
+        "edit_file", {"path": "a.py", "old_string": "v1", "new_string": "v3"}).content
+
+    c.command("/undo")
+    assert "nothing to undo" in capsys.readouterr().out
+    c.command("/checkpoints")
+    out = capsys.readouterr().out
+    assert "bump the version" in out and "[safety]" in out
+
+
+def test_undo_explains_when_unavailable(load_toml, ws_root, capsys):
+    import chat
+    c = chat.Chat(load_toml('[tools]\ncheckpoints = false\n'), ws_root, tools_enabled=True)
+    c.command("/undo")
+    assert "tools.checkpoints is off" in capsys.readouterr().out
+    c = chat.Chat(load_toml(), None, tools_enabled=True)
+    c.command("/checkpoints")
+    assert "--no-tools" in capsys.readouterr().out
+
+
+def test_compact_command(load_toml, ws_root, capsys):
+    import chat
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    c.command("/compact")
+    assert "nothing to compact yet" in capsys.readouterr().out
+    c.messages = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
+    c.command("/compact")
+    assert "already short" in capsys.readouterr().out
+
+
+def test_long_session_stays_inside_a_small_window(load_toml, ws_root, monkeypatch):
+    """Several turns of big reads through the real loop: every request the
+    model sees stays under the window, and the work so far is summarised."""
+    import json as _json
+    import chat
+    for i in range(6):
+        (ws_root / f"mod{i}.py").write_text(f"# module {i}\n" + "value = 1\n" * 300)
+    c = chat.Chat(load_toml('[server]\nctx_size = 8000\n'), ws_root, tools_enabled=True)
+    c.toolbox.approver = __import__("conftest").FakeApprover()
+    sizes, summaries = [], []
+
+    def fake_stream(body):
+        if "tools" not in body:  # the summary request
+            summaries.append(body)
+            yield {"choices": [{"delta": {"content": "Goal: review modules.\nDone so far: read mod0-mod3."}}]}
+            return
+        sizes.append(c._measure(body["messages"][1:]) / c.compactor.chars_per_token)
+        last = body["messages"][-1]
+        if last["role"] == "user":
+            n = int(last["content"].rsplit(" ", 1)[-1])
+            args = _json.dumps({"path": f"mod{n}.py"})
+            yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": f"c{n}", "type": "function",
+                                                          "function": {"name": "read_file", "arguments": args}}]}}]}
+        else:
+            yield {"choices": [{"delta": {"content": "Read it."}}]}
+
+    c.client.stream_chat = fake_stream
+    for n in range(6):
+        c.messages.append({"role": "user", "content": f"read module {n}"})
+        c._reply(label=f"read module {n}")
+    window = 8000
+    assert max(sizes) < window, sizes
+    assert summaries, "older turns should have been summarised"
+    assert c.messages[0]["content"].startswith("<earlier_conversation_summary>")
+    assert c.messages[-1] == {"role": "assistant", "content": "Read it."}
+
+
+def test_checkpoint_days_is_validated_and_startup_prune_reports(load_toml, ws_root, capsys, monkeypatch):
+    import chat
+    with pytest.raises(config.ConfigError, match="checkpoint_days"):
+        load_toml('[tools]\ncheckpoint_days = -1\n')
+    cfg = load_toml()
+    assert cfg["tools"]["checkpoint_days"] == 14
+    monkeypatch.setattr(chat, "prune_store", lambda store, days: (5, 1))
+    chat.prune_old_checkpoints(cfg)
+    assert "pruned 5 checkpoints older than 14 days, 1 workspace store removed" in capsys.readouterr().out
+    called = []
+    monkeypatch.setattr(chat, "prune_store", lambda store, days: called.append(days) or (0, 0))
+    chat.prune_old_checkpoints(load_toml('[tools]\ncheckpoint_days = 0\n'))
+    chat.prune_old_checkpoints(load_toml('[tools]\ncheckpoints = false\n'))
+    assert called == []

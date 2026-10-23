@@ -1,10 +1,12 @@
-"""Tools the model can call: read, list, search, edit and write files,
-check/run a single source file, and read web pages.
+"""Tools the model can call: see the project tree, outline, read, list,
+search, edit and write files, check/run a single source file, run a test
+suite, and read web pages.
 
 Everything is confined to one workspace directory (where you launched the
 chat). The terminal UI supplies an Approver, which is asked before any file
 changes, before anything runs, and before contacting a new website; tests
-supply a fake one.
+supply a fake one. When checkpoints are on, the workspace is snapshotted
+before the first change or run of each turn, so /undo can put it back.
 
 Tool failures are returned to the model as "error: ..." text rather than
 raised, so it can read the message and correct itself. A tool bug becomes an
@@ -17,14 +19,20 @@ import fnmatch
 import json
 import os
 import re
+import subprocess
 import traceback
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import TYPE_CHECKING, Callable, Protocol
 from urllib.parse import urlsplit
 
+import outline as outline_mod
 import runners
 import web
+
+if TYPE_CHECKING:
+    from checkpoints import Checkpoints
 
 # Directories nobody wants the model walking through.
 IGNORED_DIRS = {
@@ -58,7 +66,9 @@ class Limits:
     max_output_chars: int = 20000
     max_list_entries: int = 300
     max_grep_matches: int = 100
+    max_tree_depth: int = 4
     run_timeout: int = 120
+    test_timeout: int = 300
     web_enabled: bool = True
     web_allowed_hosts: list[str] = field(default_factory=list)  # pre-approved hosts
     web_page_chars: int = 12000
@@ -114,6 +124,14 @@ class Workspace:
     def forget(self) -> None:
         self._seen.clear()
 
+    def unsee(self, path: str) -> None:
+        """Forget one file, e.g. when its contents were compacted out of the
+        conversation: the model has to read it again before editing."""
+        try:
+            self._seen.pop(self.resolve(path), None)
+        except ToolError:
+            pass
+
     def require_fresh(self, p: Path) -> None:
         """Refuse to change a file the model hasn't read, or that changed since."""
         if p not in self._seen:
@@ -121,15 +139,49 @@ class Workspace:
         if p.stat().st_mtime_ns != self._seen[p]:
             raise ToolError(f"{self.rel(p)} changed on disk since you read it; read it again first")
 
+    def git_visible(self) -> set[str] | None:
+        """Files git would show here (tracked + untracked, minus .gitignore'd),
+        relative to the root; None when the workspace isn't in a git repo."""
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(self.root), "ls-files", "--cached", "--others",
+                 "--exclude-standard", "-z"],
+                capture_output=True, timeout=15, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode != 0:
+            return None
+        return {p for p in r.stdout.decode("utf-8", "surrogateescape").split("\0") if p}
+
     def walk_files(self, start: Path):
-        """Yield files under start, skipping ignored and hidden-tool directories."""
+        """Yield files under start, skipping ignored and hidden-tool directories.
+
+        In a git repo, .gitignore'd files are skipped too, unless start itself
+        is somewhere git ignores (then the model asked for it on purpose).
+        """
         if start.is_file():
             yield start
             return
+        visible = self.git_visible()
+        if visible is not None:
+            prefix = "" if start == self.root else self.rel(start) + "/"
+            visible = {v for v in visible if v.startswith(prefix)} or None
+        dirs = None
+        if visible is not None:
+            dirs = {"."}
+            for v in visible:
+                parts = v.split("/")[:-1]
+                dirs.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
         for dirpath, dirnames, filenames in os.walk(start):
-            dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS)
+            here = Path(dirpath)
+            kept = sorted(d for d in dirnames if d not in IGNORED_DIRS)
+            if dirs is not None:
+                kept = [d for d in kept if self.rel(here / d) in dirs]
+            dirnames[:] = kept
             for name in sorted(filenames):
-                yield Path(dirpath) / name
+                f = here / name
+                if visible is None or self.rel(f) in visible:
+                    yield f
 
 
 def _read_text(p: Path) -> str:
@@ -146,6 +198,39 @@ def _read_text(p: Path) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         raise ToolError(f"{p.name} is not UTF-8 text") from None
+
+
+TREE_FILES_PER_DIR = 25  # past this, a directory's files are summarised
+
+
+def _count_files(node: dict) -> int:
+    return sum(1 if child is None else _count_files(child) for child in node.values())
+
+
+def render_tree(node: dict, depth: int, lines: list[str], budget: int, indent: str = "  ") -> None:
+    """Indented tree, directories first. Below `depth`, a directory is one line
+    with its file count; a directory with many files lists some plus a summary."""
+    dirs = sorted(k for k, v in node.items() if v is not None)
+    files = sorted(k for k, v in node.items() if v is None)
+    for name in dirs:
+        if len(lines) >= budget:
+            return
+        child = node[name]
+        if depth <= 1:
+            lines.append(f"{indent}{name}/ ({_count_files(child)} files)")
+        else:
+            lines.append(f"{indent}{name}/")
+            render_tree(child, depth - 1, lines, budget, indent + "  ")
+    shown = files if len(files) <= TREE_FILES_PER_DIR else files[:TREE_FILES_PER_DIR - 10]
+    for name in shown:
+        if len(lines) >= budget:
+            return
+        lines.append(indent + name)
+    if len(shown) < len(files) and len(lines) < budget:
+        rest = files[len(shown):]
+        kinds = Counter(Path(f).suffix or "(no extension)" for f in rest)
+        summary = ", ".join(f"{k} ×{n}" for k, n in kinds.most_common(5))
+        lines.append(f"{indent}… {len(rest)} more files ({summary})")
 
 
 def _diff(rel: str, old: str, new: str) -> str:
@@ -187,8 +272,15 @@ class Toolbox:
     def __init__(self, workspace: Workspace, approver: Approver, limits: Limits | None = None,
                  log_dir: str | os.PathLike | None = None,
                  on_output: Callable[[str], None] | None = None,
-                 on_notice: Callable[[str], None] | None = None):
+                 on_notice: Callable[[str], None] | None = None,
+                 checkpoints: "Checkpoints | None" = None):
         self.ws = workspace
+        self.checkpoints = checkpoints
+        # Did a test run fail in this turn? The chat then offers to let the
+        # model fix it.
+        self.tests_failed = False
+        self._turn_label = ""
+        self._checkpointed = False  # this turn already has its snapshot
         self.approver = approver
         self.limits = limits or Limits()
         self.log_dir = Path(log_dir) if log_dir else self.ws.root / ".arborist-logs"
@@ -212,6 +304,22 @@ class Toolbox:
         self._checked.clear()
         self.fetcher.cache.clear()
         self.web_tainted = False
+
+    def begin_turn(self, label: str) -> None:
+        """A new user message: its first change or run gets a fresh checkpoint."""
+        self._turn_label = " ".join(label.split())[:80]
+        self._checkpointed = False
+        self.tests_failed = False
+
+    def _checkpoint(self) -> None:
+        """Snapshot the workspace once per turn, before anything changes it."""
+        if self.checkpoints is None or self._checkpointed:
+            return
+        self._checkpointed = True
+        try:
+            self.checkpoints.snapshot(self._turn_label or "before changes")
+        except Exception as e:  # a checkpoint problem must never block the work
+            self.on_notice(f"couldn't save a checkpoint ({e}); /undo won't cover this turn")
 
     @property
     def schemas(self) -> list[dict]:
@@ -311,6 +419,47 @@ class Toolbox:
             out += f"\n[{total - len(matches)} more not shown; narrow the pattern or path]"
         return out
 
+    # view_tree ------------------------------------------------------------
+
+    def tool_view_tree(self, path: str = ".", depth: int | None = None) -> str:
+        start = self.ws.resolve(path)
+        if not start.is_dir():
+            raise ToolError(f"{path} is not a directory" if start.exists() else f"no such directory: {path}")
+        cap = self.limits.max_tree_depth
+        depth = cap if depth in (None, 0) else min(_as_int(depth, "depth", 1), cap)
+
+        # Nested dicts: a file is None, a directory is a dict.
+        tree: dict = {}
+        count = 0
+        for f in self.ws.walk_files(start):
+            node = tree
+            parts = f.relative_to(start).parts
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = None
+            count += 1
+        if not count:
+            return f"{self.ws.rel(start)}/ has no files"
+
+        lines: list[str] = []
+        budget = self.limits.max_list_entries
+        render_tree(tree, depth, lines, budget)
+        if len(lines) >= budget:
+            lines.append(f"[cut at {budget} lines; view a subdirectory for more]")
+        head = f"{'.' if start == self.ws.root else self.ws.rel(start)}/ ({count} files)"
+        return "\n".join([head] + lines)
+
+    # outline_file ---------------------------------------------------------
+
+    def tool_outline_file(self, path: str) -> str:
+        p = self.ws.resolve(path)
+        if p.suffix not in outline_mod.OUTLINE_SUFFIXES:
+            raise ToolError(f"no outline for {p.suffix or 'files without an extension'}; supported: "
+                            f"{', '.join(sorted(outline_mod.OUTLINE_SUFFIXES))}. Use grep or read_file")
+        text = _read_text(p)
+        return (f"Outline of {self.ws.rel(p)} (L = line numbers; read a part with "
+                f"read_file offset/limit):\n" + outline_mod.outline(text, p.suffix))
+
     # grep -----------------------------------------------------------------
 
     def tool_grep(self, pattern: str, path: str = ".", glob: str | None = None,
@@ -356,6 +505,7 @@ class Toolbox:
                 return f"The user declined this change to {rel}; the file was not modified.{why}"
             if d.always:
                 self.auto_edits = True
+        self._checkpoint()
         p.parent.mkdir(parents=True, exist_ok=True)
         # newline="" keeps the file's existing line endings as written.
         with open(p, "w", encoding="utf-8", newline="") as fh:
@@ -443,6 +593,7 @@ class Toolbox:
                               "Tell the user this and stop; don't try another way to run it.",
                               hard_stop=True)
 
+        self._checkpoint()  # a script can change files too
         outcome = runners.execute(plan, self.log_dir, self.limits.run_timeout, self.on_output,
                                   name=p.stem)
         log = _read_log(outcome.log_path)
@@ -456,6 +607,48 @@ class Toolbox:
         # (which could drop the instructions in the footer).
         room = max(self.limits.max_output_chars - len(header) - len(footer), 200)
         return ToolResult(header + _truncate(log, room) + footer, hard_stop=True)
+
+    # run_tests ------------------------------------------------------------
+
+    def tool_run_tests(self, path: str = ".") -> ToolResult | str:
+        p = self.ws.resolve(path)
+        if not p.exists():
+            raise ToolError(f"no such file or directory: {path}")
+        rel = self.ws.rel(p)
+        plan = runners.plan_tests(p, self.ws.root, self.log_dir / "build")
+        if not plan.ok:
+            lines = [f"Can't run tests for {rel}:"]
+            lines += [f"  ok: {d}" for d in plan.checked]
+            lines += [f"  MISSING: {m}" for m in plan.problems]
+            lines.append("Tell the user what's missing; don't try to run the tests another way.")
+            return "\n".join(lines)
+
+        d = self.approver.approve_run(f"tests ({rel})", plan.steps, str(plan.cwd), self.limits.test_timeout)
+        if not d.approved:
+            why = f" Their reason: {d.reason}" if d.reason else ""
+            return ToolResult(f"The user declined to run the tests; nothing was executed.{why} "
+                              "Tell the user this and stop.", hard_stop=True)
+
+        self._checkpoint()
+        outcome = runners.execute(plan, self.log_dir, self.limits.test_timeout, self.on_output,
+                                  name="tests")
+        log = _read_log(outcome.log_path)
+        passed = outcome.exit_code == 0 and not outcome.timed_out
+        status = ("timed out after %ds" % self.limits.test_timeout) if outcome.timed_out \
+            else ("passed" if passed else f"failed (exit code {outcome.exit_code})")
+        notes = "".join(f"note: {w}\n" for w in plan.warnings)
+        header = (f"Tests for {rel} {status}, {outcome.duration:.1f}s. Full log: {outcome.log_path}\n"
+                  f"{notes}--- {'summary' if passed else 'failures and summary'} ---\n")
+        self.tests_failed = not passed
+        if passed:
+            footer = ("\n--- end ---\nNow tell the user the result briefly. Don't call any more tools.")
+        else:
+            footer = ("\n--- end ---\nNow present the bugs to the user. For each failure: what's "
+                      "wrong, where (file and line), and the fix you propose. Don't change anything "
+                      "and don't call any more tools; the user will be asked whether you may fix them.")
+        room = max(self.limits.max_output_chars - len(header) - len(footer), 200)
+        body = runners.focus_test_output(log, passed)
+        return ToolResult(header + _truncate(body, room) + footer, hard_stop=True)
 
     # fetch_url / crawl_docs -----------------------------------------------
 
@@ -578,6 +771,17 @@ def _path_of(url: str) -> str:
 _PATH = {"type": "string", "description": "File path, relative to the workspace root"}
 
 TOOL_SCHEMAS = [
+    _fn("view_tree",
+        "Show the project's directory tree (directories first, .gitignore'd files left out). "
+        "Use it first in an unfamiliar project to see where things are.",
+        {"path": {"type": "string", "description": "Directory to show (default: workspace root)"},
+         "depth": {"type": "integer", "description": "Levels to expand (default and maximum: 4)"}},
+        []),
+    _fn("outline_file",
+        "List a source file's imports, classes, functions and methods with line numbers, without "
+        "their bodies. Then read just the part you need with read_file offset and limit.",
+        {"path": _PATH},
+        ["path"]),
     _fn("read_file",
         "Read a text file. Returns numbered lines (the numbers are not part of the file). "
         "Long files come back in pages; use offset to continue.",
@@ -592,7 +796,8 @@ TOOL_SCHEMAS = [
          "path": {"type": "string", "description": "Directory to search in (default: workspace root)"}},
         []),
     _fn("grep",
-        "Search file contents with a regular expression. Returns path:line: text for each match.",
+        "Search file contents across the workspace with a regular expression (.gitignore'd files "
+        "are skipped). Returns path:line: text for each match.",
         {"pattern": {"type": "string", "description": "Python regular expression"},
          "path": {"type": "string", "description": "File or directory to search (default: workspace root)"},
          "glob": {"type": "string", "description": "Only search files matching this glob, e.g. '*.py'"},
@@ -623,6 +828,14 @@ TOOL_SCHEMAS = [
         "tool calls in this turn.",
         {"path": _PATH},
         ["path"]),
+    _fn("run_tests",
+        "Run the project's tests (pytest or unittest, cargo test, dart/flutter test, npm test or "
+        "node --test, picked from the project files). The user must approve. Returns the failures "
+        "and the summary. After this you must explain the result and stop: no further tool calls "
+        "in this turn.",
+        {"path": {"type": "string", "description": "A test file or directory (default: the whole "
+                                                   "workspace)"}},
+        []),
     _fn("fetch_url",
         "Read a web page (e.g. documentation) as plain text. Long pages come back in parts; use "
         "offset to continue. The first part lists links on the same site. The user approves each "
