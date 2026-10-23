@@ -106,7 +106,8 @@ def test_failing_pytest_run_end_to_end(ws_root, make_toolbox):
     assert res.hard_stop
     assert res.content.startswith("Tests for . failed (exit code 1)")
     assert "assert 2 + 2 == expected" in res.content and "1 failed, 1 passed" in res.content
-    assert "Don't call any more tools" in res.content
+    assert "fix you propose" in res.content and "don't call any more tools" in res.content
+    assert tb.tests_failed
     rel, steps, cwd, timeout = approver.run_requests[0]
     assert rel == "tests (.)" and timeout == 300 and "pytest" in steps[0]
 
@@ -155,86 +156,6 @@ def test_cargo_test_end_to_end(ws_root, make_toolbox):
     assert "adds" in res.content and "assertion" in res.content
 
 
-# ---------------------------------------------------------------- fix mode ---
-
-def test_fix_mode_keeps_the_turn_going_on_failure(ws_root, make_toolbox):
-    pytest.importorskip("pytest")
-    write(ws_root, "test_math.py", FAILING)
-    tb = make_toolbox()
-    tb.fix_tests = True
-    res = tb.call("run_tests", {})
-    assert not res.hard_stop and "Fix mode: find the cause" in res.content
-
-
-def test_fix_mode_still_stops_on_a_pass_or_a_refusal(ws_root, make_toolbox):
-    pytest.importorskip("pytest")
-    write(ws_root, "test_ok.py", PASSING)
-    tb = make_toolbox(FakeApprover(run=[Decision(True), Decision(False)]))
-    tb.fix_tests = True
-    passed = tb.call("run_tests", {})
-    assert passed.hard_stop and "The tests pass" in passed.content
-    assert tb.call("run_tests", {}).hard_stop  # declined
-
-
-def test_fix_mode_changes_the_schema_and_guide(ws_root, make_toolbox):
-    import agent
-    tb = make_toolbox()
-    normal = next(t for t in tb.schemas if t["function"]["name"] == "run_tests")
-    tb.fix_tests = True
-    fixing = next(t for t in tb.schemas if t["function"]["name"] == "run_tests")
-    assert "you must explain the result and stop" in normal["function"]["description"]
-    assert "Fix mode is on" in fixing["function"]["description"]
-    assert "Fix mode is on for tests" in agent.tool_guide("/p", fix_tests=True)
-    assert "Fix mode" not in agent.tool_guide("/p")
-
-
-def test_fix_loop_end_to_end(ws_root, make_toolbox):
-    """read → test (fails) → fix → test (passes) → report, all in one turn."""
-    pytest.importorskip("pytest")
-    from test_agent import FakeModel, NullUI, run, text_reply, tool_reply
-    write(ws_root, "calc.py", "def add(a, b):\n    return a - b\n")
-    write(ws_root, "test_calc.py", "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n")
-    approver = FakeApprover()
-    tb = make_toolbox(approver)
-    tb.fix_tests = True
-    model = FakeModel(
-        tool_reply(("run_tests", {})),
-        tool_reply(("read_file", {"path": "calc.py"})),
-        tool_reply(("edit_file", {"path": "calc.py", "old_string": "a - b", "new_string": "a + b"})),
-        tool_reply(("run_tests", {})),
-        text_reply("Fixed: add() subtracted. Tests pass."),
-        text_reply("should never be requested"))
-    result, _ = run(model, tb)
-    assert result.text == "Fixed: add() subtracted. Tests pass."
-    assert result.hard_stopped  # the passing run ended tool use
-    assert len(approver.run_requests) == 2  # each run was approved separately
-    assert [r["with_tools"] for r in model.requests] == [True, True, True, True, False]
-
-
-def test_without_fix_mode_a_failure_ends_the_turn(ws_root, make_toolbox):
-    pytest.importorskip("pytest")
-    from test_agent import FakeModel, run, text_reply, tool_reply
-    write(ws_root, "test_math.py", FAILING)
-    model = FakeModel(tool_reply(("run_tests", {})), text_reply("one test fails because…"))
-    result, _ = run(model, make_toolbox())
-    assert result.hard_stopped and model.requests[-1]["with_tools"] is False
-
-
-def test_fix_flag_on_the_command_line(monkeypatch):
-    import chat
-    seen = {}
-
-    def fake_chat(cfg, workspace, tools_enabled, fix_tests=False):
-        seen["fix"] = fix_tests
-        raise SystemExit(0)
-
-    monkeypatch.setattr(chat, "Chat", fake_chat)
-    for argv, expected in ((["--fix"], True), (["-f"], True), ([], False)):
-        with pytest.raises(SystemExit):
-            chat.main(argv + ["--workspace", "."])
-        assert seen["fix"] is expected
-
-
 def test_a_same_size_edit_right_after_a_run_is_not_stale(ws_root, make_toolbox):
     """Python's .pyc check uses size + whole-second mtime; arborist's runs
     mustn't leave caches that make a quick same-size fix invisible."""
@@ -246,3 +167,101 @@ def test_a_same_size_edit_right_after_a_run_is_not_stale(ws_root, make_toolbox):
     write(ws_root, "calc.py", "def add(a, b):\n    return a + b\n")  # same size, same second
     assert "passed" in tb.call("run_tests", {}).content.splitlines()[0]
     assert not (ws_root / "__pycache__").exists()
+
+
+def test_tests_failed_resets_each_turn_and_on_a_pass(ws_root, make_toolbox):
+    pytest.importorskip("pytest")
+    write(ws_root, "test_math.py", FAILING)
+    tb = make_toolbox()
+    tb.call("run_tests", {})
+    assert tb.tests_failed
+    tb.begin_turn("next")
+    assert not tb.tests_failed
+    write(ws_root, "test_math.py", PASSING)
+    tb.call("run_tests", {})
+    assert not tb.tests_failed
+
+
+# ------------------------------------------------------ asking to fix them ---
+
+@pytest.fixture
+def chat_with_failing_tests(ws_root, tmp_path, monkeypatch):
+    """A Chat whose model runs the (failing) tests, then presents the bug."""
+    pytest.importorskip("pytest")
+    import json
+    import chat
+    import config
+    cfg_file = tmp_path / "t.toml"
+    cfg_file.write_text(f'[paths]\nroot = "{tmp_path / "root"}"\n'
+                        '[model]\nrepo = "a/b"\nfile = "c.gguf"\n')
+    monkeypatch.setenv("ARBORIST_CONFIG", str(cfg_file))
+    write(ws_root, "calc.py", "def add(a, b):\n    return a - b\n")
+    write(ws_root, "test_calc.py", "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n")
+    c = chat.Chat(config.load(), ws_root, tools_enabled=True)
+    c.toolbox.approver = FakeApprover()
+    requests = []
+
+    def call(name, args, cid):
+        return {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": cid, "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)}}]}}]}
+
+    def text(t):
+        return {"choices": [{"delta": {"content": t}}]}
+
+    script = [
+        [call("run_tests", {}, "t1")],
+        [text("Bug: calc.py:2 subtracts. Proposed fix: return a + b.")],
+        # After "yes": read, fix, re-run (passes), report.
+        [call("read_file", {"path": "calc.py"}, "r1")],
+        [call("edit_file", {"path": "calc.py", "old_string": "a - b", "new_string": "a + b"}, "e1")],
+        [call("run_tests", {}, "t2")],
+        [text("Fixed; tests pass.")],
+    ]
+
+    def stream(body):
+        requests.append(body)
+        yield from script.pop(0)
+
+    c.client.stream_chat = stream
+    c.requests = requests
+    return c
+
+
+def test_failing_tests_lead_to_an_offer_and_yes_fixes(chat_with_failing_tests, ws_root, monkeypatch):
+    import chat
+    c = chat_with_failing_tests
+    c.messages.append({"role": "user", "content": "run the tests"})
+    c._reply(label="run the tests")
+    assert c.fix_offer
+    assert (ws_root / "calc.py").read_text().endswith("a - b\n")  # nothing changed yet
+
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    assert c.offer_fix() is True
+    assert not c.fix_offer  # the re-run passed, so no second offer
+    assert (ws_root / "calc.py").read_text().endswith("a + b\n")
+    assert c.messages[-1]["content"] == "Fixed; tests pass."
+    go_ahead = [m for m in c.messages if m["role"] == "user"][-1]["content"]
+    assert go_ahead == chat.FIX_GO_AHEAD
+
+
+def test_saying_no_changes_nothing(chat_with_failing_tests, ws_root, monkeypatch, capsys):
+    c = chat_with_failing_tests
+    c.messages.append({"role": "user", "content": "run the tests"})
+    c._reply(label="run the tests")
+    n = len(c.messages)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    assert c.offer_fix() is False
+    assert len(c.messages) == n and not c.fix_offer
+    assert (ws_root / "calc.py").read_text().endswith("a - b\n")
+    assert "tell the model what you'd like instead" in capsys.readouterr().out
+
+
+def test_ctrl_c_at_the_offer_is_a_no(chat_with_failing_tests, monkeypatch):
+    c = chat_with_failing_tests
+    c.fix_offer = True
+
+    def interrupt(prompt=""):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupt)
+    assert c.offer_fix() is False and not c.fix_offer

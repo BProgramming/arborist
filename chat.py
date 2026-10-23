@@ -90,6 +90,11 @@ Input:
 """
 
 
+# Sent as the user's message when they agree to let the model fix failing tests.
+FIX_GO_AHEAD = ("Yes, fix them as you proposed. Then run the tests again to check, and tell me "
+                "the result.")
+
+
 class Interrupted(BaseException):
     """Ctrl-C during a turn. A BaseException (like KeyboardInterrupt) so that
     the catch-all error handling in tools and turns lets it through."""
@@ -500,8 +505,7 @@ def environment_facts(workspace: Path, env_vars: list[str]) -> list[str]:
 # -------------------------------------------------------------------- chat ---
 
 class Chat:
-    def __init__(self, cfg: dict, workspace: Path | None, tools_enabled: bool,
-                 fix_tests: bool = False):
+    def __init__(self, cfg: dict, workspace: Path | None, tools_enabled: bool):
         self.cfg = cfg
         ch = cfg["chat"]
         self.client = Client(cfg["derived"]["base_url"])
@@ -537,6 +541,9 @@ class Chat:
         # One-off notes for the model that ride along with the next message
         # (e.g. "the user restored files with /undo").
         self.pending_notes: list[str] = []
+        # Set when a turn ends with failing tests: the user is asked whether
+        # the model may fix them.
+        self.fix_offer = False
 
         self.toolbox: Toolbox | None = None
         self.tools_enabled = False
@@ -552,7 +559,6 @@ class Chat:
                 on_output=self.ui.run_output,
                 on_notice=self.ui.notice,
                 checkpoints=self.checkpoints,
-                fix_tests=fix_tests,
             )
             self.tools_enabled = tools_enabled
 
@@ -579,7 +585,7 @@ class Chat:
         parts = [self.system_prompt] if self.system_prompt else []
         env = [self.date_line]
         if self.tools_enabled and self.toolbox:
-            parts.append(agent.tool_guide(self.toolbox.ws.root, self.toolbox.fix_tests))
+            parts.append(agent.TOOL_GUIDE.format(root=self.toolbox.ws.root))
             parts.append(MEMORY_GUIDE)
             if self._env_facts is None:
                 self._env_facts = environment_facts(self.toolbox.ws.root, self.cfg["chat"]["env_vars"])
@@ -727,6 +733,8 @@ class Chat:
                 self.ctx_used = result.usage.get("total_tokens", self.ctx_used)
             if result.hard_stopped:
                 print(dim("(code ran; tools stay off until your next message)"))
+                if self.toolbox and self.toolbox.tests_failed:
+                    self.fix_offer = True
             elif result.paused:
                 print(dim("(paused; tell the model how to proceed)"))
             if self.cfg["chat"]["show_stats"]:
@@ -1003,6 +1011,22 @@ class Chat:
 
     # -- loop ----------------------------------------------------------------
 
+    def offer_fix(self) -> bool:
+        """After a turn ends with failing tests (and the model has presented
+        them), ask whether it may fix them. Yes sends the go-ahead."""
+        self.fix_offer = False
+        try:
+            ans = input(bold(yellow("Let the model fix these? [y/N]: "))).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return False
+        if ans not in ("y", "yes"):
+            print(dim("ok; tell the model what you'd like instead, or carry on"))
+            return False
+        self.messages.append({"role": "user", "content": self._compose(FIX_GO_AHEAD)})
+        self._reply(label="fix the failing tests")
+        return True
+
     def _read_input(self) -> str | None:
         line = input(PROMPT)
         if line.strip() != '"""':
@@ -1026,14 +1050,15 @@ class Chat:
         print(dim(f"    Model:  {self.model_name}"))
         print(dim(f"    Server: {self.cfg['derived']['base_url']}"))
         print(dim(f"    Effort: {self.effort or 'n/a'}"))
-        print(dim(f"    Tools:  {'ON' if self.tools_enabled else 'OFF'}"
-                  + ("  (fix mode: the model fixes and re-runs failing tests)"
-                     if self.toolbox and self.toolbox.fix_tests else "")))
+        print(dim(f"    Tools:  {'ON' if self.tools_enabled else 'OFF'}"))
         n = len(self.memory.entries())
         print(dim(f"    Memory: {n} note{'s' * (n != 1)}"))
 
         try:
             while True:
+                if self.fix_offer:
+                    self.offer_fix()
+                    continue
                 try:
                     line = self._read_input()
                 except KeyboardInterrupt:
@@ -1087,9 +1112,6 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Chat with the local LLM server.")
     ap.add_argument("--workspace", "-w", help="directory the model's tools may access (default: current directory)")
     ap.add_argument("--no-tools", action="store_true", help="plain chat: no file or run tools at all")
-    ap.add_argument("--fix", "-f", action="store_true",
-                    help="let the model fix failing tests and re-run them in the same turn "
-                         "(each test run still asks first)")
     args = ap.parse_args(argv)
 
     try:
@@ -1103,7 +1125,7 @@ def main(argv: list[str] | None = None) -> int:
         print(yellow(f"warning: the workspace is your whole home directory ({workspace}); "
                      "consider starting from a project folder"))
 
-    chat = Chat(cfg, workspace, tools_enabled=cfg["tools"]["enabled"], fix_tests=args.fix)
+    chat = Chat(cfg, workspace, tools_enabled=cfg["tools"]["enabled"])
 
     # Ctrl-C while a turn is in progress (streaming, a tool, an approval
     # prompt or a run) cancels the turn; at the prompt it just clears the line.
