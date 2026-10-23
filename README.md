@@ -5,7 +5,7 @@ builds [llama.cpp](https://github.com/ggml-org/llama.cpp), downloads a GGUF
 model from Hugging Face, starts the server, and drops you into a chat where the
 model can read, search and edit files in the current directory, run code and
 tests, and look things up on the web, asking you before anything that changes
-or runs.
+a file, runs code, or goes online.
 
 This is a personal project, built over a few days for my own PC (Linux Mint,
 AMD RX 9070 16 GB, running PrismML's Bonsai 2 27B). It isn't a product, and
@@ -29,14 +29,40 @@ sudo apt install build-essential cmake ninja-build git curl \
 ## Quick start
 
 ```sh
-git clone https://github.com/BProgramming/arborist
+git clone https://github.com/BProgramming/arborist ~/arborist
 cd ~/some/project            # the model's tools work on this folder
-~/path/to/arborist/arborist.sh
+~/arborist/arborist.sh
 ```
 
 The first run clones and builds llama.cpp, downloads and checksums the model,
 starts the server and opens the chat. Later runs reuse all of that. When you
 leave the chat, a server the script started is stopped.
+
+### Run it from anywhere with one word
+
+Add an alias to your shell so you can just type `agent` in any project folder.
+Open your bash config:
+
+```sh
+nano ~/.bashrc
+```
+
+Add this line at the bottom (change the path if you cloned it somewhere else):
+
+```sh
+alias agent="$HOME/arborist/arborist.sh"
+```
+
+Save with Ctrl-O, Enter, then exit with Ctrl-X. Load it into the current
+terminal (new terminals pick it up automatically):
+
+```sh
+source ~/.bashrc
+```
+
+Now `cd` into a project and run `agent`. Everything below works through the
+alias too: `agent --no-tools`, `agent status`, `agent stop`. The script finds
+its own config wherever it's called from. (On zsh, use `~/.zshrc` instead.)
 
 | Command | What it does |
 |---|---|
@@ -114,8 +140,8 @@ not treated as a command; `//help me` sends the literal `/help me`.
 | `check_dependencies` | check that a file's interpreter/compiler and imports are installed | no |
 | `run_file` | run a `.py`, `.rs`, `.dart`, `.js` or `.ts` file | **always** |
 | `run_tests` | run the project's tests (pytest/unittest, cargo, dart/flutter, npm, node) | **always** |
-| `fetch_url` | read a web page as text | the first time per site |
-| `crawl_docs` | follow links under one docs directory and search them | the first time per site |
+| `fetch_url` | read a web page as text | **every new page**, showing the URL and the model's reason |
+| `crawl_docs` | follow links under one docs directory and search them | **once per crawl**, showing the start URL and how far it may go |
 | `remember` | save a one-line note that's loaded into future sessions | only after web content is in the conversation |
 
 `view_tree`, `list_files` and `grep` skip `.gitignore`d files. There are
@@ -142,12 +168,16 @@ prompts are the main safety mechanism, so read them. Specifically:
   asks first and shows the command; look at what you're approving.
   `run_tests` runs whatever the project's test setup runs (`conftest.py`,
   `npm test` scripts and so on).
-- **Web approval is per site, not per URL.** Once you approve a host, or list
-  it in `tools.web_allowed_hosts`, later requests to it don't ask. So a model
-  that has read a secret from the workspace could send it to an
-  already-approved site inside a URL. There's no indication it would, but the
-  harness can't prevent it. Set `tools.web_enabled = false` if that matters
-  for a given folder.
+- **Every web request the model chooses asks first.** The prompt shows the
+  full URL, so you can see anything tucked into it (a model that has read a
+  secret could otherwise send it out inside a query string). Approval covers
+  only that one call. Reading further into a page already fetched doesn't
+  ask, since nothing is sent. Within one approved call, requests to the same
+  host go ahead: a same-host redirect, `robots.txt`, and the pages a crawl
+  reaches by following the site's own links (those URLs come from the site,
+  not the model). A redirect to a different host asks again.
+  `tools.web_allowed_hosts` turns the prompt off for the hosts you list,
+  which reopens that leak for them; it's empty by default.
 - **The model is never given credentials.** Web requests are plain GETs with
   no cookies or auth headers, only to public addresses (localhost, LAN and
   private ranges are refused, redirects included). The system prompt includes the

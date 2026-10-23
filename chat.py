@@ -274,12 +274,16 @@ class TerminalApprover:
             if ans in ("n", "no"):
                 return Decision(False, input("Reason for the model (optional): ").strip())
 
-    def approve_fetch(self, host: str, url: str) -> Decision:
+    def approve_fetch(self, host: str, url: str, reason: str = "", scope: str = "") -> Decision:
         print()
-        print(bold(yellow(f"Allow web access to {host}?")))
+        print(bold(yellow(f"The model wants to {'crawl' if scope else 'visit'} {host}:")))
         print("  " + url)
-        print(dim("  approving covers this site for the rest of the session"))
-        ans = input("Fetch? [y/N]: ").strip().lower()
+        if scope:
+            print("  " + scope)
+        if reason:
+            print(dim(f"  reason: {reason}"))
+        print(dim("  this approves only this " + ("crawl" if scope else "page")))
+        ans = input("Allow? [y/N]: ").strip().lower()
         if ans in ("y", "yes"):
             return Decision(True)
         return Decision(False, input("Reason for the model (optional): ").strip())

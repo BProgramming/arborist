@@ -192,10 +192,13 @@ checkpoints = true
 checkpoint_days = 14
 
 # Web: fetch_url reads one page; crawl_docs follows links under the same
-# directory of a docs site. The first request to each site asks you first
-# (web_allowed_hosts skips that). Private/LAN addresses are always refused,
-# and once a page is in the conversation, edits ask again even in "auto" mode.
+# directory of a docs site. Every new page (and every crawl) asks you first,
+# showing the URL and the model's reason. Private/LAN addresses are always
+# refused, and once a page is in the conversation, edits ask again even in
+# "auto" mode.
 web_enabled = true
+# Hosts that never ask. Convenient, but it reopens the leak the prompt closes:
+# the model could put anything it has read into a URL on these hosts.
 web_allowed_hosts = []          # e.g. ["docs.python.org", "doc.rust-lang.org"]
 
 # PERF: characters of a page returned per fetch_url call (~4 chars/token).

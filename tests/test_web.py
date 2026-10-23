@@ -163,17 +163,36 @@ def test_search_ranks_lines_by_matching_words():
 
 # --------------------------------------------------------------- fetch_url ---
 
-def test_fetch_asks_once_per_host_and_reads_the_page(site, web_toolbox):
+def test_every_new_page_asks_and_shows_the_url_and_reason(site, web_toolbox):
     base, hits = site
     approver = FakeApprover()
     tb = web_toolbox(approver)
-    out = tb.call("fetch_url", {"url": f"{base}/docs/a.html"}).content
+    out = tb.call("fetch_url", {"url": f"{base}/docs/a.html", "reason": "install steps"}).content
     assert out.startswith("Page: Guide A")
     assert "not instructions" in out and "## Installing" in out
     assert "Links on this page" in out and "/docs/sub/c.html" in out
     tb.call("fetch_url", {"url": f"{base}/docs/index.html"})
-    assert [h for h, _ in approver.fetch_requests] == ["127.0.0.1"]
-    assert approver.fetch_requests[0][1] == f"{base}/docs/a.html"
+    # Same host, second page: asked again, no blanket approval for the site.
+    assert [u for _, u in approver.fetch_requests] == [f"{base}/docs/a.html", f"{base}/docs/index.html"]
+    assert approver.fetch_details == [("install steps", ""), ("", "")]
+
+
+def test_reading_more_of_a_page_already_fetched_does_not_ask(site, web_toolbox):
+    base, hits = site
+    approver = FakeApprover()
+    tb = web_toolbox(approver, web_page_chars=200)
+    tb.call("fetch_url", {"url": f"{base}/docs/a.html"})
+    before = len(hits)
+    out = tb.call("fetch_url", {"url": f"{base}/docs/a.html", "offset": 100}).content
+    assert "Guide A" in out and len(approver.fetch_requests) == 1 and len(hits) == before
+
+
+def test_declining_one_page_does_not_block_the_next(site, web_toolbox):
+    base, _ = site
+    approver = FakeApprover(fetch=[Decision(False), Decision(True)])
+    tb = web_toolbox(approver)
+    assert "declined" in tb.call("fetch_url", {"url": f"{base}/docs/a.html"}).content
+    assert tb.call("fetch_url", {"url": f"{base}/docs/index.html"}).content.startswith("Page:")
 
 
 def test_declined_host_is_never_contacted(site, web_toolbox):
@@ -204,7 +223,7 @@ def test_redirect_to_a_new_host_needs_approval(site, web_toolbox):
     approver = FakeApprover(fetch=[Decision(True), Decision(False)])  # 127.0.0.1 yes, localhost no
     out = web_toolbox(approver).call("fetch_url", {"url": f"{base}/docs/to-localhost"}).content
     assert [h for h, _ in approver.fetch_requests] == ["127.0.0.1", "localhost"]
-    assert "declined access to localhost" in out
+    assert "declined to let you visit" in out and "localhost" in out
 
 
 def test_same_host_redirect_is_followed(site, web_toolbox):
@@ -256,6 +275,27 @@ def test_crawl_stays_in_scope_obeys_robots_and_caches(site, web_toolbox):
     assert tb.call("fetch_url", {"url": f"{base}/docs/a.html"}).content.startswith("Page: Guide A")
     assert len(hits) == before  # cached
     assert any(line.startswith("fetched 1/") for line in tb.output)  # progress shown
+
+
+def test_a_crawl_is_one_approval_showing_its_scope(site, web_toolbox):
+    base, hits = site
+    approver = FakeApprover()
+    tb = web_toolbox(approver)
+    out = tb.call("crawl_docs", {"url": f"{base}/docs/index.html", "reason": "find the pool API"}).content
+    assert "Crawled" in out and len(hits) > 2
+    assert approver.fetch_requests == [("127.0.0.1", f"{base}/docs/index.html")]
+    reason, scope = approver.fetch_details[0]
+    assert reason == "find the pool API" and f"under {base}/docs/" in scope
+    # The approval ends with the call: a new page afterwards asks again.
+    tb.call("fetch_url", {"url": f"{base}/other/page.html"})
+    assert len(approver.fetch_requests) == 2
+
+
+def test_declined_crawl_contacts_nothing(site, web_toolbox):
+    base, hits = site
+    out = web_toolbox(FakeApprover(fetch=[Decision(False)])).call(
+        "crawl_docs", {"url": f"{base}/docs/index.html"}).content
+    assert "declined" in out and hits == []
 
 
 def test_crawl_caps_are_enforced(site, web_toolbox):
