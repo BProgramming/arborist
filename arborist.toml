@@ -141,6 +141,12 @@ presence_penalty = 0.0
 # Print speed and token counts after each reply.
 show_stats = true
 
+# The system prompt tells the model the date and time (fixed at the start of
+# each conversation, so the prompt cache holds), and, with tools on, the OS,
+# shell, installed toolchains and git branch. These environment variables are
+# shown too, when set. Names only; never list anything holding a secret.
+env_vars = ["VIRTUAL_ENV", "CONDA_DEFAULT_ENV"]
+
 [tools]
 # Let the model read, search, edit and create files in the directory you start
 # the chat from, and run single .py/.rs/.dart/.js/.ts files. /tools toggles
@@ -161,9 +167,27 @@ max_read_lines = 400
 max_output_chars = 20000
 max_list_entries = 300
 max_grep_matches = 100
+# Deepest view_tree will expand (the model can ask for less).
+max_tree_depth = 4
 
 # Seconds a run (compile + execute) may take before it's killed.
 run_timeout = 120
+# Same for run_tests (a whole suite, including any compile).
+test_timeout = 300
+
+# Stuck detection. Small models rarely notice they're going in circles, so
+# the harness pauses tool use and makes the model explain and ask you when:
+#   - this many tool calls in a row fail, or
+#   - the same call gets the same result this many times in one turn.
+# 0 turns a check off.
+max_consecutive_errors = 4
+max_repeat_calls = 3
+
+# Snapshot the workspace's files before the model first edits, writes or runs
+# anything in a turn, so /undo can put them back (/checkpoints lists them).
+# Uses a private git repository under paths.root; a project's own repo is
+# never touched. Needs git.
+checkpoints = true
 
 # Web: fetch_url reads one page; crawl_docs follows links under the same
 # directory of a docs site. The first request to each site asks you first
@@ -178,3 +202,20 @@ web_page_chars = 12000
 web_max_pages = 25
 web_max_depth = 2
 web_timeout = 15                # seconds per request
+
+[compaction]
+# Keeps long conversations inside server.ctx_size. Before each request, if it
+# would pass `threshold` of the window, arborist shrinks it until it's under
+# `target`: first old tool output becomes one-line stubs (the model re-reads
+# a file if it needs it again), then turns older than the last `keep_turns`
+# are replaced by a summary the model writes. /compact does it on demand.
+enabled = true
+threshold = 0.7
+target = 0.5
+# Your recent messages, the current one included, are never summarised.
+keep_turns = 2
+# The newest tool results are never stubbed in the first pass.
+keep_tool_results = 8
+# PERF: effort for writing the summary; "" uses the chat's current effort.
+# Summarising doesn't need deep thinking, so the cheapest level is fine.
+summary_effort = "none"

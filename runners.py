@@ -105,7 +105,12 @@ print(json.dumps(missing))
 
 
 def _python_interpreter(path: Path, root: Path) -> str | None:
-    d = path.parent
+    return python_for_dir(path.parent, root)
+
+
+def python_for_dir(d: Path, root: Path) -> str | None:
+    """The interpreter for code in d: the nearest .venv/venv, then $VIRTUAL_ENV,
+    then python3 on PATH."""
     while True:
         for venv in (".venv", "venv"):
             exe = d / venv / "bin" / "python"
@@ -278,12 +283,6 @@ def _plan_rust(path: Path, root: Path, build_dir: Path) -> RunPlan:
     if cargo_toml is not None:
         pkg = cargo_toml.parent
         plan.cwd = pkg
-        cargo = shutil.which("cargo")
-        v = _version([cargo, "--version"]) if cargo else None
-        if not v:
-            plan.problems.append("cargo not found (install Rust with rustup)")
-            return plan
-        plan.checked.append(v)
         rel = path.relative_to(pkg).as_posix()
         if rel == "src/main.rs":
             target = []
@@ -297,12 +296,9 @@ def _plan_rust(path: Path, root: Path, build_dir: Path) -> RunPlan:
             return plan
         # Resolves the dependency graph without touching the network: fails if
         # any crate isn't already downloaded.
-        r = _probe([cargo, "metadata", "--format-version", "1", "--offline", "--quiet"], cwd=pkg)
-        if r is None or r.returncode != 0:
-            err = (r.stderr.strip().splitlines() or ["unknown error"])[-1] if r else "timed out"
-            plan.problems.append(f"crate dependencies aren't available offline (run `cargo fetch`): {err}")
+        cargo = _cargo_offline_ready(pkg, plan)
+        if cargo is None:
             return plan
-        plan.checked.append("crate dependencies available offline")
         # --offline: never fetch at run time; the check above is the contract.
         plan.steps = [[cargo, "run", "--quiet", "--offline", *target]]
         return plan
@@ -353,6 +349,231 @@ def _plan_dart(path: Path, root: Path, build_dir: Path) -> RunPlan:
         plan.warnings.append("no pubspec.yaml; only dart: core libraries can be used")
     plan.steps = [[dart, "run", str(path)]]
     return plan
+
+
+# ----------------------------------------------------------------- tests ---
+
+# Project files that say which test runner to use, checked from the target
+# upwards; at one level, earlier entries win.
+_TEST_MARKERS = [
+    ("rust", ("Cargo.toml",)),
+    ("dart", ("pubspec.yaml",)),
+    ("python", ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "setup.py")),
+    ("node", ("package.json",)),
+]
+_TEST_KIND_BY_SUFFIX = {".py": "python", ".rs": "rust", ".dart": "dart",
+                        ".js": "node", ".mjs": "node", ".cjs": "node", ".ts": "node"}
+_NPM_PLACEHOLDER = 'echo "Error: no test specified"'
+
+
+def _has_python_tests(start: Path, limit: int = 5000) -> bool:
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(start):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")
+                       and d not in ("node_modules", "venv", "target", "__pycache__")]
+        for name in filenames:
+            seen += 1
+            if name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py")):
+                return True
+            if seen > limit:
+                return False
+    return False
+
+
+def plan_tests(target: Path, root: Path, build_dir: Path) -> RunPlan:
+    """Work out how to run the tests for a file or directory, like plan_for()
+    does for a single file: probes only, nothing in the project is executed."""
+    start = target if target.is_dir() else target.parent
+    want = None if target.is_dir() else _TEST_KIND_BY_SUFFIX.get(target.suffix)
+    if target.is_file() and want is None:
+        return RunPlan(problems=[f"{target.name} isn't a test file arborist knows how to run "
+                                 f"(supported: {', '.join(sorted(_TEST_KIND_BY_SUFFIX))})"])
+    kind, project = None, None
+    d = start
+    while kind is None:
+        for k, names in _TEST_MARKERS:
+            if (want is None or k == want) and any((d / n).exists() for n in names):
+                kind, project = k, d
+                break
+        if d == root or d.parent == d:
+            break
+        d = d.parent
+    if kind is None:
+        if want == "python" or (want is None and _has_python_tests(start)):
+            kind, project = "python", root
+        elif want == "node":
+            kind, project = "node", start
+        elif want == "rust":
+            return RunPlan(problems=["Rust tests need a Cargo project (no Cargo.toml found)"])
+        elif want == "dart":
+            return RunPlan(problems=["Dart tests need a pubspec.yaml with the test package"])
+        else:
+            return RunPlan(problems=["couldn't tell how to run tests here: no Cargo.toml, "
+                                     "pubspec.yaml, pyproject.toml/setup.cfg/pytest.ini or "
+                                     "package.json, and no test_*.py files. Pass a test file"])
+    rel = os.path.relpath(target, project)
+    planner = {"python": _tests_python, "rust": _tests_rust, "dart": _tests_dart, "node": _tests_node}[kind]
+    return planner(target, project, rel, root, build_dir)
+
+
+def _tests_python(target: Path, project: Path, rel: str, root: Path, build_dir: Path) -> RunPlan:
+    plan = RunPlan(cwd=project)
+    interp = python_for_dir(project, root)
+    version = _version([interp, "--version"]) if interp else None
+    if not version:
+        plan.problems.append("Python interpreter (python3) not found")
+        return plan
+    plan.checked.append(f"{version} ({interp})")
+    build_dir.mkdir(parents=True, exist_ok=True)
+    r = _probe([interp, "-c", "import pytest"], cwd=build_dir)
+    if r is not None and r.returncode == 0:
+        plan.checked.append("pytest")
+        plan.steps = [[interp, "-m", "pytest", "-q", "--tb=short", "--color=no",
+                       "-p", "no:cacheprovider", *([rel] if rel != "." else [])]]
+    else:
+        plan.warnings.append("pytest isn't installed for this interpreter, so unittest was used")
+        if target.is_file():
+            plan.steps = [[interp, "-m", "unittest", rel]]
+        else:
+            plan.steps = [[interp, "-m", "unittest", "discover", "-s", rel, "-t", "."]]
+    return plan
+
+
+def _cargo_offline_ready(pkg: Path, plan: RunPlan) -> str | None:
+    """cargo's path if it's installed and every crate is already downloaded."""
+    cargo = shutil.which("cargo")
+    v = _version([cargo, "--version"]) if cargo else None
+    if not v:
+        plan.problems.append("cargo not found (install Rust with rustup)")
+        return None
+    plan.checked.append(v)
+    r = _probe([cargo, "metadata", "--format-version", "1", "--offline", "--quiet"], cwd=pkg)
+    if r is None or r.returncode != 0:
+        err = (r.stderr.strip().splitlines() or ["unknown error"])[-1] if r else "timed out"
+        plan.problems.append(f"crate dependencies aren't available offline (run `cargo fetch`): {err}")
+        return None
+    plan.checked.append("crate dependencies available offline")
+    return cargo
+
+
+def _tests_rust(target: Path, project: Path, rel: str, root: Path, build_dir: Path) -> RunPlan:
+    plan = RunPlan(cwd=project)
+    cargo = _cargo_offline_ready(project, plan)
+    if cargo is None:
+        return plan
+    select = []
+    if m := re.fullmatch(r"tests/([^/]+)\.rs", rel.replace(os.sep, "/")):
+        select = ["--test", m[1]]
+    plan.steps = [[cargo, "test", "--offline", "--quiet", "--color", "never", *select]]
+    return plan
+
+
+def _tests_dart(target: Path, project: Path, rel: str, root: Path, build_dir: Path) -> RunPlan:
+    plan = RunPlan(cwd=project)
+    try:
+        pubspec = (project / "pubspec.yaml").read_text(encoding="utf-8")
+    except OSError as e:
+        plan.problems.append(f"can't read pubspec.yaml: {e}")
+        return plan
+    flutter = bool(re.search(r"^\s*sdk:\s*flutter\b", pubspec, re.MULTILINE))
+    if flutter:
+        exe = shutil.which("flutter")
+        if not exe:
+            plan.problems.append("this is a Flutter project and flutter isn't installed")
+            return plan
+        plan.checked.append(f"Flutter ({exe})")  # `flutter --version` is slow; skip it
+    else:
+        exe = shutil.which("dart")
+        v = _version([exe, "--version"]) if exe else None
+        if not v:
+            plan.problems.append("Dart SDK (dart) not found")
+            return plan
+        plan.checked.append(v)
+    config = project / ".dart_tool" / "package_config.json"
+    tool = "flutter" if flutter else "dart"
+    if not config.exists():
+        plan.problems.append(f"packages not fetched (run `{tool} pub get` in {project})")
+        return plan
+    if (project / "pubspec.yaml").stat().st_mtime > config.stat().st_mtime:
+        plan.problems.append(f"pubspec.yaml changed since the last `{tool} pub get`; run it again")
+        return plan
+    plan.checked.append("pub packages fetched")
+    plan.steps = [[exe, "test", *([rel] if rel != "." else [])]]
+    return plan
+
+
+def _tests_node(target: Path, project: Path, rel: str, root: Path, build_dir: Path) -> RunPlan:
+    plan = RunPlan(cwd=project)
+    nv = _node_version()
+    if nv is None:
+        plan.problems.append("Node.js (node) not found")
+        return plan
+    node, (major, minor) = nv
+    plan.checked.append(f"Node.js v{major}.{minor} ({node})")
+    pkg_json = project / "package.json"
+    script = ""
+    if pkg_json.exists():
+        _check_node_packages(pkg_json, root, plan)
+        if plan.problems:
+            return plan
+        try:
+            script = (json.loads(pkg_json.read_text(encoding="utf-8")).get("scripts") or {}).get("test") or ""
+        except (OSError, json.JSONDecodeError):
+            script = ""
+    if target.is_dir() and script and not script.startswith(_NPM_PLACEHOLDER):
+        npm = shutil.which("npm")
+        if not npm:
+            plan.problems.append("package.json has a test script but npm isn't installed")
+            return plan
+        plan.checked.append(f"npm test script: {script}")
+        plan.steps = [[npm, "test", "--silent"]]
+        return plan
+    if major < 18:
+        plan.problems.append("node --test needs Node 18 or newer")
+        return plan
+    if target.is_dir():
+        plan.cwd = target  # node --test finds test files under the current directory
+        plan.steps = [[node, "--test"]]
+    elif target.suffix == ".ts":
+        local_tsx = _find_up(target.parent, root, "node_modules/.bin/tsx")
+        tsx = str(local_tsx) if local_tsx else shutil.which("tsx")
+        if tsx:
+            plan.steps = [[tsx, "--test", rel]]
+        elif (major, minor) >= (22, 18) or major >= 23:
+            plan.steps = [[node, "--test", rel]]
+        elif (major, minor) >= (22, 6):
+            plan.steps = [[node, "--experimental-strip-types", "--test", rel]]
+        else:
+            plan.problems.append("TypeScript tests need tsx (npm install -g tsx) or Node 22.6+")
+    else:
+        plan.steps = [[node, "--test", rel]]
+    return plan
+
+
+# Where failure detail starts in each runner's output.
+_FAILURE_START = re.compile(
+    r"^(=+ (FAILURES|ERRORS) =+"          # pytest
+    r"|(FAIL|ERROR): "                     # unittest
+    r"|failures:\s*$"                      # cargo test
+    r"|error(\[E\d+\])?: "                 # rustc compile errors
+    r"|not ok \d+"                         # node --test (TAP)
+    r"|\s*✖ "                              # node --test (spec reporter)
+    r"|.*\[E\]"                            # dart/flutter test
+    r")")
+
+
+def focus_test_output(log: str, passed: bool) -> str:
+    """The useful part of a test log: the summary when everything passed,
+    otherwise everything from the first failure on (with the command line)."""
+    lines = log.splitlines()
+    if passed:
+        return "\n".join(lines[-15:])
+    first = next((i for i, line in enumerate(lines) if _FAILURE_START.match(line)), None)
+    if not first:  # None, or the failure is already at the top
+        return log
+    head = [lines[0]] if lines[0].startswith("$ ") else []
+    return "\n".join(head + [f"[... {first - len(head)} lines before the first failure omitted ...]"]
+                     + lines[first:])
 
 
 # ------------------------------------------------------------- execution ---

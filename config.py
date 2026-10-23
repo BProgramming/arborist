@@ -69,6 +69,9 @@ DEFAULTS: dict = {
         "min_p": 0.05,
         "presence_penalty": 0.0,
         "show_stats": True,
+        # Environment variables shown to the model in its system prompt (only
+        # the ones that are set). Names only; never put secrets here.
+        "env_vars": ["VIRTUAL_ENV", "CONDA_DEFAULT_ENV"],
     },
     "tools": {
         "enabled": True,
@@ -78,13 +81,27 @@ DEFAULTS: dict = {
         "max_output_chars": 20000,
         "max_list_entries": 300,
         "max_grep_matches": 100,
+        "max_tree_depth": 4,
         "run_timeout": 120,
+        "test_timeout": 300,
+        "max_consecutive_errors": 4,
+        "max_repeat_calls": 3,
+        "checkpoints": True,
         "web_enabled": True,
         "web_allowed_hosts": [],
         "web_page_chars": 12000,
         "web_max_pages": 25,
         "web_max_depth": 2,
         "web_timeout": 15,
+    },
+    "compaction": {
+        "enabled": True,
+        "threshold": 0.7,
+        "target": 0.5,
+        "keep_turns": 2,
+        "keep_tool_results": 8,
+        # Effort for writing summaries; "" = whatever the chat is using.
+        "summary_effort": "",
     },
 }
 
@@ -156,7 +173,8 @@ def _validate(c: dict) -> None:
     _check(t["approve_edits"] in EDIT_APPROVALS,
            f"tools.approve_edits must be one of {sorted(EDIT_APPROVALS)} (running code always asks)")
     for key in ("max_steps", "max_read_lines", "max_output_chars", "max_list_entries",
-                "max_grep_matches", "run_timeout", "web_page_chars", "web_max_pages", "web_timeout"):
+                "max_grep_matches", "max_tree_depth", "run_timeout", "test_timeout",
+                "web_page_chars", "web_max_pages", "web_timeout"):
         _check(isinstance(t[key], int) and not isinstance(t[key], bool) and t[key] > 0,
                f"tools.{key} must be a positive integer")
     # Below this a run's log has no room next to its header and instructions.
@@ -170,6 +188,26 @@ def _validate(c: dict) -> None:
     _check(isinstance(t["web_allowed_hosts"], list) and all(
         isinstance(h, str) and h and "/" not in h for h in t["web_allowed_hosts"]),
         "tools.web_allowed_hosts must be a list of host names, e.g. [\"docs.python.org\"]")
+    for key in ("max_consecutive_errors", "max_repeat_calls"):
+        _check(isinstance(t[key], int) and not isinstance(t[key], bool) and t[key] >= 0,
+               f"tools.{key} must be a whole number (0 turns the check off)")
+    _check(isinstance(t["checkpoints"], bool), "tools.checkpoints must be true or false")
+    _check(isinstance(ch["env_vars"], list) and all(
+        isinstance(v, str) and v.replace("_", "").isalnum() for v in ch["env_vars"]),
+        'chat.env_vars must be a list of variable names, e.g. ["VIRTUAL_ENV"]')
+    k = c["compaction"]
+    _check(isinstance(k["enabled"], bool), "compaction.enabled must be true or false")
+    for key in ("threshold", "target"):
+        _check(isinstance(k[key], (int, float)) and not isinstance(k[key], bool) and 0 < k[key] < 1,
+               f"compaction.{key} must be a fraction between 0 and 1, e.g. 0.7")
+    _check(k["target"] < k["threshold"], "compaction.target must be below compaction.threshold")
+    for key in ("keep_turns", "keep_tool_results"):
+        _check(isinstance(k[key], int) and not isinstance(k[key], bool) and k[key] >= 1,
+               f"compaction.{key} must be at least 1")
+    _check(isinstance(k["summary_effort"], str), "compaction.summary_effort must be a string")
+    if k["summary_effort"]:
+        _check(k["summary_effort"] in efforts,
+               f"compaction.summary_effort must be \"\" or one of model.efforts {efforts}")
 
 
 def load(path: str | os.PathLike | None = None) -> dict:
@@ -205,6 +243,7 @@ def load(path: str | os.PathLike | None = None) -> dict:
         "log_dir": str(root / "logs"),
         "history_dir": str(root / "history"),
         "memory_path": str(root / "memory" / "memory.md"),
+        "checkpoint_dir": str(root / "checkpoints"),
         "base_url": f"http://{cfg['server']['host']}:{cfg['server']['port']}",
     }
     return cfg

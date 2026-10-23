@@ -55,9 +55,9 @@ class FakeModel:
         yield from reply
 
 
-def run(model, toolbox, ui=None, max_steps=25, prompt="go"):
+def run(model, toolbox, ui=None, max_steps=25, prompt="go", **kw):
     messages = [{"role": "user", "content": prompt}]
-    result = agent.run_turn(messages, model.make_body, model.stream, toolbox, ui or NullUI(), max_steps)
+    result = agent.run_turn(messages, model.make_body, model.stream, toolbox, ui or NullUI(), max_steps, **kw)
     return result, messages
 
 
@@ -165,7 +165,80 @@ def test_step_limit_forces_a_wrap_up(ws_root, make_toolbox):
     write(ws_root, "a.py", "x\n")
     ui = NullUI()
     model = FakeModel(*[tool_reply(("read_file", {"path": "a.py"}))] * 3, text_reply("summary"))
-    result, messages = run(model, make_toolbox(), ui, max_steps=3)
+    # Identical reads would trip the loop check first; this test is about the step limit.
+    result, messages = run(model, make_toolbox(), ui, max_steps=3, max_repeat_calls=0)
     assert result.steps == 3 and result.text == "summary"
     assert model.requests[-1]["with_tools"] is False
     assert ui.notices and "3 tool steps" in ui.notices[0]
+
+
+# ----------------------------------------------------------- forced pause ---
+
+def test_consecutive_errors_pause_tool_use(ws_root, make_toolbox):
+    ui = NullUI()
+    # The third failure pauses; the fourth call is in the same reply and is skipped.
+    bad = [tool_reply(("read_file", {"path": f"missing{i}.py"})) for i in range(2)]
+    bad.append(tool_reply(("read_file", {"path": "missing2.py"}), ("read_file", {"path": "never.py"})))
+    model = FakeModel(*bad, text_reply("I'm stuck: …"))
+    result, messages = run(model, make_toolbox(), ui, max_consecutive_errors=3)
+    assert result.paused.startswith("3 tool calls in a row failed")
+    assert ui.calls == ["read_file"] * 3  # nothing ran after the pause
+    assert model.requests[-1]["with_tools"] is False
+    assert "Tool use is paused" in model.requests[-1]["messages"][-1]["content"]
+    assert result.text == "I'm stuck: …" and any("paused" in n for n in ui.notices)
+    assert messages[-3]["content"].startswith("skipped: tool use is paused")
+
+
+def test_a_success_resets_the_error_count(ws_root, make_toolbox):
+    write(ws_root, "a.py", "x = 1\n")
+    replies = [tool_reply(("read_file", {"path": "nope1.py"})), tool_reply(("read_file", {"path": "nope2.py"})),
+               tool_reply(("read_file", {"path": "a.py"})), tool_reply(("read_file", {"path": "nope3.py"})),
+               tool_reply(("read_file", {"path": "nope4.py"})), text_reply("done")]
+    result, _ = run(FakeModel(*replies), make_toolbox(), max_consecutive_errors=3)
+    assert not result.paused and result.text == "done"
+
+
+def test_same_call_same_result_pauses(ws_root, make_toolbox):
+    write(ws_root, "a.py", "x = 1\n")
+    model = FakeModel(*[tool_reply(("grep", {"pattern": "y"}))] * 3, text_reply("asking"))
+    result, _ = run(model, make_toolbox(), max_repeat_calls=3)
+    assert "same grep call returned the same result 3 times" in result.paused
+    assert model.requests[-1]["with_tools"] is False
+
+
+def test_rereading_a_file_that_changed_is_not_a_loop(ws_root, make_toolbox):
+    write(ws_root, "a.py", "n = 0\n")
+    replies = []
+    for i in range(3):
+        replies.append(tool_reply(("read_file", {"path": "a.py"})))
+        replies.append(tool_reply(("edit_file", {"path": "a.py", "old_string": f"n = {i}",
+                                                 "new_string": f"n = {i + 1}"})))
+    result, _ = run(FakeModel(*replies, text_reply("done")), make_toolbox(), max_repeat_calls=2)
+    assert not result.paused and (ws_root / "a.py").read_text() == "n = 3\n"
+
+
+def test_zero_turns_the_checks_off(ws_root, make_toolbox):
+    bad = [tool_reply(("read_file", {"path": "missing.py"}))] * 5
+    result, _ = run(FakeModel(*bad, text_reply("ok")), make_toolbox(),
+                    max_consecutive_errors=0, max_repeat_calls=0)
+    assert not result.paused and result.steps == 5
+
+
+def test_the_compactor_runs_before_every_request_and_sees_usage(ws_root, make_toolbox):
+    write(ws_root, "a.py", "x\n")
+
+    class Spy:
+        def __init__(self):
+            self.calls, self.usages = 0, []
+
+        def maybe_compact(self, messages, force=False):
+            self.calls += 1
+            return False
+
+        def observe(self, usage):
+            self.usages.append(usage)
+
+    spy = Spy()
+    with_usage = tool_reply(("read_file", {"path": "a.py"})) + [{"choices": [], "usage": {"prompt_tokens": 900}}]
+    run(FakeModel(with_usage, text_reply("done")), make_toolbox(), compactor=spy)
+    assert spy.calls == 2 and spy.usages == [{"prompt_tokens": 900}]

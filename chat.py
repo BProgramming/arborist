@@ -14,8 +14,11 @@ import argparse
 import http.client
 import json
 import os
+import platform
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -29,8 +32,11 @@ except ImportError:  # pragma: no cover
     readline = None
 
 import agent
+import compaction
 import config as model_config
-from tools import Decision, Limits, ToolResult, Toolbox, Workspace, TOOL_SCHEMAS
+import runners
+from checkpoints import CheckpointError, Checkpoints
+from tools import IGNORED_DIRS, Decision, Limits, ToolResult, Toolbox, Workspace, TOOL_SCHEMAS
 
 # ---------------------------------------------------------------- terminal ---
 
@@ -69,6 +75,11 @@ Commands:
   /recall [-n] TERM     search saved memories and attach the hits to your next
                         message as a reminder (-n: only show them; no term:
                         where the memories live)
+  /undo [ID]            put the workspace's files back as they were before the
+                        model last changed them (or at checkpoint ID); asks first
+  /checkpoints          list workspace checkpoints, newest first
+  /compact              shrink the conversation now (old tool output, then a
+                        summary of older turns)
 
 Input:
   \"\"\"                   on its own line starts/ends a multi-line block
@@ -435,6 +446,57 @@ class AgentTools:
         return ToolResult(f"saved to memory: {entry}")
 
 
+# ------------------------------------------------------------- environment ---
+
+def date_line(now: datetime | None = None) -> str:
+    now = now or datetime.now().astimezone()
+    offset = now.strftime("%z")
+    offset = f"UTC{offset[:3]}:{offset[3:]}" if offset else "local time"
+    return (f"- Current date and time: {now:%A, %B} {now.day}, {now:%Y}, {now:%H:%M} "
+            f"{now.tzname() or ''} ({offset}), as of the start of this conversation")
+
+
+def environment_facts(workspace: Path, env_vars: list[str]) -> list[str]:
+    """What the model can't see for itself: OS, shell, toolchains, branch.
+    Probed once per session (toolchains don't change mid-chat)."""
+    facts = []
+    os_name = f"{platform.system()} {platform.release()} ({platform.machine()})"
+    try:
+        os_name = platform.freedesktop_os_release().get("PRETTY_NAME", "") + f", {os_name}"
+    except (OSError, AttributeError):
+        pass
+    facts.append(f"- OS: {os_name.lstrip(', ')}")
+    if os.environ.get("SHELL"):
+        facts.append(f"- Shell: {os.environ['SHELL']}")
+
+    tools = []
+    interp = runners.python_for_dir(workspace, workspace)
+    if interp and (v := runners._version([interp, "--version"])):
+        where = " (project venv)" if "/venv/" in interp or "/.venv/" in interp else ""
+        tools.append(f"{v}{where}")
+    for label, cmd in (("Node.js", ["node", "--version"]), ("", ["rustc", "--version"]),
+                       ("", ["cargo", "--version"]), ("", ["dart", "--version"])):
+        if shutil.which(cmd[0]) and (v := runners._version(cmd)):
+            tools.append(f"{label} {v}".strip())
+    if shutil.which("flutter"):
+        tools.append("Flutter")
+    facts.append("- Toolchains: " + (", ".join(tools) if tools else "none detected"))
+
+    try:
+        r = subprocess.run(["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+        if r.returncode == 0 and r.stdout.strip():
+            facts.append(f"- Git branch: {r.stdout.strip()}")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    for name in env_vars:
+        value = os.environ.get(name)
+        if value:
+            facts.append(f"- ${name}={value if len(value) <= 200 else value[:199] + '…'}")
+    return facts
+
+
 # -------------------------------------------------------------------- chat ---
 
 class Chat:
@@ -467,18 +529,41 @@ class Chat:
         # the system prompt has to stay byte-identical for the prompt cache.
         # The model already knows anything it saves mid-conversation.
         self.memory_block = self.memory.prompt_block()
+        # Same reasoning: the date is fixed per conversation, and the
+        # toolchain probe runs once, the first time the prompt is built.
+        self.date_line = date_line()
+        self._env_facts: list[str] | None = None
+        # One-off notes for the model that ride along with the next message
+        # (e.g. "the user restored files with /undo").
+        self.pending_notes: list[str] = []
 
         self.toolbox: Toolbox | None = None
         self.tools_enabled = False
+        self.checkpoints: Checkpoints | None = None
         if workspace is not None:
+            if cfg["tools"]["checkpoints"]:
+                self.checkpoints = Checkpoints(workspace, Path(cfg["derived"]["checkpoint_dir"]),
+                                               exclude=IGNORED_DIRS)
             self.toolbox = Toolbox(
                 Workspace(workspace), TerminalApprover(),
                 Limits.from_config(cfg["tools"]),
                 log_dir=cfg["derived"]["log_dir"],
                 on_output=self.ui.run_output,
                 on_notice=self.ui.notice,
+                checkpoints=self.checkpoints,
             )
             self.tools_enabled = tools_enabled
+
+        server = cfg["server"]
+        self.context_tokens = server["ctx_size"] // server["parallel"]
+        self.compactor = compaction.Compactor(
+            compaction.CompactionSettings.from_config(cfg["compaction"]),
+            self.context_tokens,
+            measure=self._measure,
+            summarize=self._summarize,
+            notice=self.ui.notice,
+            forget_file=self.toolbox.ws.unsee if self.toolbox else (lambda p: None),
+        )
 
     @property
     def agent_tools(self) -> AgentTools | None:
@@ -490,12 +575,56 @@ class Chat:
 
     def _system(self) -> str:
         parts = [self.system_prompt] if self.system_prompt else []
+        env = [self.date_line]
         if self.tools_enabled and self.toolbox:
             parts.append(agent.TOOL_GUIDE.format(root=self.toolbox.ws.root))
             parts.append(MEMORY_GUIDE)
+            if self._env_facts is None:
+                self._env_facts = environment_facts(self.toolbox.ws.root, self.cfg["chat"]["env_vars"])
+            env += self._env_facts
+        parts.append("Environment:\n" + "\n".join(env))
         if self.memory_block:
             parts.append(self.memory_block)
         return "\n\n".join(parts)
+
+    def _measure(self, messages: list[dict]) -> int:
+        """Characters in a request (for the compactor's token estimate)."""
+        n = len(self._system())
+        tools = self.agent_tools
+        if tools:
+            n += len(json.dumps(tools.schemas))
+        for m in messages:
+            n += len(m.get("content") or "") + 12  # plus template overhead per message
+            if m.get("tool_calls"):
+                n += len(json.dumps(m["tool_calls"]))
+        return n
+
+    def _summarize(self, transcript: str) -> str:
+        """One tool-free request asking the model to summarise old turns."""
+        ch = self.cfg["chat"]
+        body = {
+            "messages": [
+                {"role": "system", "content": "You summarise coding sessions so an assistant can "
+                                              "pick up the work from your summary alone."},
+                {"role": "user", "content": f"<transcript>\n{transcript}\n</transcript>\n\n"
+                                            + compaction.SUMMARY_INSTRUCTIONS},
+            ],
+            "stream": True,
+            "max_tokens": ch["max_tokens"],
+            "temperature": min(ch["temperature"], 0.7),
+            "top_p": ch["top_p"],
+            "top_k": ch["top_k"],
+            "min_p": ch["min_p"],
+        }
+        effort = self.cfg["compaction"]["summary_effort"] or self.effort
+        if effort:
+            body["reasoning_effort"] = effort
+        self.ui.notice("  writing a summary of the earlier turns…")
+        text = []
+        for chunk in self.client.stream_chat(body):
+            for choice in chunk.get("choices") or []:
+                text.append((choice.get("delta") or {}).get("content") or "")
+        return "".join(text)
 
     def _body(self, messages: list[dict], with_tools: bool) -> dict:
         ch = self.cfg["chat"]
@@ -529,6 +658,7 @@ class Chat:
     def _print_stats(self, compact: bool = False) -> None:
         ctx = self.cfg["server"]["ctx_size"] // self.cfg["server"]["parallel"]
         pct = 100 * self.ctx_used / ctx if ctx else 0
+        compacting = self.cfg["compaction"]["enabled"]
         parts = []
         t = self.last.timings if self.last else {}
         if t.get("predicted_per_second"):
@@ -542,39 +672,50 @@ class Chat:
         parts.append(f"ctx {self.ctx_used:,}/{ctx:,} ({pct:.0f}%)")
         line = " · ".join(parts)
         print(dim(line) if compact else line)
-        if pct > 85:
-            print(red("context nearly full — /save then /clear soon"))
+        if pct > 85 and not compacting:
+            print(red("context nearly full — /compact, or /save then /clear"))
 
     # -- turn ----------------------------------------------------------------
 
-    def _reply(self) -> None:
+    def _reply(self, label: str = "") -> None:
         print()
-        snapshot = len(self.messages) - 1  # index of this turn's user message
+        # The whole history, not an index: compaction may rewrite earlier
+        # messages during the turn, and a failed turn should leave no trace.
+        before = list(self.messages[:-1])
         started = time.monotonic()
         self.busy = True
+        if self.toolbox:
+            if not label and self.messages:  # /retry: label it with the message's last line
+                label = (self.messages[-1].get("content") or "").strip().splitlines()[-1:] or [""]
+                label = label[0]
+            self.toolbox.begin_turn(label)
+        t = self.cfg["tools"]
         try:
             result = agent.run_turn(
                 self.messages, self._body, self.client.stream_chat,
                 self.agent_tools, self.ui,
-                max_steps=self.cfg["tools"]["max_steps"],
+                max_steps=t["max_steps"],
+                compactor=self.compactor,
+                max_consecutive_errors=t["max_consecutive_errors"],
+                max_repeat_calls=t["max_repeat_calls"],
             )
         except Interrupted:
             self.ui.end_message()
             print(red("[stopped]"))
-            self._rollback(snapshot)
+            self._restore(before)
         except (RuntimeError, OSError) as e:
             self.ui.end_message()
             print(red(f"error: {e}"))
             if not self.client.healthy():
                 print(red("the server isn't responding — check the server log"))
-            self._rollback(snapshot)
+            self._restore(before)
         except Exception as e:
             # Anything else is a bug here, not in the model. Keep the session.
             self.ui.end_message()
             log = self._log_error()
             print(red(f"internal error: {type(e).__name__}: {e}"))
             print(dim(f"traceback written to {log}; the conversation is intact, minus this turn"))
-            self._rollback(snapshot)
+            self._restore(before)
         else:
             self.last = result
             self.last_wall = time.monotonic() - started
@@ -584,6 +725,8 @@ class Chat:
                 self.ctx_used = result.usage.get("total_tokens", self.ctx_used)
             if result.hard_stopped:
                 print(dim("(code ran; tools stay off until your next message)"))
+            elif result.paused:
+                print(dim("(paused; tell the model how to proceed)"))
             if self.cfg["chat"]["show_stats"]:
                 self._print_stats(compact=True)
             if not result.text.strip():
@@ -604,10 +747,16 @@ class Chat:
 
     def _rollback(self, snapshot: int) -> None:
         """Drop the interrupted turn so the history stays well-formed."""
-        changed = any(m.get("role") == "tool" for m in self.messages[snapshot:])
-        del self.messages[snapshot:]
+        self._restore(self.messages[:snapshot])
+
+    def _restore(self, before: list[dict]) -> None:
+        """Put the history back to `before` (as it was when the turn began)."""
+        kept = {id(m) for m in before}
+        changed = any(m.get("role") == "tool" and id(m) not in kept for m in self.messages)
+        self.messages[:] = before
         if changed:
-            print(dim("note: any file changes made during that turn are still on disk"))
+            undo = " (/undo puts them back)" if self.checkpoints else ""
+            print(dim(f"note: any file changes made during that turn are still on disk{undo}"))
 
     # -- commands ------------------------------------------------------------
 
@@ -657,6 +806,9 @@ class Chat:
         self.pending_files.clear()
         self.pending_memories.clear()
         self.ctx_used = 0
+        self.pending_notes.clear()
+        self.compactor.reset()
+        self.date_line = date_line()
         self.memory_block = self.memory.prompt_block()  # picks up new and hand-edited memories
         if self.toolbox:
             # The model forgot what it read, so it has to read files again
@@ -687,9 +839,85 @@ class Chat:
         if self.pending_memories:
             print(dim(f"{_memories(len(self.pending_memories))} attached to the next message."))
 
+    # -- checkpoints -------------------------------------------------------------
+
+    def _checkpoints_ready(self) -> bool:
+        if self.checkpoints is None:
+            why = ("tools are off for this session (--no-tools)" if self.toolbox is None
+                   else "tools.checkpoints is off in the config")
+            print(red(f"no checkpoints: {why}"))
+            return False
+        if not self.checkpoints.available:
+            print(red("no checkpoints: git isn't installed"))
+            return False
+        return True
+
+    def _list_checkpoints(self) -> None:
+        if not self._checkpoints_ready():
+            return
+        try:
+            cps = self.checkpoints.list(limit=15)
+        except CheckpointError as e:
+            print(red(f"can't list checkpoints: {e}"))
+            return
+        if not cps:
+            print(dim("no checkpoints yet; one is saved before the model first changes or runs "
+                      "anything in a turn"))
+            return
+        for cp in cps:
+            kind = "" if cp.kind == "turn" else dim(f" [{cp.kind}]")
+            print(f"  {yellow(cp.short)}  {cp.when:%m-%d %H:%M}  {cp.label}{kind}")
+        print(dim("/undo restores the newest one your files differ from; /undo ID restores a "
+                  "specific one"))
+
+    def _undo(self, arg: str) -> None:
+        if not self._checkpoints_ready():
+            return
+        try:
+            if arg:
+                cp = self.checkpoints.find(arg)
+                if cp is None:
+                    print(red(f"no single checkpoint matches {arg!r}; see /checkpoints"))
+                    return
+                changes = self.checkpoints.changes_since(cp.sha)
+            else:
+                found = self.checkpoints.latest_different()
+                if found is None:
+                    print(dim("nothing to undo: the files match the latest checkpoint"))
+                    return
+                cp, changes = found
+            if not changes:
+                print(dim(f"the files already match checkpoint {cp.short}"))
+                return
+            print(bold(f"Restore files to checkpoint {cp.short} ({cp.when:%H:%M}, before: {cp.label})?"))
+            verbs = {"M": yellow("restore"), "D": green("bring back"), "A": red("delete  ")}
+            for c in changes[:40]:
+                print(f"  {verbs.get(c.status, c.status)} {c.path}")
+            if len(changes) > 40:
+                print(dim(f"  … and {len(changes) - 40} more"))
+            print(dim("  your current files are saved as a checkpoint first, so this can be undone"))
+            if input("Restore? [y/N]: ").strip().lower() not in ("y", "yes"):
+                print(dim("left as is"))
+                return
+            reverted, safety = self.checkpoints.restore(cp.sha)
+        except CheckpointError as e:
+            print(red(f"undo failed: {e}"))
+            return
+        print(dim(f"restored {len(reverted)} file{'s' * (len(reverted) != 1)}"
+                  + (f"; the state before this undo is checkpoint {safety[:7]}" if safety else "")))
+        # The model still remembers its edits; tell it, and make it re-read.
+        if self.toolbox:
+            self.toolbox.ws.forget()
+        names = ", ".join(c.path for c in reverted[:20]) + (" …" if len(reverted) > 20 else "")
+        self.pending_notes.append(
+            f"The user restored the workspace files to how they were before \"{cp.label}\" "
+            f"(files: {names}). Changes made after that point are gone from disk. Read files "
+            "again before relying on their earlier contents.")
+
     def _compose(self, line: str) -> str:
         """The user's message, with any /recall reminders and /file contents in front."""
-        parts = []
+        parts = [f"<note>\n{n}\n</note>" for n in self.pending_notes]
+        self.pending_notes.clear()
         if self.pending_memories:
             notes = "\n".join(f"- {e}" for e in self.pending_memories)
             parts.append("<memory_reminder>\n(Notes from your memory, re-sent by the user as a "
@@ -749,6 +977,24 @@ class Chat:
             self._print_stats()
         elif cmd == "recall":
             self._recall(arg)
+        elif cmd == "undo":
+            self._undo(arg)
+        elif cmd == "checkpoints":
+            self._list_checkpoints()
+        elif cmd == "compact":
+            if len(self.messages) < 2:
+                print(dim("nothing to compact yet"))
+            else:
+                before = list(self.messages)
+                self.busy = True
+                try:
+                    if not self.compactor.maybe_compact(self.messages, force=True):
+                        print(dim("nothing to compact: the conversation is already short"))
+                except Interrupted:
+                    self.messages[:] = before
+                    print(red("[stopped]"))
+                finally:
+                    self.busy = False
         else:
             print(red(f"unknown command /{cmd} — try /help"))
         return True
@@ -801,7 +1047,7 @@ class Chat:
                 if line.startswith("//"):
                     line = line[1:]
                 self.messages.append({"role": "user", "content": self._compose(line)})
-                self._reply()
+                self._reply(label=line)
         finally:
             if readline:
                 try:
