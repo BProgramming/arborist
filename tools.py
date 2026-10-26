@@ -53,10 +53,19 @@ class Decision:
     always: bool = False  # "yes to all edits this session" (ignored for runs)
 
 
+@dataclass
+class MemoryChoice:
+    """The user's answer when a new memory looks like ones already saved."""
+    action: str                     # "replace", "keep" (save both) or "skip"
+    replace: list[int] = field(default_factory=list)  # indexes into the similar notes
+    reason: str = ""                # sent back to the model on "skip"
+
+
 class Approver(Protocol):
     def approve_change(self, rel_path: str, diff: str, is_new: bool) -> Decision: ...
     def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int) -> Decision: ...
     def approve_fetch(self, host: str, url: str, reason: str = "", scope: str = "") -> Decision: ...
+    def approve_memory(self, fact: str, block: str, similar: list[str], web_tainted: bool) -> MemoryChoice: ...
 
 
 @dataclass

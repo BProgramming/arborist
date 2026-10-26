@@ -6,17 +6,20 @@ from pathlib import Path
 
 import pytest
 
-from tools import Decision, Limits, Toolbox, Workspace
+from tools import Decision, Limits, MemoryChoice, Toolbox, Workspace
 
 
 class FakeApprover:
     """Records every approval request and answers from a script.
 
     `change`, `run` and `fetch` are lists of Decisions consumed in order;
-    when a list runs out, the default is to approve.
+    when a list runs out, the default is to approve. `memory` is a list of
+    MemoryChoices; the default is to keep both notes.
     """
 
-    def __init__(self, change=None, run=None, fetch=None):
+    def __init__(self, change=None, run=None, fetch=None, memory=None):
+        self.memory_answers = list(memory or [])
+        self.memory_requests: list[tuple[str, str, list[str], bool]] = []
         self.change_answers = list(change or [])
         self.run_answers = list(run or [])
         self.fetch_answers = list(fetch or [])
@@ -32,6 +35,10 @@ class FakeApprover:
     def approve_run(self, rel_path, steps, cwd, timeout):
         self.run_requests.append((rel_path, steps, cwd, timeout))
         return self.run_answers.pop(0) if self.run_answers else Decision(True)
+
+    def approve_memory(self, fact, block, similar, web_tainted):
+        self.memory_requests.append((fact, block, list(similar), web_tainted))
+        return self.memory_answers.pop(0) if self.memory_answers else MemoryChoice("keep")
 
     def approve_fetch(self, host, url, reason="", scope=""):
         self.fetch_requests.append((host, url))

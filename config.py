@@ -250,7 +250,7 @@ def load(path: str | os.PathLike | None = None) -> dict:
         "mmproj_url": f"https://huggingface.co/{m['repo']}/resolve/main/{m['mmproj_file']}",
         "log_dir": str(root / "logs"),
         "history_dir": str(root / "history"),
-        "memory_path": str(root / "memory" / "memory.md"),
+        "memory_path": str(root / "memory" / "memory.toml"),
         "checkpoint_dir": str(root / "checkpoints"),
         "base_url": f"http://{cfg['server']['host']}:{cfg['server']['port']}",
     }
