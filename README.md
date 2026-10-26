@@ -98,8 +98,42 @@ defaults are stock llama.cpp `master`.
 
 Everything arborist keeps lives under `paths.root` (default
 `~/.local/share/arborist`): the llama.cpp source and build, model weights,
-server logs, saved chats, memory, and workspace checkpoints. Output from runs
+server logs, saved chats, memory (`memory/memory.toml`), and workspace checkpoints. Output from runs
 the model makes is logged in `.arborist-logs/` inside the workspace.
+
+## Memory
+
+The model saves notes with its `remember` tool to `memory/memory.toml` under
+`paths.root`. Each note goes in one of two places: `[general]`, for facts about
+you that hold everywhere, or a block named after the folder arborist was started
+in, for facts about that project:
+
+```toml
+[general]
+memories = ["2026-10-26: Prefers tabs over spaces"]
+outdated = []
+
+["~/code/project1"]
+memories = ["2026-10-26: Tests now use pytest"]
+outdated = ["2026-10-20: Tests use unittest"]
+```
+
+A session sees `[general]` plus the blocks for its own folder, the folders
+above it and the folders inside it. Started in `~/code/project1` it sees notes
+saved for `~/code` (say, "all my repos use ruff"); started in `~/code` it sees
+the `project1` notes too. Notes for sibling folders stay out. A `--no-tools`
+chat uses the folder it was started in.
+
+`memories` go into the system prompt (up to a size limit: this folder's notes
+first, then parent folders, nearest first, then general, then subfolders). `outdated` notes stay out of the prompt,
+but `/recall` still finds them. When the model saves a note that looks like one
+already in that block, you're shown both and asked whether to **replace** the
+old one (it moves to `outdated`), **keep** both, or **skip** saving. Edit the
+file freely, comments included: arborist edits it in place, adding or moving
+only the lines for the notes it saves, and checks the result before writing. If
+you've laid a block out in a way it can't edit safely, it reports that and
+leaves the file alone. An old `memory.md` is imported into `[general]` the
+first time, and renamed `memory.md.migrated`.
 
 ## Chat commands
 
@@ -116,7 +150,7 @@ the model makes is logged in `.arborist-logs/` inside the workspace.
 | `/retry` | regenerate the last reply (file changes are not undone) |
 | `/save [PATH]` | write the conversation to Markdown |
 | `/stats` | context usage and last-reply speed |
-| `/recall [-n] TERM` | search saved memories and attach the hits to your next message (`-n` only shows them) |
+| `/recall [-n] TERM` | search the memories this folder can see, outdated ones too, and attach the hits to your next message (`-n` only shows them) |
 | `/undo [ID]` | restore the workspace's files from before the model's last change (or checkpoint `ID`); previews and asks first |
 | `/checkpoints` | list workspace checkpoints, newest first |
 | `/compact` | shrink the conversation now: stub old tool output, then summarise older turns |
@@ -141,7 +175,7 @@ not treated as a command; `//help me` sends the literal `/help me`.
 | `run_tests` | run the project's tests (pytest/unittest, cargo, dart/flutter, npm, node) | **always** |
 | `fetch_url` | read a web page as text | **every new page**, showing the URL and the model's reason |
 | `crawl_docs` | follow links under one docs directory and search them | **once per crawl**, showing the start URL and how far it may go |
-| `remember` | save a one-line note that's loaded into future sessions | only after web content is in the conversation |
+| `remember` | save a one-line note for future sessions, for this folder or everywhere | when it looks like a saved note (replace/keep/skip), or after web content is in the conversation |
 
 `view_tree`, `list_files` and `grep` skip `.gitignore`d files. There are
 guardrails for small models: a step limit per message, and a forced pause
@@ -189,7 +223,7 @@ prompts are the main safety mechanism, so read them. Specifically:
   running as any user on your machine can use it. Don't change `server.host`
   to `0.0.0.0` on a network you don't trust.
 - **Local data is plain text.** Saved chats include file contents the model
-  read; memory notes are in `memory/memory.md`; checkpoints are copies of
+  read; memory notes are in `memory/memory.toml`; checkpoints are copies of
   workspace files (anything covered by `.gitignore` is skipped, but an
   un-ignored `.env` gets copied). All of it is under `paths.root`.
 - **Supply chain.** The build uses whatever is at `build.ref`; pin a commit
