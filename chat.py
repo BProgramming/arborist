@@ -1202,7 +1202,8 @@ class Chat:
         parts = [self.system_prompt] if self.system_prompt else []
         env = [self.date_line]
         if self.tools_enabled and self.toolbox:
-            parts.append(agent.TOOL_GUIDE.format(root=self.toolbox.ws.root))
+            parts.append(agent.TOOL_GUIDE.format(root=self.toolbox.ws.root,
+                                                 sandbox=agent.sandbox_rule(self.toolbox.limits)))
             parts.append(MEMORY_GUIDE)
             if self._env_facts is None:
                 with self.toolbox._probing():  # version probes run the project's interpreter

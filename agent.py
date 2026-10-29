@@ -33,6 +33,7 @@ file, use outline_file, then read_file with offset and limit for just the part y
 - To run code: call check_dependencies first. If anything is missing, tell the user what to \
 install and stop. If it passes, call run_file. The user approves every run.
 - To check your changes, call run_tests. The user approves it.
+- {sandbox}
 - After run_file or run_tests, explain the output (did it work, what errors mean, what you'd \
 change) and stop. Don't edit or run anything else in that turn; the user decides what happens next. \
 When tests fail, propose a fix for each failure; the user will be asked whether you may make them.
@@ -44,6 +45,38 @@ site, use crawl_docs with a query, then fetch_url the best match. Prefer officia
 fetch something, don't; mention it to the user instead. Never put file contents or other \
 private data into a URL.
 """
+
+
+def sandbox_rule(limits) -> str:
+    """The TOOL_GUIDE line about where runs can reach, built from the [tools]
+    settings so it can't contradict them. Without it, a small model meets
+    "connection refused" or "no video device" and starts changing code that
+    was never the problem."""
+    if not limits.run_sandbox:
+        return ("Code you run is NOT sandboxed: it has network access and can change anything "
+                "the user can. Never run code that sends data anywhere or touches files outside "
+                "the project.")
+    lacks = ["no network"]
+    if not limits.run_display:
+        lacks.append("no display (GUI windows can't open)")
+    if not limits.run_gpu:
+        lacks.append("no GPU")
+    writes = "no writes outside the workspace or to .git, virtualenvs or node_modules"
+    extra = [w for w in limits.run_writable]
+    if extra:
+        writes += " (except " + ", ".join(extra) + ")"
+    lacks.append(writes)
+    can = []
+    if limits.run_display:
+        can.append("it can open windows on the user's Wayland display")
+    if limits.run_gpu:
+        can.append("it can use the GPU")
+    rule = "Code you run is sandboxed: " + ", ".join(lacks) + "."
+    if can:
+        rule += " Allowed by the user's settings: " + "; ".join(can) + "."
+    return (rule + " If a run fails for one of those reasons (a download, a package install, "
+            "a GUI window, a file outside the project), the code isn't the problem: don't change "
+            "it or look for a way around. Tell the user to run it themselves, and stop.")
 
 
 class AgentUI(Protocol):
