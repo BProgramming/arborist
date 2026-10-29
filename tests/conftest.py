@@ -29,6 +29,7 @@ class FakeApprover:
         self.change_requests: list[tuple[str, str, bool]] = []
         self.run_requests: list[tuple[str, list[list[str]], str, int]] = []
         self.run_notes: list[list[str]] = []
+        self.run_views: list[str | None] = []
         self.shown_changes: list[tuple[str, str, bool]] = []
         self.fetch_requests: list[tuple[str, str]] = []
         self.fetch_details: list[tuple[str, str]] = []  # (reason, scope)
@@ -40,9 +41,10 @@ class FakeApprover:
     def show_change(self, rel_path, diff, is_new):
         self.shown_changes.append((rel_path, diff, is_new))
 
-    def approve_run(self, rel_path, steps, cwd, timeout, notes=()):
+    def approve_run(self, rel_path, steps, cwd, timeout, notes=(), view=None):
         self.run_requests.append((rel_path, steps, cwd, timeout))
         self.run_notes.append(list(notes))
+        self.run_views.append(view)
         return self.run_answers.pop(0) if self.run_answers else Decision(True)
 
     def approve_memory(self, fact, block, similar, web_tainted):

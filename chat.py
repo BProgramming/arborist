@@ -446,18 +446,25 @@ class TerminalApprover:
                 print(dim(f"  pick numbers from 1 to {len(similar)}"))
 
     def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int,
-                    notes: list[str] = ()) -> Decision:
+                    notes: list[str] = (), view: str | None = None) -> Decision:
         print()
         print(bold(yellow(f"Run {rel_path}?")))
         for step in steps:
             print("  $ " + " ".join(step))
         print(dim(f"  in {cwd}, killed after {timeout}s"))
         for note in notes:
-            print(("  " + red(bold(note))) if note.startswith("NOT sandboxed") else dim("  " + note))
-        ans = ask("Run it? [y/N]: ").strip().lower()
-        if ans in ("y", "yes"):
-            return Decision(True)
-        return Decision(False, ask("Reason for the model (optional): ").strip())
+            loud = note.startswith(("NOT sandboxed", "CHANGED", "WEB:"))
+            print(("  " + red(bold(note))) if loud else dim("  " + note))
+        choices = "[v]iew the file / [y]es / [N]o" if view is not None else "[y/N]"
+        while True:
+            ans = ask(f"Run it? {choices}: ").strip().lower()
+            if view is not None and ans in ("v", "view"):
+                for i, line in enumerate(view.splitlines(), 1):
+                    print(dim(f"{i:5} ") + mark_dotted(line, str))
+                continue
+            if ans in ("y", "yes"):
+                return Decision(True)
+            return Decision(False, ask("Reason for the model (optional): ").strip())
 
 
 # ------------------------------------------------------------------ memory ---

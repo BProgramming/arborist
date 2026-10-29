@@ -600,3 +600,52 @@ def test_chat_protects_arborist_and_hides_its_data(load_toml, tmp_path, monkeypa
     assert install.resolve() in c.toolbox.ws.readonly
     assert Path(c.cfg["derived"]["config_path"]).resolve() in c.toolbox.ws.readonly
     assert Path(c.cfg["derived"]["root"]).resolve() in c.toolbox.ws.hidden
+
+
+# --- run prompts tie the run to what you approved -----------------------------
+
+def _run_notes_for(tb, approver, rel):
+    tb.call("check_dependencies", {"path": rel})
+    tb.call("run_file", {"path": rel})
+    return " | ".join(approver.run_notes[-1])
+
+
+def test_run_prompt_says_where_the_file_came_from(ws_root, make_toolbox, approver):
+    write(ws_root, "mine.py", "print('mine')\n")
+    tb = make_toolbox(approver)
+    assert "wasn't written by the model" in _run_notes_for(tb, approver, "mine.py")
+    assert approver.run_views[-1] == "print('mine')\n"  # offered for [v]iew
+
+    tb.call("write_file", {"path": "new.py", "content": "print('new')\n"})
+    assert "unchanged since the diff you were shown" in _run_notes_for(tb, approver, "new.py")
+
+    (ws_root / "new.py").write_text("print('swapped')\n")  # changed after the diff you saw
+    notes = _run_notes_for(tb, approver, "new.py")
+    assert "CHANGED: new.py" in notes and approver.run_views[-1] == "print('swapped')\n"
+
+
+def test_run_prompt_flags_other_changed_model_files(ws_root, make_toolbox, approver):
+    tb = make_toolbox(approver)
+    tb.call("write_file", {"path": "helper.py", "content": "X = 1\n"})
+    write(ws_root, "main.py", "import helper\nprint(helper.X)\n")
+    (ws_root / "helper.py").write_text("X = 2\n")
+    notes = _run_notes_for(tb, approver, "main.py")
+    assert "CHANGED since you were shown them: helper.py" in notes
+
+
+def test_run_prompt_warns_when_web_content_is_present(ws_root, make_toolbox, approver):
+    write(ws_root, "a.py", "print(1)\n")
+    tb = make_toolbox(approver)
+    assert "WEB:" not in _run_notes_for(tb, approver, "a.py")
+    tb.web_tainted = True
+    assert "WEB:" in _run_notes_for(tb, approver, "a.py")
+
+
+def test_terminal_run_prompt_can_show_the_file(monkeypatch, capsys):
+    answers = iter(["v", "y"])
+    monkeypatch.setattr("builtins.input", lambda p="": next(answers))
+    d = chat.TerminalApprover().approve_run("a.py", [["python3", "a.py"]], "/w", 10,
+                                            notes=["CHANGED: a.py was written by the model, then changed"],
+                                            view="import os\nos.remove('x')\n")
+    out = capsys.readouterr().out
+    assert d.approved and "os.remove('x')" in out and "CHANGED" in out
