@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load and validate arborist.toml, and hand values to the shell launcher.
+"""Load and validate .config/config, and hand values to the shell launcher.
 
 Usage (called by arborist.sh):
     config.py --shell        print `KEY=value` lines (shell-quoted) to eval
@@ -90,6 +90,7 @@ DEFAULTS: dict = {
         "run_env_keep": [],
         "run_writable": [],
         "run_display": False,
+        "run_gpu": False,
         "max_consecutive_errors": 4,
         "max_repeat_calls": 3,
         "checkpoints": True,
@@ -202,7 +203,7 @@ def _validate(c: dict) -> None:
         _check(isinstance(t[key], int) and not isinstance(t[key], bool) and t[key] >= 0,
                f"tools.{key} must be a whole number (0 turns the check off)")
     _check(isinstance(t["checkpoints"], bool), "tools.checkpoints must be true or false")
-    for key in ("run_sandbox", "run_display"):
+    for key in ("run_sandbox", "run_display", "run_gpu"):
         _check(isinstance(t[key], bool), f"tools.{key} must be true or false")
     _check(isinstance(t["run_writable"], list) and all(isinstance(v, str) and v for v in t["run_writable"]),
            'tools.run_writable must be a list of folders, e.g. ["~/.cache/my-tool"]')
@@ -229,8 +230,13 @@ def _validate(c: dict) -> None:
                f"compaction.summary_effort must be \"\" or one of model.efforts {efforts}")
 
 
+def default_path() -> Path:
+    """$ARBORIST_CONFIG, else .config/config next to this file. The file is TOML."""
+    return Path(os.environ.get("ARBORIST_CONFIG") or HERE / ".config" / "config")
+
+
 def load(path: str | os.PathLike | None = None) -> dict:
-    path = Path(path or os.environ.get("ARBORIST_CONFIG") or HERE / "arborist.toml")
+    path = Path(path or default_path())
     if not path.exists():
         raise ConfigError(f"config not found: {path}")
     with open(path, "rb") as f:

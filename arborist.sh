@@ -11,7 +11,7 @@
 #   ./arborist.sh status   show what's installed and whether a server is up
 #   ./arborist.sh stop     stop a server this script left running
 #
-# Settings, including which model, live in arborist.toml (or point
+# Settings, including which model, live in .config/config (or point
 # ARBORIST_CONFIG at another file). Inference runs in C++ (llama.cpp, or the
 # fork named in the toml); config + chat are Python.
 

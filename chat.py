@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Terminal chat client for a local llama-server (model set in arborist.toml).
+"""Terminal chat client for a local llama-server (model set in .config/config).
 
 The heavy lifting (inference) happens in the C++ server; this is just I/O
 plus the tools the model can call on files in your workspace (the directory
@@ -16,6 +16,8 @@ import json
 import os
 import platform
 import re
+import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -35,6 +37,7 @@ except ImportError:  # pragma: no cover
 
 import agent
 import compaction
+import changes as changes_mod
 import config as model_config
 import runners
 from checkpoints import CheckpointError, Checkpoints, prune_store
@@ -46,8 +49,77 @@ from tools import (IGNORED_DIRS, Decision, Limits, MemoryChoice, ToolResult, Too
 USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
 
+# ------------------------------------------------------- safe terminal output
+#
+# Model replies, program output, file contents in diffs, file names, URLs: any
+# of it can carry terminal control sequences that erase or redraw lines (so an
+# approval prompt shows something other than what will happen), hide text,
+# set the window title, or copy data to the clipboard (OSC 52). So stdout
+# passes only the escape sequences arborist itself writes, which carry this
+# per-process tag that untrusted text can't guess. Every other control
+# character is shown as a visible symbol instead.
+TAG = "\ue000" + secrets.token_hex(8) + "\ue001"
+_TRUSTED = re.compile(r"\x1b\[[0-9;]*[mK]|\r")
+# Bidirectional overrides ("Trojan Source"): they reorder how text displays.
+_BIDI = dict.fromkeys(map(ord, "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f"))
+
+
+def neutralize(text: str) -> str:
+    """Untrusted text with every control character made visible: ESC as ␛,
+    others as ^X or <U+XXXX>. Newlines and tabs stay; carriage returns become
+    newlines (a bare \\r would let text overwrite what came before it)."""
+    text = text.replace("\r\n", "\n")
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if ch in "\n\t":
+            out.append(ch)
+        elif ch == "\r":
+            out.append("\n")
+        elif ch == "\x1b":
+            out.append("␛")
+        elif o < 32 or o == 127:
+            out.append("^" + chr(o ^ 64))
+        elif 0x80 <= o <= 0x9f or o in _BIDI or 0xe000 <= o <= 0xf8ff and ch in "\ue000\ue001":
+            out.append(f"<U+{o:04X}>")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def clean(text: str) -> str:
+    """What reaches the terminal: tagged (arborist's own) sequences kept,
+    everything else neutralized."""
+    parts = text.split(TAG)
+    out = [neutralize(parts[0])]
+    for part in parts[1:]:
+        m = _TRUSTED.match(part)
+        trusted = m.group() if m else ""
+        out.append(trusted + neutralize(part[len(trusted):]))
+    return "".join(out)
+
+
+class SafeStdout:
+    """sys.stdout replacement: everything written goes through clean()."""
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        if text in (PROMPT, CONT_PROMPT):  # constants, written by input() without readline
+            return self._stream.write(text)
+        return self._stream.write(clean(text))
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def ask(prompt: str) -> str:
+    """input() with a prompt that may contain arborist's own colours."""
+    return input(prompt.replace(TAG, ""))
+
+
 def _c(code: str, text: str) -> str:
-    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+    return f"{TAG}\033[{code}m{text}{TAG}\033[0m" if USE_COLOR else text
 
 
 def dim(t: str) -> str: return _c("2", t)
@@ -113,6 +185,10 @@ Commands:
   /checkpoints          list workspace checkpoints, newest first
   /compact              shrink the conversation now (old tool output, then a
                         summary of older turns)
+  /diff [-f] [PATH…]    files changed since this session started, in the
+                        workspace or under PATH (-f, --full: the whole diff)
+  /config               open .config/config in nano; [tools] settings apply
+                        right away, the rest after a restart
 
 Input:
   \"\"\"                   on its own line starts/ends a multi-line block
@@ -120,6 +196,8 @@ Input:
   A line starting with / is a command only if its first word has no other /,
   so pasting a path like /etc/hosts sends it as a message. Use // to send a
   message that starts with a command word (//help me → "/help me").
+  Commands are handled by arborist itself and never reach the model. Quote
+  arguments with spaces: /file "my notes.md".
 """
 
 
@@ -223,7 +301,7 @@ class TerminalUI:
 
     def _clear_status(self):
         if self.status_shown:
-            sys.stdout.write("\r\033[K" if USE_COLOR else "\n")
+            sys.stdout.write(f"{TAG}\r{TAG}\033[K" if USE_COLOR else "\n")
             self.status_shown = False
 
     def reasoning(self, text: str) -> None:
@@ -235,7 +313,7 @@ class TerminalUI:
             sys.stdout.write(dim(text))
         else:
             secs = time.monotonic() - self.started
-            sys.stdout.write(f"\r{dim(f'thinking… {secs:4.0f}s, ~{self.thinking_chars // 4} tokens')}")
+            sys.stdout.write(f"{TAG}\r{dim(f'thinking… {secs:4.0f}s, ~{self.thinking_chars // 4} tokens')}")
             self.status_shown = True
         sys.stdout.flush()
 
@@ -286,18 +364,8 @@ class TerminalApprover:
         print(bold(("Create " if is_new else "Edit ") + rel_path))
         lines = diff.splitlines()
         for line in lines[: self.MAX_DIFF_LINES]:
-            if line.startswith(("+++", "---")):
-                print(dim(line))
-            elif line.startswith("+"):
-                print(mark_dotted(line, green))
-            elif line.startswith("-"):
-                print(mark_dotted(line, red))
-            elif line.startswith("@@"):
-                print(cyan(line))
-            else:
-                print(mark_dotted(line, str))
-        if len(lines) > self.MAX_DIFF_LINES:
-            print(dim(f"… {len(lines) - self.MAX_DIFF_LINES} more diff lines not shown"))
+            print(_colour_diff_line(line))
+        hidden_count = max(len(lines) - self.MAX_DIFF_LINES, 0)
         shown, hidden = dotted_names(lines, self.MAX_DIFF_LINES)
         if shown or hidden:
             print(bold("Dotted names this change adds:"))
@@ -305,14 +373,32 @@ class TerminalApprover:
                 print("  " + "  ".join(marked(n) for n in shown))
             if hidden:
                 print(yellow("  only in the lines not shown: ") + "  ".join(marked(n) for n in hidden))
+        # Nothing is applied that you haven't been shown: with lines held
+        # back, yes isn't offered until you've viewed them.
+        while hidden_count:
+            ans = ask(f"{hidden_count} more diff lines. [v]iew them / [n]o: ").strip().lower()
+            if ans in ("v", "view"):
+                for line in lines[self.MAX_DIFF_LINES:]:
+                    print(_colour_diff_line(line))
+                hidden_count = 0
+            elif ans in ("n", "no"):
+                return Decision(False, ask("Reason for the model (optional): ").strip())
         while True:
-            ans = input("Apply? [y]es / [n]o / [a]ll edits this session: ").strip().lower()
+            ans = ask("Apply? [y]es / [n]o / [a]ll edits this session: ").strip().lower()
             if ans in ("y", "yes"):
                 return Decision(True)
             if ans in ("a", "all"):
                 return Decision(True, always=True)
             if ans in ("n", "no"):
-                return Decision(False, input("Reason for the model (optional): ").strip())
+                return Decision(False, ask("Reason for the model (optional): ").strip())
+
+    def show_change(self, rel_path: str, diff: str, is_new: bool) -> None:
+        """An edit applied without asking (approve_edits = auto, or [a]ll):
+        still shown in full, so nothing changes unseen."""
+        print()
+        print(bold(("Created " if is_new else "Edited ") + rel_path) + dim("  (applied without asking)"))
+        for line in diff.splitlines():
+            print(_colour_diff_line(line))
 
     def approve_fetch(self, host: str, url: str, reason: str = "", scope: str = "") -> Decision:
         print()
@@ -323,10 +409,10 @@ class TerminalApprover:
         if reason:
             print(dim(f"  reason: {reason}"))
         print(dim("  this approves only this " + ("crawl" if scope else "page")))
-        ans = input("Allow? [y/N]: ").strip().lower()
+        ans = ask("Allow? [y/N]: ").strip().lower()
         if ans in ("y", "yes"):
             return Decision(True)
-        return Decision(False, input("Reason for the model (optional): ").strip())
+        return Decision(False, ask("Reason for the model (optional): ").strip())
 
     def approve_memory(self, fact: str, block: str, similar: list[str], web_tainted: bool) -> MemoryChoice:
         print()
@@ -342,12 +428,12 @@ class TerminalApprover:
         prompt = (f"[r]eplace {which} / [k]eep both / [s]kip saving "
                   f"[{default}]: ")
         while True:
-            ans = input(prompt).strip().lower() or default
+            ans = ask(prompt).strip().lower() or default
             cmd, _, rest = ans.partition(" ")
             if cmd in ("k", "keep"):
                 return MemoryChoice("keep")
             if cmd in ("s", "skip"):
-                return MemoryChoice("skip", reason=input("Reason for the model (optional): ").strip())
+                return MemoryChoice("skip", reason=ask("Reason for the model (optional): ").strip())
             if cmd in ("r", "replace"):
                 if not rest.strip():
                     return MemoryChoice("replace", list(range(len(similar))))
@@ -359,16 +445,19 @@ class TerminalApprover:
                     return MemoryChoice("replace", picks)
                 print(dim(f"  pick numbers from 1 to {len(similar)}"))
 
-    def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int) -> Decision:
+    def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int,
+                    notes: list[str] = ()) -> Decision:
         print()
         print(bold(yellow(f"Run {rel_path}?")))
         for step in steps:
             print("  $ " + " ".join(step))
         print(dim(f"  in {cwd}, killed after {timeout}s"))
-        ans = input("Run it? [y/N]: ").strip().lower()
+        for note in notes:
+            print(("  " + red(bold(note))) if note.startswith("NOT sandboxed") else dim("  " + note))
+        ans = ask("Run it? [y/N]: ").strip().lower()
         if ans in ("y", "yes"):
             return Decision(True)
-        return Decision(False, input("Reason for the model (optional): ").strip())
+        return Decision(False, ask("Reason for the model (optional): ").strip())
 
 
 # ------------------------------------------------------------------ memory ---
@@ -956,6 +1045,10 @@ class AgentTools:
         msg = f"saved to memory [{block}]: {entry}"
         if replaces:
             msg += "\nMarked outdated (no longer shown to you): " + "; ".join(replaces)
+        # Shown in full, whether or not it was asked about: the memory file is
+        # read into every future session's prompt.
+        self.toolbox.on_notice(f"Saved to memory [{block}] in {self.memory.path}: {entry}"
+                       + "".join(f"\n  marked outdated: {r}" for r in replaces))
         return ToolResult(msg)
 
 
@@ -996,7 +1089,8 @@ def environment_facts(workspace: Path, env_vars: list[str]) -> list[str]:
     facts.append("- Toolchains: " + (", ".join(tools) if tools else "none detected"))
 
     try:
-        r = subprocess.run(["git", "-C", str(workspace), "rev-parse", "--abbrev-ref", "HEAD"],
+        r = subprocess.run(["git", "-C", str(workspace), "-c", "core.fsmonitor=false",
+                            "rev-parse", "--abbrev-ref", "HEAD"],
                            capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
         if r.returncode == 0 and r.stdout.strip():
             facts.append(f"- Git branch: {r.stdout.strip()}")
@@ -1059,6 +1153,9 @@ class Chat:
 
         self.toolbox: Toolbox | None = None
         self.tools_enabled = False
+        # The checkpoint /diff compares against: the workspace when this
+        # session started (taken when the chat loop starts).
+        self.session_base: str | None = None
         self.checkpoints: Checkpoints | None = None
         if workspace is not None:
             if cfg["tools"]["checkpoints"]:
@@ -1071,6 +1168,7 @@ class Chat:
                 on_output=self.ui.run_output,
                 on_notice=self.ui.notice,
                 checkpoints=self.checkpoints,
+                on_changes=self._show_run_changes,
             )
             self.tools_enabled = tools_enabled
 
@@ -1107,7 +1205,8 @@ class Chat:
             parts.append(agent.TOOL_GUIDE.format(root=self.toolbox.ws.root))
             parts.append(MEMORY_GUIDE)
             if self._env_facts is None:
-                self._env_facts = environment_facts(self.toolbox.ws.root, self.cfg["chat"]["env_vars"])
+                with self.toolbox._probing():  # version probes run the project's interpreter
+                    self._env_facts = environment_facts(self.toolbox.ws.root, self.cfg["chat"]["env_vars"])
             env += self._env_facts
         parts.append("Environment:\n" + "\n".join(env))
         if self.memory_block:
@@ -1303,7 +1402,8 @@ class Chat:
             self.pending_files.append((str(path), text))
             print(dim(f"attached {path} ({len(text):,} chars, ~{len(text) // 4:,} tokens)"))
 
-    def _save(self, arg: str) -> None:
+    def _save(self, args: list[str]) -> None:
+        arg = args[0] if args else ""
         path = Path(os.path.expanduser(arg)) if arg else \
             self.history_dir / f"chat-{datetime.now():%Y%m%d-%H%M%S}.md"
         lines = [f"# Chat with {self.model_name} — {datetime.now():%Y-%m-%d %H:%M}", ""]
@@ -1344,10 +1444,9 @@ class Chat:
             # before editing them.
             self.toolbox.reset()
 
-    def _recall(self, arg: str) -> None:
-        show_only = False
-        if arg == "-n" or arg.startswith("-n "):
-            show_only, arg = True, arg[2:].strip()
+    def _recall(self, args: list[str]) -> None:
+        show_only = "-n" in args
+        arg = " ".join(a for a in args if a != "-n")
         try:
             if not arg:
                 current, old = self.memory.counts()
@@ -1405,7 +1504,8 @@ class Chat:
         print(dim("/undo restores the newest one your files differ from; /undo ID restores a "
                   "specific one"))
 
-    def _undo(self, arg: str) -> None:
+    def _undo(self, args: list[str]) -> None:
+        arg = args[0] if args else ""
         if not self._checkpoints_ready():
             return
         try:
@@ -1431,7 +1531,7 @@ class Chat:
             if len(changes) > 40:
                 print(dim(f"  … and {len(changes) - 40} more"))
             print(dim("  your current files are saved as a checkpoint first, so this can be undone"))
-            if input("Restore? [y/N]: ").strip().lower() not in ("y", "yes"):
+            if ask("Restore? [y/N]: ").strip().lower() not in ("y", "yes"):
                 print(dim("left as is"))
                 return
             reverted, safety = self.checkpoints.restore(cp.sha)
@@ -1465,75 +1565,195 @@ class Chat:
 
     def command(self, line: str) -> bool:
         """Handle a slash command. Returns False to exit."""
-        cmd, _, arg = line[1:].partition(" ")
-        arg = arg.strip()
-        if cmd in ("exit", "quit", "q"):
+        try:
+            name, args, raw = parse_command(line)
+        except ValueError as e:
+            print(red(f"can't read that command: {e}"))
+            return True
+        if name in ("exit", "quit", "q"):
             return False
-        if cmd == "help":
-            print(HELP)
-        elif cmd == "clear":
-            self._clear()
-            print(dim("conversation cleared"))
-        elif cmd == "effort":
-            if not self.efforts:
-                print(red(f"{self.model_name} has no effort levels (model.efforts is empty)"))
-            elif arg in self.efforts:
-                self.effort = arg
-                print(dim(f"reasoning effort: {arg}"))
-            else:
-                print(red(f"usage: /effort {'|'.join(self.efforts)}  (now: {self.effort})"))
-        elif cmd == "think":
-            self.ui.show_thinking = not self.ui.show_thinking
-            print(dim(f"show thinking: {'on' if self.ui.show_thinking else 'off'}"))
-        elif cmd == "tools":
-            if self.toolbox is None:
-                print(red("tools are unavailable in this session (started with --no-tools)"))
-            else:
-                self.tools_enabled = not self.tools_enabled
-                print(dim(f"tools: {'on' if self.tools_enabled else 'off'}  (workspace {self.toolbox.ws.root})"))
-        elif cmd == "file":
-            self._attach(arg.split())
-        elif cmd == "system":
-            if not arg:
-                print(dim(f"system prompt: {self.system_prompt}"))
-            else:
-                self.system_prompt = arg
-                self._clear()
-                print(dim("system prompt replaced; conversation cleared"))
-        elif cmd == "retry":
-            last_user = max((i for i, m in enumerate(self.messages) if m["role"] == "user"), default=None)
-            if last_user is None or last_user == len(self.messages) - 1:
-                print(red("nothing to retry"))
-            else:
-                self._rollback(last_user + 1)
-                self._reply()
-        elif cmd == "save":
-            self._save(arg)
-        elif cmd == "stats":
-            self._print_stats()
-        elif cmd == "recall":
-            self._recall(arg)
-        elif cmd == "undo":
-            self._undo(arg)
-        elif cmd == "checkpoints":
-            self._list_checkpoints()
-        elif cmd == "compact":
-            if len(self.messages) < 2:
-                print(dim("nothing to compact yet"))
-            else:
-                before = list(self.messages)
-                self.busy = True
-                try:
-                    if not self.compactor.maybe_compact(self.messages, force=True):
-                        print(dim("nothing to compact: the conversation is already short"))
-                except Interrupted:
-                    self.messages[:] = before
-                    print(red("[stopped]"))
-                finally:
-                    self.busy = False
-        else:
-            print(red(f"unknown command /{cmd} — try /help"))
+        handler = self._commands().get(name)
+        if handler is None:
+            print(red(f"unknown command /{name} — try /help"))
+            return True
+        fn, max_args = handler
+        if max_args is not None and len(args) > max_args:
+            print(red(f"/{name} takes {'no' if max_args == 0 else f'at most {max_args}'} "
+                      f"argument{'' if max_args == 1 else 's'}; got {' '.join(args)!r} — try /help"))
+            return True
+        fn(args, raw)
         return True
+
+    def _commands(self) -> dict:
+        """Command name -> (handler(args, raw), most arguments it takes or None)."""
+        return {
+            "help": (lambda a, r: print(HELP), 0),
+            "clear": (self._cmd_clear, 0),
+            "effort": (self._cmd_effort, 1),
+            "think": (self._cmd_think, 0),
+            "tools": (self._cmd_tools, 0),
+            "file": (lambda a, r: self._attach(a), None),
+            "system": (self._cmd_system, None),
+            "retry": (self._cmd_retry, 0),
+            "save": (lambda a, r: self._save(a), 1),
+            "stats": (lambda a, r: self._print_stats(), 0),
+            "recall": (lambda a, r: self._recall(a), None),
+            "undo": (lambda a, r: self._undo(a), 1),
+            "checkpoints": (lambda a, r: self._list_checkpoints(), 0),
+            "compact": (self._cmd_compact, 0),
+            "diff": (lambda a, r: self._diff(a), None),
+            "config": (self._cmd_config, 0),
+        }
+
+    # -- changes ------------------------------------------------------------
+
+    CHANGE_COLOURS = {"A": green, "M": yellow, "D": red}
+
+    def _show_run_changes(self, found: list) -> None:
+        """After every run: what it added, changed or deleted in the workspace."""
+        if not found:
+            print(dim("  the run changed no files in the workspace"))
+            return
+        print(bold("Files the run changed:"))
+        for line in changes_mod.format_changes(found, colour=self.CHANGE_COLOURS):
+            print(line)
+
+    def _mark_session_start(self) -> None:
+        if self.checkpoints is None or not self.checkpoints.available:
+            return
+        try:
+            self.session_base = self.checkpoints.snapshot("session start", kind="session")
+        except CheckpointError as e:
+            self.ui.notice(f"couldn't record the session's starting point ({e}); /diff won't work")
+
+    def _diff(self, args: list[str]) -> None:
+        """/diff [-f|--full] [PATH…]: what changed since the session started."""
+        full = any(a in ("-f", "--full") for a in args)
+        unknown = [a for a in args if a.startswith("-") and a not in ("-f", "--full")]
+        if unknown:
+            print(red(f"unknown option {unknown[0]}; usage: /diff [-f|--full] [PATH…]"))
+            return
+        if not self._checkpoints_ready():
+            return
+        if self.session_base is None:
+            self._mark_session_start()
+            print(dim("no starting point was recorded for this session; tracking from now"))
+            return
+        rels = []
+        for a in (a for a in args if not a.startswith("-")):
+            try:
+                p = self.toolbox.ws.resolve(a)
+            except Exception as e:
+                print(red(str(e)))
+                return
+            rels.append(self.toolbox.ws.rel(p))
+        rels = [r for r in rels if r != "."]
+        try:
+            found = [c for c in self.checkpoints.changes_since(self.session_base)
+                     if not rels or any(c.path == r or c.path.startswith(r + "/") for r in rels)]
+            text = self.checkpoints.diff_text(self.session_base, rels) if full and found else ""
+        except CheckpointError as e:
+            print(red(f"can't diff: {e}"))
+            return
+        where = ", ".join(rels) if rels else "the workspace"
+        if not found:
+            print(dim(f"no changes in {where} since this session started"))
+            return
+        print(bold(f"Changed in {where} since this session started:"))
+        for line in changes_mod.format_changes(found, limit=200, colour=self.CHANGE_COLOURS):
+            print(line)
+        if full:
+            print()
+            for line in text.splitlines():
+                print(_colour_diff_line(line))
+
+    # -- config ---------------------------------------------------------------
+
+    def _cmd_config(self, args, raw) -> None:
+        """Open the config file in nano, then apply what can change live."""
+        path = Path(self.cfg["derived"]["config_path"])
+        nano = shutil.which("nano")
+        if nano is None:
+            print(red(f"nano isn't installed; edit {path} with any editor, then restart"))
+            return
+        try:
+            subprocess.run([nano, str(path)])
+        except OSError as e:
+            print(red(f"couldn't start nano: {e}"))
+            return
+        try:
+            new = model_config.load(path)
+        except model_config.ConfigError as e:
+            print(red(f"the config now has an error, so nothing was applied: {e}"))
+            print(dim("run /config again to fix it; until then this session keeps the old settings"))
+            return
+        changed = sorted(k for k in new if k != "derived" and new[k] != self.cfg.get(k))
+        if not changed:
+            print(dim("no changes"))
+            return
+        if "tools" in changed and self.toolbox is not None:
+            self.toolbox.apply_limits(Limits.from_config(new["tools"]))
+            print(dim("[tools] applied to this session"))
+        self.cfg["tools"] = new["tools"]
+        later = [k for k in changed if k != "tools"]
+        if later:
+            print(yellow(f"restart arborist for changes to [{'], ['.join(later)}] to take effect"))
+
+    def _cmd_clear(self, args, raw) -> None:
+        self._clear()
+        print(dim("conversation cleared"))
+
+    def _cmd_effort(self, args, raw) -> None:
+        if not self.efforts:
+            print(red(f"{self.model_name} has no effort levels (model.efforts is empty)"))
+        elif args and args[0] in self.efforts:
+            self.effort = args[0]
+            print(dim(f"reasoning effort: {args[0]}"))
+        else:
+            print(red(f"usage: /effort {'|'.join(self.efforts)}  (now: {self.effort})"))
+
+    def _cmd_think(self, args, raw) -> None:
+        self.ui.show_thinking = not self.ui.show_thinking
+        print(dim(f"show thinking: {'on' if self.ui.show_thinking else 'off'}"))
+
+    def _cmd_tools(self, args, raw) -> None:
+        if self.toolbox is None:
+            print(red("tools are unavailable in this session (started with --no-tools)"))
+        else:
+            self.tools_enabled = not self.tools_enabled
+            print(dim(f"tools: {'on' if self.tools_enabled else 'off'}  (workspace {self.toolbox.ws.root})"))
+
+    def _cmd_system(self, args, raw) -> None:
+        # Free text: the raw remainder, so quotes and spacing survive.
+        if not raw:
+            print(dim(f"system prompt: {self.system_prompt}"))
+        else:
+            self.system_prompt = raw
+            self._clear()
+            print(dim("system prompt replaced; conversation cleared"))
+
+    def _cmd_retry(self, args, raw) -> None:
+        last_user = max((i for i, m in enumerate(self.messages) if m["role"] == "user"), default=None)
+        if last_user is None or last_user == len(self.messages) - 1:
+            print(red("nothing to retry"))
+        else:
+            self._rollback(last_user + 1)
+            self._reply()
+
+    def _cmd_compact(self, args, raw) -> None:
+        if len(self.messages) < 2:
+            print(dim("nothing to compact yet"))
+            return
+        before = list(self.messages)
+        self.busy = True
+        try:
+            if not self.compactor.maybe_compact(self.messages, force=True):
+                print(dim("nothing to compact: the conversation is already short"))
+        except Interrupted:
+            self.messages[:] = before
+            print(red("[stopped]"))
+        finally:
+            self.busy = False
 
     # -- loop ----------------------------------------------------------------
 
@@ -1542,7 +1762,7 @@ class Chat:
         them), ask whether it may fix them. Yes sends the go-ahead."""
         self.fix_offer = False
         try:
-            ans = input(bold(yellow("Let the model fix these? [y/N]: "))).strip().lower()
+            ans = ask(bold(yellow("Let the model fix these? [y/N]: "))).strip().lower()
         except (KeyboardInterrupt, EOFError):
             print()
             return False
@@ -1577,6 +1797,7 @@ class Chat:
         print(dim(f"    Server: {self.cfg['derived']['base_url']}"))
         print(dim(f"    Effort: {self.effort or 'n/a'}"))
         print(dim(f"    Tools:  {'ON' if self.tools_enabled else 'OFF'}"))
+        self._mark_session_start()
         try:
             current, old = self.memory.counts()
             extra = f" (+{old} outdated)" if old else ""
@@ -1619,6 +1840,31 @@ def _memories(n: int) -> str:
     return f"{n} memor{'y' if n == 1 else 'ies'}"
 
 
+def _colour_diff_line(line: str) -> str:
+    if line.startswith(("+++", "---", "diff ", "index ")):
+        return dim(line)
+    if line.startswith("+"):
+        return mark_dotted(line, green)
+    if line.startswith("-"):
+        return mark_dotted(line, red)
+    if line.startswith("@@"):
+        return cyan(line)
+    return mark_dotted(line, str)
+
+
+def parse_command(line: str) -> tuple[str, list[str], str]:
+    """'/name a "b c"' -> ('name', ['a', 'b c'], 'a "b c"').
+
+    Splits on any whitespace. Arguments are split shell-style, so quotes keep
+    spaces in one argument; `raw` is the untouched remainder, for commands
+    that take free text (/system). Raises ValueError on an unclosed quote.
+    """
+    parts = line.strip()[1:].split(maxsplit=1)
+    name = parts[0] if parts else ""
+    raw = parts[1].strip() if len(parts) > 1 else ""
+    return name, shlex.split(raw), raw
+
+
 def is_command(line: str) -> bool:
     """'/clear' is a command; '/etc/hosts …' and '//help' are messages."""
     if not line.startswith("/") or line.startswith("//"):
@@ -1659,6 +1905,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace", "-w", help="directory the model's tools may access (default: current directory)")
     ap.add_argument("--no-tools", action="store_true", help="plain chat: no file or run tools at all")
     args = ap.parse_args(argv)
+    if not isinstance(sys.stdout, SafeStdout):
+        sys.stdout, sys.stderr = SafeStdout(sys.stdout), SafeStdout(sys.stderr)
 
     try:
         cfg = model_config.load()

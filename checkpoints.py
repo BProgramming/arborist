@@ -156,6 +156,15 @@ class Checkpoints:
         fields = [f for f in out.decode("utf-8", "surrogateescape").split("\0") if f]
         return [Change(fields[i][0], fields[i + 1]) for i in range(0, len(fields) - 1, 2)]
 
+    def diff_text(self, sha: str, paths: list[str] = ()) -> str:
+        """The full unified diff from a checkpoint to the workspace now
+        (binary files are named, not shown). `paths` limits it, relative to
+        the workspace."""
+        self._stage()
+        out = self._git("diff", "--cached", "--no-renames", "--no-color", "--no-ext-diff",
+                        sha, "--", *(paths or ["."])).stdout
+        return out.decode("utf-8", "replace")
+
     def latest_different(self, limit: int = 100) -> tuple[Checkpoint, list[Change]] | None:
         """What /undo restores: the newest turn checkpoint the workspace
         differs from. Right after an undo (nothing new since), only

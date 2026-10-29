@@ -203,8 +203,15 @@ class TestRust:
         write(ws_root, "src/util.rs", "pub fn x() {}\n")
         tb = make_toolbox(run_timeout=180)
         report, result = check_and_run(tb, "src/main.rs")
-        assert "crate dependencies available offline" in report
+        if tb.limits.run_sandbox:
+            # No Cargo.lock yet: the sandboxed check can't write one, so it skips.
+            assert "no Cargo.lock yet" in report
+        else:
+            assert "crate dependencies available offline" in report
         assert "cargo ok" in result.content
+        assert (ws_root / "Cargo.lock").exists()  # the approved run made it
+        assert "crate dependencies available offline" in tb.call(
+            "check_dependencies", {"path": "src/main.rs"}).content
         assert "isn't a binary target" in tb.call("check_dependencies", {"path": "src/util.rs"}).content
 
 

@@ -1,4 +1,4 @@
-# arborist.toml — settings for arborist.sh / chat.py
+# .config/config — settings for arborist.sh / chat.py (TOML; /config opens it)
 #
 # Lines tagged  PERF  change speed or memory use. Defaults are tuned for an
 # AMD RX 9070 (16 GB VRAM, RDNA4 / gfx1201) on Linux Mint.
@@ -173,24 +173,35 @@ run_timeout = 120
 # Same for run_tests (a whole suite, including any compile).
 test_timeout = 300
 
-# Code the model wrote (run_file and run_tests) runs in a sandbox
-# (`unshare -rmn`): no network apart from loopback, so it can't reach the
-# internet, your LAN or the llama-server; and your home directory is
-# read-only apart from the workspace, so it can't plant anything that later
-# runs outside the sandbox. In the workspace, .git, virtualenvs and
-# node_modules are read-only too. If your system disables unprivileged user
-# namespaces, runs are refused until you fix that or set this to false.
+# Code the model wrote (run_file, run_tests, and the dependency checks before
+# them) runs in a bubblewrap (bwrap) sandbox. Inside, it sees /usr, /etc and
+# the toolchain folders it needs, read-only; the workspace, writable; and an
+# empty, throwaway home directory. It has no network (loopback only), can't
+# reach local sockets (Docker, D-Bus, your desktop), can't read your files
+# outside the workspace (~/.ssh, other projects, arborist's memory), and can't
+# create namespaces of its own. In the workspace, .git, virtualenvs and
+# node_modules are read-only, so it can't plant a git hook or poison an
+# environment you also use. After each run arborist lists the files it
+# changed. Needs bwrap (apt/dnf/pacman package "bubblewrap"); without it,
+# nothing runs. false runs code directly, with your full access: don't.
 run_sandbox = true
-# Extra folders runs may write to, e.g. a tool's cache in your home directory.
+# Extra folders runs may write to (they're shown on every run's approval
+# prompt), e.g. "~/.cache/some-tool". Writes outside these and the workspace
+# go to the throwaway home, or fail.
 run_writable = []
 # Runs get a minimal environment (PATH, HOME, locale, venv and toolchain
 # variables), so API keys and tokens in your shell don't reach them. List any
 # other variables your code needs here. Names only.
 run_env_keep = []
-# Let runs open windows (pygame and other GUI programs). This passes on your
-# display variables and XDG_RUNTIME_DIR, which also holds the D-Bus socket,
-# so a run could ask your desktop to do things. Off by default.
+# Let runs open windows (pygame and other GUI programs) on your Wayland
+# display: only the Wayland socket is passed in. X11 isn't supported, since
+# any X client can read every keystroke on the screen.
 run_display = false
+# Let runs use the GPU: /dev/dri (and /dev/kfd for ROCm, /dev/nvidia* if
+# present), plus the read-only /sys entries drivers use to find the card.
+# Only for code that needs it (OpenGL/Vulkan rendering, GPU compute); the
+# model's own inference runs outside the sandbox and doesn't need this.
+run_gpu = false
 
 # Stuck detection. Small models rarely notice they're going in circles, so
 # the harness pauses tool use and makes the model explain and ask you when:

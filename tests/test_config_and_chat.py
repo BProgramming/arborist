@@ -25,7 +25,7 @@ def load_toml(tmp_path, monkeypatch):
 
 def test_repo_config_is_valid(monkeypatch):
     monkeypatch.delenv("ARBORIST_CONFIG", raising=False)
-    cfg = config.load(Path(config.__file__).with_name("arborist.toml"))
+    cfg = config.load(Path(config.__file__).parent / ".config" / "config")
     assert cfg["tools"]["approve_edits"] == "ask"
     assert cfg["derived"]["model_name"] and cfg["derived"]["model_path"].endswith(cfg["model"]["file"])
     assert cfg["chat"]["reasoning_effort"] in cfg["model"]["efforts"]
@@ -189,7 +189,7 @@ def test_banner_and_transcript_use_the_configured_name(load_toml, ws_root, tmp_p
                   ws_root, tools_enabled=True)
     c.messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
     out = tmp_path / "t.md"
-    c._save(str(out))
+    c._save([str(out)])
     assert "## Test Model" in out.read_text()
 
 
@@ -791,3 +791,26 @@ def test_hip_backend_needs_a_target(load_toml):
         load_toml('[build]\nbackend = "hip"\n')
     assert load_toml('[build]\nbackend = "hip"\nhip_target = "gfx1100"\n')["build"]["hip_target"] == "gfx1100"
     assert load_toml()["build"]["hip_target"] == ""  # vulkan/cpu don't need one
+
+
+@pytest.mark.parametrize("line,expected", [
+    ("/clear", ("clear", [], "")),
+    ("/effort\thigh", ("effort", ["high"], "high")),
+    ("/diff  --full   src", ("diff", ["--full", "src"], "--full   src")),
+    ('/file "my notes.md" b.py', ("file", ["my notes.md", "b.py"], '"my notes.md" b.py')),
+    ("/system Be terse.  Really.", ("system", ["Be", "terse.", "Really."], "Be terse.  Really.")),
+])
+def test_parse_command(line, expected):
+    import chat
+    assert chat.parse_command(line) == expected
+
+
+def test_unclosed_quote_and_extra_args_are_reported(load_toml, ws_root, capsys):
+    import chat
+    c = chat.Chat(load_toml(""), ws_root, tools_enabled=False)
+    assert c.command('/file "oops') is True
+    assert "can't read that command" in capsys.readouterr().out
+    assert c.command("/clear now please") is True
+    assert "takes no arguments" in capsys.readouterr().out
+    assert c.command("/effort\tmedium") is True  # a tab separates like a space
+    assert "unknown command" not in capsys.readouterr().out

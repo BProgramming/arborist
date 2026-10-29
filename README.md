@@ -77,7 +77,7 @@ its own config wherever it's called from. (On zsh, use `~/.zshrc` instead.)
 
 ## Configuration
 
-Everything is in [`arborist.toml`](arborist.toml), commented line by line;
+Everything is in [`.config/config`](.config/config) (TOML), commented line by line;
 lines tagged `PERF` affect speed or memory. Point `ARBORIST_CONFIG` at another
 file to keep your own copy outside the repo.
 

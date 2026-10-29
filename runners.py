@@ -22,6 +22,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+import sandbox
+
 RUNNABLE = {".py", ".rs", ".dart", ".js", ".ts"}
 
 # Python decides whether a cached .pyc is stale from the source's size and
@@ -57,142 +59,24 @@ def run_env(extra: dict[str, str] | None = None, keep=(), display: bool = False)
     return env
 
 
-# Runs happen in new user, mount and network namespaces (`unshare -rmn`).
-# This shim runs first, inside them, and then execs the real command:
-#   - brings loopback up, so tests using 127.0.0.1 work; nothing else is
-#     reachable (no internet, LAN, cloud metadata or llama-server);
-#   - makes your home directory read-only, apart from the workspace and the
-#     build directory, so a run can't plant anything that later runs outside
-#     the sandbox (~/.bashrc, a .pth file in ~/.local, arborist's own memory);
-#   - makes .git, virtualenvs and node_modules in the workspace read-only too
-#     (git hooks, and environments you also use from your own shell).
-# Inside, the process is "root" of its own namespaces only; on the host it's
-# still you, and files it writes are owned by you.
-_SHIM = r"""
-import ctypes, fcntl, json, os, re, socket, struct, sys
-MS_RDONLY, MS_REMOUNT, MS_BIND, MS_REC = 1, 32, 4096, 16384
-libc = ctypes.CDLL(None, use_errno=True)
-
-def mount(src, dst, flags):
-    if libc.mount(src.encode(), dst.encode(), None, flags, None) != 0:
-        e = ctypes.get_errno()
-        raise OSError(e, f"{dst}: {os.strerror(e)}")
-
-def mounts_under(top):
-    with open("/proc/self/mountinfo") as f:
-        for line in f:
-            p = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])
-            if p == top or p.startswith(top.rstrip("/") + "/"):
-                yield p
-
-def inside(p, dirs):
-    return any(p == d or p.startswith(d.rstrip("/") + "/") for d in dirs)
-
-spec = json.loads(sys.argv[1])
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    got = fcntl.ioctl(s, 0x8913, struct.pack("16sH22x", b"lo", 0))  # SIOCGIFFLAGS
-    fcntl.ioctl(s, 0x8914, struct.pack("16sH22x", b"lo", struct.unpack("16sH", got[:18])[1] | 1))
-    s.close()
-except OSError:
-    pass
-try:
-    for d in spec["rw"]:  # first, so the copies made below carry them along
-        mount(d, d, MS_BIND | MS_REC)
-    for d in spec["ro"]:
-        mount(d, d, MS_BIND | MS_REC)
-        for m in list(mounts_under(d)):
-            if not inside(m, spec["rw"]) or m == d:
-                mount(m, m, MS_REMOUNT | MS_BIND | MS_RDONLY)
-    for d in spec["inner_ro"]:
-        mount(d, d, MS_BIND | MS_REC)
-        mount(d, d, MS_REMOUNT | MS_BIND | MS_RDONLY)
-except OSError as e:
-    print(f"arborist sandbox: can't set up read-only mounts ({e}); not running", file=sys.stderr)
-    sys.exit(126)
-os.execvp(sys.argv[2], sys.argv[2:])
-"""
-# Folders in a project that hold things you'll run yourself, outside arborist.
-_INNER_RO = (".git", ".venv", "venv", "node_modules")
-_sandbox: bool | None = None
+# Dependency probes run in the sandbox too (they execute the project's own
+# interpreter, before you've approved anything). The Toolbox installs the
+# wrapper with probe_sandbox(); None means probes run directly.
+_probe_wrap: Callable[[list[str], Path | None], list[str]] | None = None
 
 
-def sandbox_prefix(spec: dict) -> list[str]:
-    """What goes before each step to run it in the sandbox described by `spec`."""
-    return [shutil.which("unshare") or "unshare", "-rmn", "--",
-            sys.executable, "-I", "-c", _SHIM, json.dumps(spec)]
+class probe_sandbox:
+    """`with probe_sandbox(fn):` makes _probe run fn(cmd, cwd) instead of cmd."""
+    def __init__(self, fn):
+        self.fn = fn
 
+    def __enter__(self):
+        global _probe_wrap
+        self.prev, _probe_wrap = _probe_wrap, self.fn
 
-def sandbox_spec(root: Path, cwd: Path, steps: list[list[str]], build_dir: Path,
-                 writable=(), toolchain_writable=()) -> dict:
-    """Which folders a run may write (`rw`) and which it may only read.
-
-    `writable` comes from the user (tools.run_writable); `toolchain_writable`
-    from the plan (RunPlan.writable), and is created if missing, as the
-    toolchain would have done itself.
-    """
-    home = Path.home().resolve()
-    root = root.resolve()
-    build_dir.mkdir(parents=True, exist_ok=True)
-    for d in toolchain_writable:
-        Path(d).mkdir(parents=True, exist_ok=True)
-    rw = ([root, build_dir.resolve()] + [Path(os.path.expanduser(w)).resolve() for w in writable]
-          + [Path(d).resolve() for d in toolchain_writable])
-    # A workspace at or above home would make home writable again anyway.
-    ro = [] if root == home or root in home.parents else [home]
-    inner = set()
-    for d in {root, Path(cwd).resolve()}:
-        inner.update(d / n for n in _INNER_RO)
-    for step in steps:  # the project's own interpreter's venv, wherever it is
-        venv = Path(step[0]).parent.parent
-        if Path(step[0]).is_absolute() and (venv / "pyvenv.cfg").is_file():
-            inner.add(venv)
-    if os.environ.get("VIRTUAL_ENV"):
-        inner.add(Path(os.environ["VIRTUAL_ENV"]))
-    return {"rw": [str(p) for p in rw if p.is_dir()],
-            "ro": [str(p) for p in ro if p.is_dir()],
-            "inner_ro": sorted(str(p) for p in inner if p.is_dir())}
-
-
-def sandbox_available() -> bool:
-    """Whether runs can be sandboxed here (checked once).
-
-    False where util-linux's unshare is missing or unprivileged user
-    namespaces are disabled (e.g. Ubuntu 24.04's default AppArmor setting,
-    kernel.apparmor_restrict_unprivileged_userns = 1).
-    """
-    global _sandbox
-    if _sandbox is None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as t:
-            ro, rw = Path(t, "ro"), Path(t, "ro", "rw")
-            rw.mkdir(parents=True)
-            # Passes only if an outside address is unreachable, the read-only
-            # folder refuses writes and the writable one inside it takes them.
-            probe = ("import socket, sys\n"
-                     "s = socket.socket(); s.settimeout(3)\n"
-                     "try:\n    s.connect(('1.1.1.1', 53)); sys.exit(1)\n"
-                     "except OSError:\n    pass\n"
-                     "open(sys.argv[2] + '/ok', 'w').write('x')\n"
-                     "try:\n    open(sys.argv[1] + '/bad', 'w').write('x'); sys.exit(1)\n"
-                     "except OSError:\n    pass\n")
-            spec = {"rw": [str(rw)], "ro": [str(ro)], "inner_ro": []}
-            try:
-                r = subprocess.run(sandbox_prefix(spec) + [sys.executable, "-I", "-c", probe,
-                                                            str(ro), str(rw)],
-                                   capture_output=True, timeout=PROBE_TIMEOUT,
-                                   stdin=subprocess.DEVNULL, env=run_env())
-                _sandbox = (shutil.which("unshare") is not None and r.returncode == 0
-                            and (rw / "ok").exists() and not (ro / "bad").exists())
-            except (OSError, subprocess.TimeoutExpired):
-                _sandbox = False
-    return _sandbox
-
-
-SANDBOX_HELP = ("arborist can't sandbox runs on this machine: `unshare -rmn` (util-linux) is "
-                "missing or unprivileged user namespaces are disabled. Fix that, or set "
-                "tools.run_sandbox = false in arborist.toml to run with network access and "
-                "write access to your home directory.")
+    def __exit__(self, *exc):
+        global _probe_wrap
+        _probe_wrap = self.prev
 
 
 @dataclass
@@ -203,7 +87,8 @@ class RunPlan:
     warnings: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)     # non-empty means "don't run"
     env: dict[str, str] = field(default_factory=dict)     # added to the environment for the run
-    writable: list[Path] = field(default_factory=list)    # home folders the toolchain must write
+    reads: list[Path] = field(default_factory=list)       # toolchain folders the sandbox shows, read-only
+    writable: list[Path] = field(default_factory=list)    # folders outside the workspace it must write
 
     @property
     def ok(self) -> bool:
@@ -221,9 +106,12 @@ class RunOutcome:
 # --------------------------------------------------------------- helpers ---
 
 def _probe(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess | None:
+    run_cwd = cwd
+    if _probe_wrap is not None:
+        cmd, run_cwd = _probe_wrap(cmd, cwd), None  # the sandbox sets the directory
     try:
-        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                              timeout=PROBE_TIMEOUT, stdin=subprocess.DEVNULL)
+        return subprocess.run(cmd, cwd=run_cwd, capture_output=True, text=True,
+                              timeout=PROBE_TIMEOUT, stdin=subprocess.DEVNULL, env=run_env())
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -254,7 +142,102 @@ def plan_for(path: Path, root: Path, build_dir: Path) -> RunPlan:
     if planner is None:
         return RunPlan(problems=[f"{path.suffix or 'this file type'} can't be run; "
                                  f"only {', '.join(sorted(RUNNABLE))} are supported"])
-    return planner(path, root, build_dir)
+    return _with_toolchain(planner(path, root, build_dir))
+
+
+# ------------------------------------------------------------- toolchain ---
+
+# Tools a step may start on its own (npm runs node, cargo runs rustc, tsx runs
+# node...). Their install folders are shown to every run, read-only.
+COMPANIONS = ("node", "npm", "npx", "tsx", "cargo", "rustc", "rustup", "dart", "flutter")
+
+_PY_PATHS = r"""
+import json, site, sys
+paths = [sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix, *sys.path]
+paths += site.getsitepackages() + [site.getusersitepackages()]
+print(json.dumps(paths))
+"""
+_py_paths_cache: dict[tuple[str, int], list[Path]] = {}
+
+
+def _python_paths(interp: str) -> list[Path]:
+    """Where an interpreter loads code from. Asked with -I -S, so no .pth
+    files or site customisation run: this one probe can't be sandboxed (its
+    answer is what the sandbox needs to show)."""
+    real = os.path.realpath(interp)
+    try:
+        key = (real, os.stat(real).st_mtime_ns)
+    except OSError:
+        return []
+    if key not in _py_paths_cache:
+        cmd = [interp, "-I", "-S", "-c", _PY_PATHS]
+        if _probe_wrap is not None:  # sandboxing is on
+            cmd = sandbox.wrap_system_readonly(cmd)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=PROBE_TIMEOUT,
+                               stdin=subprocess.DEVNULL,
+                               env={"PATH": os.environ.get("PATH", "/usr/bin")})
+            found = json.loads(r.stdout) if r.returncode == 0 else []
+            if not isinstance(found, list):
+                found = []
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            found = []
+        cfg = Path(interp).parent.parent / "pyvenv.cfg"  # a venv's base interpreter
+        if cfg.is_file():
+            m = re.search(r"^home\s*=\s*(.+)$", cfg.read_text(errors="replace"), re.MULTILINE)
+            if m:
+                found.append(m[1].strip())
+        _py_paths_cache[key] = [p for p in (Path(f).resolve() for f in found
+                                            if isinstance(f, str) and f) if _python_dir(p)]
+    return _py_paths_cache[key]
+
+
+_PYTHONISH = re.compile(r"python|site-packages|dist-packages|venv|pyenv|conda|mamba|lib-dynload",
+                        re.IGNORECASE)
+
+
+def _python_dir(p: Path) -> bool:
+    """Whether an interpreter's answer looks like a place Python loads code
+    from. A doctored interpreter could name ~/.ssh to have it shown to later
+    runs; anything that doesn't look like Python's is dropped, and so is
+    home itself or anything above it."""
+    if not p.is_dir():
+        return p.suffix == ".zip" and p.is_file()  # zipped stdlib on sys.path
+    home = Path.home().resolve()
+    if p == home or p in home.parents or p == Path("/"):
+        return False
+    return bool(_PYTHONISH.search(str(p))) or any((p / "lib").glob("python3*"))
+
+
+def toolchain_folders(steps: list[list[str]]) -> tuple[list[Path], list[Path]]:
+    """(read-only folders, writable folders) the sandbox must show for `steps`."""
+    reads: list[Path] = []
+    writable: list[Path] = []
+    exes = [s[0] for s in steps if s] + [shutil.which(c) for c in COMPANIONS]
+    for exe in filter(None, exes):
+        if not os.path.isabs(exe):
+            exe = shutil.which(exe) or exe
+        reads += sandbox.tool_root(exe)
+        name = Path(exe).name
+        if name.startswith("python"):
+            reads += _python_paths(exe)
+        if name == "flutter":
+            # Flutter takes a lock in, and updates, its own cache on every
+            # command; it won't start without write access to it.
+            for root in sandbox.tool_root(exe):
+                if (root / "bin" / "cache").is_dir():
+                    writable.append((root / "bin" / "cache").resolve())
+    reads += sandbox.home_dir("CARGO_HOME", ".cargo") + sandbox.home_dir("RUSTUP_HOME", ".rustup")
+    reads += sandbox.home_dir("PUB_CACHE", ".pub-cache")
+    return sandbox._dedupe(reads), sandbox._dedupe(writable)
+
+
+def _with_toolchain(plan: RunPlan) -> RunPlan:
+    if plan.ok:
+        reads, writable = toolchain_folders(plan.steps)
+        plan.reads = sandbox._dedupe(plan.reads + reads)
+        plan.writable = sandbox._dedupe(plan.writable + writable)
+    return plan
 
 
 # ---------------------------------------------------------------- python ---
@@ -492,13 +475,8 @@ def _plan_rust(path: Path, root: Path, build_dir: Path) -> RunPlan:
 
 # ----------------------------------------------------------------- dart ---
 
-# Dart and Flutter refuse to start without writing their settings here.
-DART_STATE = (".dart-tool",)
-FLUTTER_STATE = (".dart-tool", ".flutter", ".config/flutter")
-
-
 def _plan_dart(path: Path, root: Path, build_dir: Path) -> RunPlan:
-    plan = RunPlan(cwd=path.parent, writable=[Path.home() / d for d in DART_STATE])
+    plan = RunPlan(cwd=path.parent)
     dart = shutil.which("dart")
     v = _version([dart, "--version"]) if dart else None
     if not v:
@@ -591,7 +569,7 @@ def plan_tests(target: Path, root: Path, build_dir: Path) -> RunPlan:
                                      "package.json, and no test_*.py files. Pass a test file"])
     rel = os.path.relpath(target, project)
     planner = {"python": _tests_python, "rust": _tests_rust, "dart": _tests_dart, "node": _tests_node}[kind]
-    return planner(target, project, rel, root, build_dir)
+    return _with_toolchain(planner(target, project, rel, root, build_dir))
 
 
 def _tests_python(target: Path, project: Path, rel: str, root: Path, build_dir: Path) -> RunPlan:
@@ -625,6 +603,13 @@ def _cargo_offline_ready(pkg: Path, plan: RunPlan) -> str | None:
         plan.problems.append("cargo not found (install Rust with rustup)")
         return None
     plan.checked.append(v)
+    if _probe_wrap is not None and not any((d / "Cargo.lock").exists()
+                                           for d in (pkg, *pkg.parents)):
+        # cargo metadata would write Cargo.lock, and sandboxed probes can't
+        # write the workspace (nothing changes before you approve a run). The
+        # run itself is --offline, so a missing crate still fails there.
+        plan.warnings.append("no Cargo.lock yet, so crates weren't checked; the run creates it")
+        return cargo
     r = _probe([cargo, "metadata", "--format-version", "1", "--offline", "--quiet"], cwd=pkg)
     if r is None or r.returncode != 0:
         err = (r.stderr.strip().splitlines() or ["unknown error"])[-1] if r else "timed out"
@@ -654,7 +639,6 @@ def _tests_dart(target: Path, project: Path, rel: str, root: Path, build_dir: Pa
         plan.problems.append(f"can't read pubspec.yaml: {e}")
         return plan
     flutter = bool(re.search(r"^\s*sdk:\s*flutter\b", pubspec, re.MULTILINE))
-    plan.writable = [Path.home() / d for d in (FLUTTER_STATE if flutter else DART_STATE)]
     if flutter:
         exe = shutil.which("flutter")
         if not exe:
@@ -759,16 +743,14 @@ def focus_test_output(log: str, passed: bool) -> str:
 
 def execute(plan: RunPlan, log_dir: Path, timeout: int,
             on_output: Callable[[str], None], name: str = "run",
-            sandbox: dict | None = None, env_keep=(), display: bool = False) -> RunOutcome:
+            spec: sandbox.Spec | None = None, env_keep=(), display: bool = False) -> RunOutcome:
     """Run each step with a shared timeout; combined output goes to a log file.
 
     `name` (usually the source file's stem) labels the log file. Steps get a
-    minimal environment (run_env). With a `sandbox` spec (sandbox_spec()),
-    they also run with no network and read-only folders; the caller checks
-    sandbox_available() first.
+    minimal environment (run_env). With a sandbox `spec`, each step runs
+    inside bwrap (sandbox.wrap); the caller checks sandbox.available() first.
     """
-    env = run_env(plan.env, env_keep, display)
-    prefix = sandbox_prefix(sandbox) if sandbox is not None else []
+    env = run_env(plan.env, env_keep, display and spec is None)
     runs = log_dir / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     name = re.sub(r"[^\w.-]", "_", name) or "run"
@@ -790,7 +772,11 @@ def execute(plan: RunPlan, log_dir: Path, timeout: int,
             if remaining <= 0:
                 timed_out = True
                 break
-            exit_code, timed_out = _run_step(prefix + step, plan.cwd, remaining, log, on_output, env)
+            if spec is not None:
+                cmd, cwd, step_env = sandbox.wrap(step, spec, env), None, {"PATH": "/usr/bin:/bin"}
+            else:
+                cmd, cwd, step_env = step, plan.cwd, env
+            exit_code, timed_out = _run_step(cmd, cwd, remaining, log, on_output, step_env)
             if timed_out or exit_code != 0:
                 break
         footer = (f"[timed out after {timeout}s]" if timed_out else f"[exit code {exit_code}]")

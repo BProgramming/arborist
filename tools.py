@@ -14,6 +14,7 @@ raised, so it can read the message and correct itself. A tool bug becomes an
 """
 from __future__ import annotations
 
+import contextlib
 import difflib
 import fnmatch
 import json
@@ -27,8 +28,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Protocol
 from urllib.parse import urlsplit
 
+import changes
 import outline as outline_mod
 import runners
+import sandbox
 import web
 
 if TYPE_CHECKING:
@@ -63,7 +66,9 @@ class MemoryChoice:
 
 class Approver(Protocol):
     def approve_change(self, rel_path: str, diff: str, is_new: bool) -> Decision: ...
-    def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int) -> Decision: ...
+    def show_change(self, rel_path: str, diff: str, is_new: bool) -> None: ...
+    def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int,
+                    notes: list[str] = ()) -> Decision: ...
     def approve_fetch(self, host: str, url: str, reason: str = "", scope: str = "") -> Decision: ...
     def approve_memory(self, fact: str, block: str, similar: list[str], web_tainted: bool) -> MemoryChoice: ...
 
@@ -78,10 +83,11 @@ class Limits:
     max_tree_depth: int = 4
     run_timeout: int = 120
     test_timeout: int = 300
-    run_sandbox: bool = True        # runs: no network, home read-only (unshare -rmn)
+    run_sandbox: bool = True        # runs and probes go through bwrap (sandbox.py)
     run_env_keep: list[str] = field(default_factory=list)  # extra env vars runs may see
     run_writable: list[str] = field(default_factory=list)  # extra folders runs may write
-    run_display: bool = False       # let runs open windows (DISPLAY, Wayland, XDG_RUNTIME_DIR)
+    run_display: bool = False       # let runs open windows on the Wayland display
+    run_gpu: bool = False           # let runs use the GPU (/dev/dri, /dev/kfd)
     web_enabled: bool = True
     web_allowed_hosts: list[str] = field(default_factory=list)  # hosts that never ask
     web_page_chars: int = 12000
@@ -157,7 +163,8 @@ class Workspace:
         relative to the root; None when the workspace isn't in a git repo."""
         try:
             r = subprocess.run(
-                ["git", "-C", str(self.root), "ls-files", "--cached", "--others",
+                ["git", "-C", str(self.root), "-c", "core.fsmonitor=false", "ls-files",
+                 "--cached", "--others",
                  "--exclude-standard", "-z"],
                 capture_output=True, timeout=15, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.TimeoutExpired):
@@ -286,7 +293,8 @@ class Toolbox:
                  log_dir: str | os.PathLike | None = None,
                  on_output: Callable[[str], None] | None = None,
                  on_notice: Callable[[str], None] | None = None,
-                 checkpoints: "Checkpoints | None" = None):
+                 checkpoints: "Checkpoints | None" = None,
+                 on_changes: "Callable[[list[changes.Change]], None] | None" = None):
         self.ws = workspace
         self.checkpoints = checkpoints
         # Did a test run fail in this turn? The chat then offers to let the
@@ -299,6 +307,8 @@ class Toolbox:
         self.log_dir = Path(log_dir) if log_dir else self.ws.root / ".arborist-logs"
         self.on_output = on_output or (lambda line: None)
         self.on_notice = on_notice or (lambda msg: None)
+        # Shown to the user after every run: the files it added, changed or deleted.
+        self.on_changes = on_changes or (lambda found: None)
         self.auto_edits = self.limits.approve_edits == "auto"
         # path -> (mtime_ns, plan) for files whose dependencies checked out
         self._checked: dict[Path, tuple[int, runners.RunPlan]] = {}
@@ -314,6 +324,15 @@ class Toolbox:
         self._reason = ""
         self.fetcher = web.Fetcher(self._allow, timeout=self.limits.web_timeout,
                                    allow_private=self.limits.web_allow_private)
+
+    def apply_limits(self, limits: "Limits") -> None:
+        """New [tools] settings mid-session (after /config)."""
+        old, self.limits = self.limits, limits
+        if limits.approve_edits != old.approve_edits:
+            self.auto_edits = limits.approve_edits == "auto"
+        self.allowed_hosts = {h.lower() for h in limits.web_allowed_hosts}
+        self.fetcher = web.Fetcher(self._allow, timeout=limits.web_timeout,
+                                   allow_private=limits.web_allow_private)
 
     def reset(self) -> None:
         """Forget what the model has read, checked and fetched (e.g. after /clear)."""
@@ -514,6 +533,10 @@ class Toolbox:
 
     def _apply(self, p: Path, old: str, new: str, is_new: bool) -> str:
         rel = self.ws.rel(p)
+        if ".git" in Path(rel).parts:
+            # .git/config and hooks hold commands that git runs (arborist's own
+            # git calls included), outside any sandbox and without asking.
+            raise ToolError(f"{rel} is inside .git; the model can't change git's files")
         diff = _diff(rel, old, new)
         if self.web_tainted or not self.auto_edits:
             d = self.approver.approve_change(rel, diff, is_new)
@@ -522,6 +545,8 @@ class Toolbox:
                 return f"The user declined this change to {rel}; the file was not modified.{why}"
             if d.always:
                 self.auto_edits = True
+        else:
+            self.approver.show_change(rel, diff, is_new)
         self._checkpoint()
         p.parent.mkdir(parents=True, exist_ok=True)
         # newline="" keeps the file's existing line endings as written.
@@ -571,8 +596,13 @@ class Toolbox:
         p = self.ws.resolve(path)
         if not p.is_file():
             raise ToolError(f"no such file: {path}")
-        plan = runners.plan_for(p, self.ws.root, self.log_dir / "build")
         rel = self.ws.rel(p)
+        problem = self._sandbox_problem()
+        if problem:
+            return (f"Can't check or run {rel}: {problem} Tell the user this; don't try another "
+                    "way to run it.")
+        with self._probing():
+            plan = runners.plan_for(p, self.ws.root, self.log_dir / "build")
         lines = [f"Dependency check for {rel}:"]
         lines += [f"  ok: {d}" for d in plan.checked]
         lines += [f"  note: {w}" for w in plan.warnings]
@@ -602,27 +632,17 @@ class Toolbox:
         plan = checked[1]
         # Single-use: every run needs a fresh check (and a fresh approval).
         del self._checked[p]
-        if self.limits.run_sandbox and not runners.sandbox_available():
-            return ToolResult(f"{rel} was not run: {runners.SANDBOX_HELP} Tell the user this "
-                              "and stop; don't try another way to run it.", hard_stop=True)
 
-        d = self.approver.approve_run(rel, plan.steps, str(plan.cwd), self.limits.run_timeout)
-        if not d.approved:
-            why = f" Their reason: {d.reason}" if d.reason else ""
-            return ToolResult(f"The user declined to run {rel}; nothing was executed.{why} "
-                              "Tell the user this and stop; don't try another way to run it.",
-                              hard_stop=True)
-
-        self._checkpoint()  # a script can change files too
-        outcome = runners.execute(plan, self.log_dir, self.limits.run_timeout, self.on_output,
-                                  name=p.stem, sandbox=self._sandbox(plan),
-                                  env_keep=self.limits.run_env_keep,
-                                  display=self.limits.run_display)
+        ran = self._execute(rel, plan, self.limits.run_timeout, name=p.stem,
+                            refused=f"{rel} was not run", declined=f"The user declined to run {rel}")
+        if isinstance(ran, ToolResult):
+            return ran
+        outcome, changed = ran
         log = _read_log(outcome.log_path)
         status = ("timed out after %ds" % self.limits.run_timeout) if outcome.timed_out \
             else f"exit code {outcome.exit_code}"
         header = (f"Ran {rel}: {status}, {outcome.duration:.1f}s. Log: {outcome.log_path}\n"
-                  f"--- log ---\n")
+                  f"{changed}--- log ---\n")
         footer = ("\n--- end of log ---\nNow explain what happened for the user: whether it worked, "
                   "and what any errors or warnings mean. Don't call any more tools.")
         # Size the log to fit, so call() never has to cut the whole thing again
@@ -630,12 +650,91 @@ class Toolbox:
         room = max(self.limits.max_output_chars - len(header) - len(footer), 200)
         return ToolResult(header + _truncate(log, room) + footer, hard_stop=True)
 
-    def _sandbox(self, plan: runners.RunPlan) -> dict | None:
-        """The sandbox spec for a run, or None when tools.run_sandbox is off."""
+    # running, shared by run_file and run_tests -------------------------------
+
+    def _spec(self, plan: runners.RunPlan, probe: bool = False) -> sandbox.Spec:
+        build = (self.log_dir / "build").resolve()
+        build.mkdir(parents=True, exist_ok=True)
+        writable = [build]
+        if not probe:
+            writable += [Path(os.path.expanduser(w)).resolve() for w in self.limits.run_writable]
+            writable += plan.writable
+        return sandbox.Spec(
+            workspace=self.ws.root, cwd=Path(plan.cwd),
+            reads=list(plan.reads), writable=writable,
+            protect=sandbox.protected_dirs(self.ws.root, Path(plan.cwd), plan.steps),
+            workspace_writable=not probe,
+            display=self.limits.run_display and not probe,
+            gpu=self.limits.run_gpu and not probe)
+
+    def _probe_wrap(self, cmd: list[str], cwd: Path | None) -> list[str]:
+        """Dependency probes: sandboxed, workspace read-only, no extras."""
+        reads, _ = runners.toolchain_folders([cmd])
+        plan = runners.RunPlan(steps=[cmd], cwd=cwd or self.log_dir / "build", reads=reads)
+        return sandbox.wrap(cmd, self._spec(plan, probe=True), runners.run_env())
+
+    def _probing(self):
+        """Context for planning: probes go through the sandbox when it's on."""
+        if self.limits.run_sandbox and sandbox.available():
+            return runners.probe_sandbox(self._probe_wrap)
+        return contextlib.nullcontext()
+
+    def _sandbox_problem(self) -> str | None:
         if not self.limits.run_sandbox:
             return None
-        return runners.sandbox_spec(self.ws.root, plan.cwd, plan.steps, self.log_dir / "build",
-                                    self.limits.run_writable, plan.writable)
+        ok, why = sandbox.status()
+        if not ok:
+            return why
+        if self.limits.run_display:
+            try:
+                sandbox._display_args({})
+            except sandbox.SandboxError as e:
+                return str(e)
+        return None
+
+    def _run_notes(self, spec: sandbox.Spec | None) -> list[str]:
+        """What the approval prompt says about where the run can reach."""
+        if spec is None:
+            return ["NOT sandboxed (run_sandbox = false): full network access, and it can "
+                    "change anything your account can"]
+        notes = ["sandboxed: no network; writes only inside the workspace"
+                 + (" and:" if spec.outside_writes() else "")]
+        notes += [f"  {w}" for w in spec.outside_writes()]
+        if spec.display:
+            notes.append("can open windows on your Wayland display (run_display)")
+        if spec.gpu:
+            notes.append("can use the GPU (run_gpu)")
+        return notes
+
+    def _execute(self, label: str, plan: runners.RunPlan, timeout: int, name: str,
+                 refused: str, declined: str):
+        """Gate, approve, checkpoint, run and diff. Returns (outcome, changed
+        files text) or a ToolResult explaining why nothing ran."""
+        problem = self._sandbox_problem()
+        if problem:
+            return ToolResult(f"{refused}: {problem} Tell the user this and stop; don't try "
+                              "another way to run it.", hard_stop=True)
+        spec = self._spec(plan) if self.limits.run_sandbox else None
+        d = self.approver.approve_run(label, plan.steps, str(plan.cwd), timeout,
+                                      notes=self._run_notes(spec))
+        if not d.approved:
+            why = f" Their reason: {d.reason}" if d.reason else ""
+            return ToolResult(f"{declined}; nothing was executed.{why} "
+                              "Tell the user this and stop; don't try another way to run it.",
+                              hard_stop=True)
+
+        self._checkpoint()  # a script can change files too
+        skip = spec.protect if spec is not None else []
+        before = changes.snapshot(self.ws.root, skip)
+        outcome = runners.execute(plan, self.log_dir, timeout, self.on_output, name=name,
+                                  spec=spec, env_keep=self.limits.run_env_keep,
+                                  display=self.limits.run_display)
+        found = changes.compare(before, changes.snapshot(self.ws.root, skip))
+        self.on_changes(found)
+        if not found:
+            return outcome, "Files changed by the run: none\n"
+        listing = "\n".join(changes.format_changes(found, limit=20))
+        return outcome, f"Files changed by the run:\n{listing}\n"
 
     # run_tests ------------------------------------------------------------
 
@@ -644,35 +743,31 @@ class Toolbox:
         if not p.exists():
             raise ToolError(f"no such file or directory: {path}")
         rel = self.ws.rel(p)
-        plan = runners.plan_tests(p, self.ws.root, self.log_dir / "build")
+        problem = self._sandbox_problem()
+        if problem:
+            return ToolResult(f"The tests were not run: {problem} Tell the user this and stop; "
+                              "don't try another way to run them.", hard_stop=True)
+        with self._probing():
+            plan = runners.plan_tests(p, self.ws.root, self.log_dir / "build")
         if not plan.ok:
             lines = [f"Can't run tests for {rel}:"]
             lines += [f"  ok: {d}" for d in plan.checked]
             lines += [f"  MISSING: {m}" for m in plan.problems]
             lines.append("Tell the user what's missing; don't try to run the tests another way.")
             return "\n".join(lines)
-        if self.limits.run_sandbox and not runners.sandbox_available():
-            return ToolResult(f"The tests were not run: {runners.SANDBOX_HELP} Tell the user "
-                              "this and stop; don't try another way to run them.", hard_stop=True)
 
-        d = self.approver.approve_run(f"tests ({rel})", plan.steps, str(plan.cwd), self.limits.test_timeout)
-        if not d.approved:
-            why = f" Their reason: {d.reason}" if d.reason else ""
-            return ToolResult(f"The user declined to run the tests; nothing was executed.{why} "
-                              "Tell the user this and stop.", hard_stop=True)
-
-        self._checkpoint()
-        outcome = runners.execute(plan, self.log_dir, self.limits.test_timeout, self.on_output,
-                                  name="tests", sandbox=self._sandbox(plan),
-                                  env_keep=self.limits.run_env_keep,
-                                  display=self.limits.run_display)
+        ran = self._execute(f"tests ({rel})", plan, self.limits.test_timeout, name="tests",
+                            refused="The tests were not run", declined="The user declined to run the tests")
+        if isinstance(ran, ToolResult):
+            return ran
+        outcome, changed = ran
         log = _read_log(outcome.log_path)
         passed = outcome.exit_code == 0 and not outcome.timed_out
         status = ("timed out after %ds" % self.limits.test_timeout) if outcome.timed_out \
             else ("passed" if passed else f"failed (exit code {outcome.exit_code})")
         notes = "".join(f"note: {w}\n" for w in plan.warnings)
         header = (f"Tests for {rel} {status}, {outcome.duration:.1f}s. Full log: {outcome.log_path}\n"
-                  f"{notes}--- {'summary' if passed else 'failures and summary'} ---\n")
+                  f"{notes}{changed}--- {'summary' if passed else 'failures and summary'} ---\n")
         self.tests_failed = not passed
         if passed:
             footer = ("\n--- end ---\nNow tell the user the result briefly. Don't call any more tools.")
