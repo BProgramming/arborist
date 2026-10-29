@@ -56,6 +56,36 @@ def cyan(t: str) -> str: return _c("36", t)
 def red(t: str) -> str: return _c("31", t)
 def green(t: str) -> str: return _c("32", t)
 def yellow(t: str) -> str: return _c("33", t)
+def marked(t: str) -> str: return _c("1;7", t)  # bold, reverse video
+
+
+# A period immediately followed by characters, with the word it's attached to:
+# file names, hosts, modules, attribute access. Edit prompts highlight these so
+# a URL or file name buried in a long diff or comment stands out.
+DOTTED = re.compile(r"[\w-]*(?:\.[\w-]+)+")
+
+
+def mark_dotted(line: str, colour) -> str:
+    """`line` in `colour`, with every dotted name in it highlighted."""
+    out, pos = [], 0
+    for m in DOTTED.finditer(line):
+        out.append(colour(line[pos:m.start()]) if m.start() > pos else "")
+        out.append(marked(m.group()))
+        pos = m.end()
+    out.append(colour(line[pos:]) if pos < len(line) else "")
+    return "".join(out)
+
+
+def dotted_names(diff_lines: list[str], shown_count: int) -> tuple[list[str], list[str]]:
+    """Unique dotted names on added lines, in order: (in the shown lines, only in hidden ones)."""
+    shown: dict[str, None] = {}
+    hidden: dict[str, None] = {}
+    for i, line in enumerate(diff_lines):
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        for name in DOTTED.findall(line[1:]):
+            (shown if i < shown_count else hidden).setdefault(name, None)
+    return list(shown), [n for n in hidden if n not in shown]
 
 
 # Readline needs non-printing escapes wrapped in \001..\002 or the cursor drifts.
@@ -259,15 +289,22 @@ class TerminalApprover:
             if line.startswith(("+++", "---")):
                 print(dim(line))
             elif line.startswith("+"):
-                print(green(line))
+                print(mark_dotted(line, green))
             elif line.startswith("-"):
-                print(red(line))
+                print(mark_dotted(line, red))
             elif line.startswith("@@"):
                 print(cyan(line))
             else:
-                print(line)
+                print(mark_dotted(line, str))
         if len(lines) > self.MAX_DIFF_LINES:
             print(dim(f"… {len(lines) - self.MAX_DIFF_LINES} more diff lines not shown"))
+        shown, hidden = dotted_names(lines, self.MAX_DIFF_LINES)
+        if shown or hidden:
+            print(bold("Dotted names this change adds:"))
+            if shown:
+                print("  " + "  ".join(marked(n) for n in shown))
+            if hidden:
+                print(yellow("  only in the lines not shown: ") + "  ".join(marked(n) for n in hidden))
         while True:
             ans = input("Apply? [y]es / [n]o / [a]ll edits this session: ").strip().lower()
             if ans in ("y", "yes"):

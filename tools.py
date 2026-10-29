@@ -78,6 +78,8 @@ class Limits:
     max_tree_depth: int = 4
     run_timeout: int = 120
     test_timeout: int = 300
+    run_offline: bool = True        # runs and tests get no network (unshare -rn)
+    run_env_keep: list[str] = field(default_factory=list)  # extra env vars runs may see
     web_enabled: bool = True
     web_allowed_hosts: list[str] = field(default_factory=list)  # hosts that never ask
     web_page_chars: int = 12000
@@ -598,6 +600,9 @@ class Toolbox:
         plan = checked[1]
         # Single-use: every run needs a fresh check (and a fresh approval).
         del self._checked[p]
+        if self.limits.run_offline and not runners.offline_available():
+            return ToolResult(f"{rel} was not run: {runners.OFFLINE_HELP} Tell the user this "
+                              "and stop; don't try another way to run it.", hard_stop=True)
 
         d = self.approver.approve_run(rel, plan.steps, str(plan.cwd), self.limits.run_timeout)
         if not d.approved:
@@ -608,7 +613,8 @@ class Toolbox:
 
         self._checkpoint()  # a script can change files too
         outcome = runners.execute(plan, self.log_dir, self.limits.run_timeout, self.on_output,
-                                  name=p.stem)
+                                  name=p.stem, offline=self.limits.run_offline,
+                                  env_keep=self.limits.run_env_keep)
         log = _read_log(outcome.log_path)
         status = ("timed out after %ds" % self.limits.run_timeout) if outcome.timed_out \
             else f"exit code {outcome.exit_code}"
@@ -635,6 +641,9 @@ class Toolbox:
             lines += [f"  MISSING: {m}" for m in plan.problems]
             lines.append("Tell the user what's missing; don't try to run the tests another way.")
             return "\n".join(lines)
+        if self.limits.run_offline and not runners.offline_available():
+            return ToolResult(f"The tests were not run: {runners.OFFLINE_HELP} Tell the user "
+                              "this and stop; don't try another way to run them.", hard_stop=True)
 
         d = self.approver.approve_run(f"tests ({rel})", plan.steps, str(plan.cwd), self.limits.test_timeout)
         if not d.approved:
@@ -644,7 +653,8 @@ class Toolbox:
 
         self._checkpoint()
         outcome = runners.execute(plan, self.log_dir, self.limits.test_timeout, self.on_output,
-                                  name="tests")
+                                  name="tests", offline=self.limits.run_offline,
+                                  env_keep=self.limits.run_env_keep)
         log = _read_log(outcome.log_path)
         passed = outcome.exit_code == 0 and not outcome.timed_out
         status = ("timed out after %ds" % self.limits.test_timeout) if outcome.timed_out \

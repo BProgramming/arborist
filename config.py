@@ -86,6 +86,8 @@ DEFAULTS: dict = {
         "max_tree_depth": 4,
         "run_timeout": 120,
         "test_timeout": 300,
+        "run_offline": True,
+        "run_env_keep": [],
         "max_consecutive_errors": 4,
         "max_repeat_calls": 3,
         "checkpoints": True,
@@ -198,6 +200,10 @@ def _validate(c: dict) -> None:
         _check(isinstance(t[key], int) and not isinstance(t[key], bool) and t[key] >= 0,
                f"tools.{key} must be a whole number (0 turns the check off)")
     _check(isinstance(t["checkpoints"], bool), "tools.checkpoints must be true or false")
+    _check(isinstance(t["run_offline"], bool), "tools.run_offline must be true or false")
+    _check(isinstance(t["run_env_keep"], list) and all(
+        isinstance(v, str) and v.replace("_", "").isalnum() for v in t["run_env_keep"]),
+        'tools.run_env_keep must be a list of variable names, e.g. ["DATABASE_URL"]')
     _check(isinstance(t["checkpoint_days"], int) and not isinstance(t["checkpoint_days"], bool)
            and t["checkpoint_days"] >= 0, "tools.checkpoint_days must be a whole number (0 keeps them forever)")
     _check(isinstance(ch["env_vars"], list) and all(

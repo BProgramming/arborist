@@ -173,6 +173,16 @@ run_timeout = 120
 # Same for run_tests (a whole suite, including any compile).
 test_timeout = 300
 
+# Code the model wrote (run_file and run_tests) runs with no network: a fresh
+# network namespace (`unshare -rn`) with only loopback, so it can't reach the
+# internet, your LAN or the llama-server. If your system disables unprivileged
+# user namespaces, runs are refused until you fix that or set this to false.
+run_offline = true
+# Runs also get a minimal environment (PATH, HOME, locale, venv and toolchain
+# variables), so API keys and tokens in your shell don't reach them. List any
+# other variables your code needs here. Names only.
+run_env_keep = []
+
 # Stuck detection. Small models rarely notice they're going in circles, so
 # the harness pauses tool use and makes the model explain and ask you when:
 #   - this many tool calls in a row fail, or

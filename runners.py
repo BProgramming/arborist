@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -29,6 +30,83 @@ RUNNABLE = {".py", ".rs", ".dart", ".js", ".ts"}
 # So arborist's own Python runs don't write bytecode caches at all.
 PYTHON_ENV = {"PYTHONDONTWRITEBYTECODE": "1"}
 PROBE_TIMEOUT = 20  # seconds, for version checks and dependency probes
+
+# What a run inherits from arborist's environment. Code the model wrote runs
+# with only these (plus the plan's own env and the user's tools.run_env_keep),
+# so API keys, tokens, SSH_AUTH_SOCK, DISPLAY and the D-Bus address don't
+# reach it. LC_* variables are kept too.
+SAFE_ENV = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR",
+    "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV",
+    "CARGO_HOME", "RUSTUP_HOME", "PUB_CACHE", "FLUTTER_ROOT", "NODE_PATH",
+    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+})
+
+
+def run_env(extra: dict[str, str] | None = None, keep=()) -> dict[str, str]:
+    """The whole environment a run gets: SAFE_ENV, LC_*, `keep`, then `extra`."""
+    env = {k: v for k, v in os.environ.items()
+           if k in SAFE_ENV or k.startswith("LC_") or k in keep}
+    env.update(extra or {})
+    return env
+
+
+# Runs happen in a new user + network namespace (`unshare -rn`): the process
+# sees only a loopback interface, so nothing it does reaches the internet, the
+# LAN, cloud metadata addresses or the llama-server. This shim, run inside the
+# namespace, brings loopback up (so tests using 127.0.0.1 still work) and then
+# execs the real command. Inside, the process is "root" of its own namespace
+# only; on the host it's still you, and files it writes are owned by you.
+_LO_UP_SHIM = """\
+import fcntl, os, socket, struct, sys
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    got = fcntl.ioctl(s, 0x8913, struct.pack("16sH22x", b"lo", 0))  # SIOCGIFFLAGS
+    flags = struct.unpack("16sH", got[:18])[1]
+    fcntl.ioctl(s, 0x8914, struct.pack("16sH22x", b"lo", flags | 1))  # SIOCSIFFLAGS, IFF_UP
+    s.close()
+except OSError:
+    pass
+os.execvp(sys.argv[1], sys.argv[1:])
+"""
+_offline: bool | None = None
+
+
+def offline_prefix() -> list[str]:
+    """What goes before each step to run it with no network."""
+    return [shutil.which("unshare") or "unshare", "-rn", "--",
+            sys.executable, "-I", "-c", _LO_UP_SHIM]
+
+
+def offline_available() -> bool:
+    """Whether runs can be cut off from the network here (checked once).
+
+    False where util-linux's unshare is missing or unprivileged user
+    namespaces are disabled (e.g. Ubuntu 24.04's default AppArmor setting,
+    kernel.apparmor_restrict_unprivileged_userns = 1).
+    """
+    global _offline
+    if _offline is None:
+        # Passes only if the namespace was made AND an outside address is unreachable.
+        probe = ("import socket\n"
+                 "s = socket.socket(); s.settimeout(3)\n"
+                 "try:\n    s.connect(('1.1.1.1', 53))\n"
+                 "except OSError:\n    raise SystemExit(0)\n"
+                 "raise SystemExit(1)\n")
+        try:
+            r = subprocess.run(offline_prefix() + [sys.executable, "-I", "-c", probe],
+                               capture_output=True, timeout=PROBE_TIMEOUT,
+                               stdin=subprocess.DEVNULL, env=run_env())
+            _offline = shutil.which("unshare") is not None and r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            _offline = False
+    return _offline
+
+
+OFFLINE_HELP = ("arborist can't cut runs off from the network on this machine: `unshare -rn` "
+                "(util-linux) is missing or unprivileged user namespaces are disabled. Fix "
+                "that, or set tools.run_offline = false in arborist.toml to run with network "
+                "access.")
 
 
 @dataclass
@@ -587,11 +665,16 @@ def focus_test_output(log: str, passed: bool) -> str:
 # ------------------------------------------------------------- execution ---
 
 def execute(plan: RunPlan, log_dir: Path, timeout: int,
-            on_output: Callable[[str], None], name: str = "run") -> RunOutcome:
+            on_output: Callable[[str], None], name: str = "run",
+            offline: bool = False, env_keep=()) -> RunOutcome:
     """Run each step with a shared timeout; combined output goes to a log file.
 
-    `name` (usually the source file's stem) labels the log file.
+    `name` (usually the source file's stem) labels the log file. Steps get a
+    minimal environment (run_env); with `offline`, they also run with no
+    network (the caller checks offline_available() first).
     """
+    env = run_env(plan.env, env_keep)
+    prefix = offline_prefix() if offline else []
     runs = log_dir / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     name = re.sub(r"[^\w.-]", "_", name) or "run"
@@ -613,7 +696,7 @@ def execute(plan: RunPlan, log_dir: Path, timeout: int,
             if remaining <= 0:
                 timed_out = True
                 break
-            exit_code, timed_out = _run_step(step, plan.cwd, remaining, log, on_output, plan.env)
+            exit_code, timed_out = _run_step(prefix + step, plan.cwd, remaining, log, on_output, env)
             if timed_out or exit_code != 0:
                 break
         footer = (f"[timed out after {timeout}s]" if timed_out else f"[exit code {exit_code}]")
@@ -627,7 +710,7 @@ def _run_step(cmd: list[str], cwd: Path, timeout: float, log, on_output,
     try:
         # New session: Ctrl-C at the terminal doesn't reach it directly, and on
         # timeout or interrupt we can kill the whole process group.
-        proc = subprocess.Popen(cmd, cwd=cwd, env={**os.environ, **env} if env else None,
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, errors="replace",
                                 bufsize=1, start_new_session=True)
