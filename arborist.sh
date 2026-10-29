@@ -11,7 +11,7 @@
 #   ./arborist.sh status   show what's installed and whether a server is up
 #   ./arborist.sh stop     stop a server this script left running
 #
-# Settings, including which model, live in arborist.toml (or point
+# Settings, including which model, live in .config/config (or point
 # ARBORIST_CONFIG at another file). Inference runs in C++ (llama.cpp, or the
 # fork named in the toml); config + chat are Python.
 
@@ -53,6 +53,8 @@ check_deps() {
   for c in git cmake curl; do command -v "$c" >/dev/null || missing+=("$c"); done
   command -v c++ >/dev/null || command -v g++ >/dev/null || missing+=("c++ compiler")
   command -v ninja >/dev/null || info "Ninja not found; using make (slower builds, same binary)."
+  command -v bwrap >/dev/null \
+    || info "bubblewrap (bwrap) not found: the model can't run code until it's installed (sudo apt install bubblewrap)."
   hints+=("build-essential cmake ninja-build git curl")
 
   case "$CFG_BACKEND" in

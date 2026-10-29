@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 import runners
+import sandbox
 from conftest import FakeApprover, needs, write
 from tools import Decision
 
@@ -200,7 +201,7 @@ def chat_with_failing_tests(ws_root, tmp_path, monkeypatch):
     c = chat.Chat(config.load(), ws_root, tools_enabled=True)
     c.toolbox.approver = FakeApprover()
     # Like make_toolbox: offline where this machine can do it, online where it can't.
-    c.toolbox.limits.run_sandbox = runners.sandbox_available()
+    c.toolbox.limits.run_sandbox = sandbox.available()
     requests = []
 
     def call(name, args, cid):

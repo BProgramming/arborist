@@ -37,15 +37,24 @@ jobs:
         run: |
           python --version; node --version; rustc --version; cargo --version; dart --version
 
-      # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor, which
-      # would make the run-isolation tests skip. Allow them so CI tests the
-      # sandbox for real, then fail early if it still doesn't work.
-      - name: Allow unprivileged user namespaces
+      # Runs are sandboxed with bubblewrap, which needs unprivileged user
+      # namespaces. Ubuntu 24.04 restricts them through AppArmor; lift that on
+      # the runner, then check bwrap really works before testing.
+      - name: Install bubblewrap
         run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          bwrap --version
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          unshare -rn true
+          bwrap --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
+                --symlink usr/lib64 /lib64 --proc /proc --dev /dev --unshare-all /usr/bin/true \
+            || { echo "::error title=bwrap::bwrap can't create a sandbox on this runner"; exit 1; }
 
+      # ARBORIST_REQUIRE_SANDBOX: the sandbox and audit tests fail instead of
+      # skipping if the sandbox doesn't work here.
       - name: Run tests
+        env:
+          ARBORIST_REQUIRE_SANDBOX: "1"
         run: python -m pytest -v --junitxml=pytest-results.xml
 
       # One annotation per failing test, so failures show on the PR page
@@ -54,7 +63,9 @@ jobs:
         if: failure()
         run: |
           python - <<'EOF'
-          import xml.etree.ElementTree as ET
+          import os, xml.etree.ElementTree as ET
+          if not os.path.exists("pytest-results.xml"):
+              raise SystemExit(0)  # failed before the tests ran; the step log says why
           for case in ET.parse("pytest-results.xml").iter("testcase"):
               for bad in list(case.iter("failure")) + list(case.iter("error")):
                   text = ((bad.get("message") or "") + "\n" + (bad.text or ""))[-3000:]
