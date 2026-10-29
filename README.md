@@ -219,8 +219,10 @@ prompts are the main safety mechanism, so read them. Specifically:
   namespaces of its own. In the workspace, `.git`, virtualenvs and
   `node_modules` are read-only, so a run can't plant a git hook or poison an
   environment you use yourself. Dependency checks get a read-only workspace.
-  Every run asks first and lists any folder outside the workspace it can
-  write; afterwards arborist lists every file it added, changed or deleted
+  Every run asks first, says whether the model wrote the file this session
+  and whether it changed after the diff you were shown (`[v]iew` shows it),
+  warns when web content is in the conversation, and lists any folder
+  outside the workspace it can write; afterwards arborist lists every file it added, changed or deleted
   (by ctime, so resetting a timestamp doesn't hide an edit). The openings
   are all off by default and named in `[tools]`: `run_writable`,
   `run_env_keep`, `run_display` (your Wayland socket only; X11 isn't

@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import difflib
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -68,7 +69,7 @@ class Approver(Protocol):
     def approve_change(self, rel_path: str, diff: str, is_new: bool) -> Decision: ...
     def show_change(self, rel_path: str, diff: str, is_new: bool) -> None: ...
     def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int,
-                    notes: list[str] = ()) -> Decision: ...
+                    notes: list[str] = (), view: str | None = None) -> Decision: ...
     def approve_fetch(self, host: str, url: str, reason: str = "", scope: str = "") -> Decision: ...
     def approve_memory(self, fact: str, block: str, similar: list[str], web_tainted: bool) -> MemoryChoice: ...
 
@@ -286,6 +287,13 @@ def render_tree(node: dict, depth: int, lines: list[str], budget: int, indent: s
         lines.append(f"{indent}… {len(rest)} more files ({summary})")
 
 
+def _sha256(p: Path) -> str | None:
+    try:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 def _diff(rel: str, old: str, new: str) -> str:
     return "".join(difflib.unified_diff(
         old.splitlines(keepends=True), new.splitlines(keepends=True),
@@ -340,6 +348,11 @@ class Toolbox:
         self.log_dir = Path(log_dir) if log_dir else self.ws.root / ".arborist-logs"
         self.on_output = on_output or (lambda line: None)
         self.on_notice = on_notice or (lambda msg: None)
+        # Files the model wrote this session -> sha256 of the content you were
+        # shown. Run prompts say whether the file to run is one of them, and
+        # whether it has changed since. Kept across /clear: it's about the
+        # files on disk, not the conversation.
+        self.model_writes: dict[Path, str] = {}
         # Shown to the user after every run: the files it added, changed or deleted.
         self.on_changes = on_changes or (lambda found: None)
         self.auto_edits = self.limits.approve_edits == "auto"
@@ -583,6 +596,7 @@ class Toolbox:
         with open(p, "w", encoding="utf-8", newline="") as fh:
             fh.write(new)
         self.ws.mark_seen(p)
+        self.model_writes[p] = _sha256(p)
         added = sum(1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
         removed = sum(1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---"))
         verb = "created" if is_new else "updated"
@@ -676,7 +690,8 @@ class Toolbox:
         del self._checked[p]
 
         ran = self._execute(rel, plan, self.limits.run_timeout, name=p.stem,
-                            refused=f"{rel} was not run", declined=f"The user declined to run {rel}")
+                            refused=f"{rel} was not run", declined=f"The user declined to run {rel}",
+                            target=p)
         if isinstance(ran, ToolResult):
             return ran
         outcome, changed = ran
@@ -752,8 +767,37 @@ class Toolbox:
             notes.append("can use the GPU (run_gpu)")
         return notes
 
+    def _provenance(self, target: Path | None) -> list[str]:
+        """Where the code being run came from, for the approval prompt: the
+        write and the run are approved separately, so this ties them together."""
+        notes = []
+        if target is not None:
+            rel = self.ws.rel(target)
+            shown = self.model_writes.get(target)
+            if shown is None:
+                notes.append(f"{rel} wasn't written by the model this session")
+            elif shown == _sha256(target):
+                notes.append(f"{rel} was written by the model this session; it's unchanged since "
+                             "the diff you were shown")
+            else:
+                notes.append(f"CHANGED: {rel} was written by the model, then changed after the "
+                             "diff you were shown (by a run, or outside arborist)")
+        changed = sorted(self.ws.rel(f) for f, h in self.model_writes.items()
+                         if f != target and _sha256(f) not in (h, None))
+        if changed:
+            notes.append("CHANGED since you were shown them: " + ", ".join(changed[:10])
+                         + (f" and {len(changed) - 10} more" if len(changed) > 10 else ""))
+        others = sum(1 for f in self.model_writes if f != target)
+        if others:
+            notes.append(f"the model wrote {others} other file{'s' * (others != 1)} this session "
+                         "(/diff lists them)")
+        if self.web_tainted:
+            notes.append("WEB: web content is in this conversation; make sure this run is "
+                         "something you asked for, not something a page suggested")
+        return notes
+
     def _execute(self, label: str, plan: runners.RunPlan, timeout: int, name: str,
-                 refused: str, declined: str):
+                 refused: str, declined: str, target: Path | None = None):
         """Gate, approve, checkpoint, run and diff. Returns (outcome, changed
         files text) or a ToolResult explaining why nothing ran."""
         problem = self._sandbox_problem()
@@ -761,8 +805,15 @@ class Toolbox:
             return ToolResult(f"{refused}: {problem} Tell the user this and stop; don't try "
                               "another way to run it.", hard_stop=True)
         spec = self._spec(plan) if self.limits.run_sandbox else None
+        view = None
+        if target is not None:
+            try:
+                view = target.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
         d = self.approver.approve_run(label, plan.steps, str(plan.cwd), timeout,
-                                      notes=self._run_notes(spec))
+                                      notes=self._provenance(target) + self._run_notes(spec),
+                                      view=view)
         if not d.approved:
             why = f" Their reason: {d.reason}" if d.reason else ""
             return ToolResult(f"{declined}; nothing was executed.{why} "
