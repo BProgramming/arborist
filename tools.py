@@ -112,10 +112,16 @@ class ToolResult:
 # ------------------------------------------------------------- workspace ---
 
 class Workspace:
-    def __init__(self, root: str | os.PathLike):
+    def __init__(self, root: str | os.PathLike, hidden=(), readonly=()):
+        """`hidden`: folders the model can't see at all (arborist's data:
+        weights, memory, chat logs). `readonly`: folders it can read but never
+        change (arborist's own code and config). Both apply only where they
+        fall inside the workspace; outside it, nothing is reachable anyway."""
         self.root = Path(root).resolve(strict=True)
         if not self.root.is_dir():
             raise ValueError(f"workspace is not a directory: {self.root}")
+        self.hidden = [Path(h).resolve() for h in hidden]
+        self.readonly = [Path(r).resolve() for r in readonly]
         # path -> mtime_ns when the model last read (or wrote) it
         self._seen: dict[Path, int] = {}
 
@@ -132,7 +138,17 @@ class Workspace:
         resolved = p.resolve()
         if resolved != self.root and not resolved.is_relative_to(self.root):
             raise ToolError(f"{path} is outside the workspace ({self.root}); only paths inside it are allowed")
+        if any(resolved == h or resolved.is_relative_to(h) for h in self.hidden):
+            raise ToolError(f"{path} is arborist's own data (memory, logs, models); it's off limits")
         return resolved
+
+    def is_readonly(self, p: Path) -> bool:
+        return any(p == r or p.is_relative_to(r) for r in self.readonly)
+
+    def inside(self, dirs: list[Path]) -> list[Path]:
+        """Those of `dirs` that are inside the workspace (or contain it)."""
+        return [d for d in dirs if d == self.root or d.is_relative_to(self.root)
+                or self.root.is_relative_to(d)]
 
     def rel(self, p: Path) -> str:
         return "." if p == self.root else p.relative_to(self.root).as_posix()
@@ -160,18 +176,34 @@ class Workspace:
 
     def git_visible(self) -> set[str] | None:
         """Files git would show here (tracked + untracked, minus .gitignore'd),
-        relative to the root; None when the workspace isn't in a git repo."""
+        relative to the root; None when the workspace isn't in a git repo.
+
+        A repo nested inside (another project cloned into this folder) shows
+        up in its parent's listing as one entry, "name/", with no files: its
+        own files are listed with its own git, so its .gitignore applies."""
+        return self._git_files(self.root, "", depth=0)
+
+    def _git_files(self, d: Path, prefix: str, depth: int) -> set[str] | None:
         try:
             r = subprocess.run(
-                ["git", "-C", str(self.root), "-c", "core.fsmonitor=false", "ls-files",
-                 "--cached", "--others",
-                 "--exclude-standard", "-z"],
+                ["git", "-C", str(d), "-c", "core.fsmonitor=false", "ls-files",
+                 "--cached", "--others", "--exclude-standard", "-z"],
                 capture_output=True, timeout=15, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.TimeoutExpired):
             return None
         if r.returncode != 0:
             return None
-        return {p for p in r.stdout.decode("utf-8", "surrogateescape").split("\0") if p}
+        found: set[str] = set()
+        for entry in r.stdout.decode("utf-8", "surrogateescape").split("\0"):
+            if not entry:
+                continue
+            if entry.endswith("/") and depth < 4 and (d / entry / ".git").exists():
+                inner = self._git_files(d / entry, prefix + entry, depth + 1)
+                if inner is not None:
+                    found |= inner
+                    continue
+            found.add(prefix + entry)
+        return found
 
     def walk_files(self, start: Path):
         """Yield files under start, skipping ignored and hidden-tool directories.
@@ -194,7 +226,8 @@ class Workspace:
                 dirs.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
         for dirpath, dirnames, filenames in os.walk(start):
             here = Path(dirpath)
-            kept = sorted(d for d in dirnames if d not in IGNORED_DIRS)
+            kept = sorted(d for d in dirnames if d not in IGNORED_DIRS
+                          and (here / d).resolve() not in self.hidden)
             if dirs is not None:
                 kept = [d for d in kept if self.rel(here / d) in dirs]
             dirnames[:] = kept
@@ -533,10 +566,7 @@ class Toolbox:
 
     def _apply(self, p: Path, old: str, new: str, is_new: bool) -> str:
         rel = self.ws.rel(p)
-        if ".git" in Path(rel).parts:
-            # .git/config and hooks hold commands that git runs (arborist's own
-            # git calls included), outside any sandbox and without asking.
-            raise ToolError(f"{rel} is inside .git; the model can't change git's files")
+        self._check_writable(p)
         diff = _diff(rel, old, new)
         if self.web_tainted or not self.auto_edits:
             d = self.approver.approve_change(rel, diff, is_new)
@@ -558,9 +588,20 @@ class Toolbox:
         verb = "created" if is_new else "updated"
         return f"{verb} {rel} (+{added} -{removed})"
 
+    def _check_writable(self, p: Path) -> None:
+        rel = self.ws.rel(p)
+        if self.ws.is_readonly(p):
+            raise ToolError(f"{rel} is part of arborist itself (its code or config); the model "
+                            "can read it but not change it. Propose the change to the user instead.")
+        if ".git" in Path(rel).parts:
+            # .git/config and hooks hold commands that git runs (arborist's own
+            # git calls included), outside any sandbox and without asking.
+            raise ToolError(f"{rel} is inside .git; the model can't change git's files")
+
     def tool_edit_file(self, path: str, old_string: str, new_string: str,
                        replace_all: bool = False) -> str:
         p = self.ws.resolve(path)
+        self._check_writable(p)
         if not p.exists():
             raise ToolError(f"no such file: {path}; use write_file to create it")
         if old_string == new_string:
@@ -583,6 +624,7 @@ class Toolbox:
 
     def tool_write_file(self, path: str, content: str) -> str:
         p = self.ws.resolve(path)
+        self._check_writable(p)
         if p.is_dir():
             raise ToolError(f"{path} is a directory")
         if p.exists():
@@ -661,7 +703,9 @@ class Toolbox:
         return sandbox.Spec(
             workspace=self.ws.root, cwd=Path(plan.cwd),
             reads=list(plan.reads), writable=writable,
-            protect=sandbox.protected_dirs(self.ws.root, Path(plan.cwd), plan.steps),
+            protect=sandbox.protected_dirs(self.ws.root, Path(plan.cwd), plan.steps)
+            + self.ws.inside(self.ws.readonly),
+            hide=self.ws.inside(self.ws.hidden),
             workspace_writable=not probe,
             display=self.limits.run_display and not probe,
             gpu=self.limits.run_gpu and not probe)
@@ -726,7 +770,7 @@ class Toolbox:
                               hard_stop=True)
 
         self._checkpoint()  # a script can change files too
-        skip = spec.protect if spec is not None else []
+        skip = (spec.protect + spec.hide) if spec is not None else self.ws.hidden
         before = changes.snapshot(self.ws.root, skip)
         outcome = runners.execute(plan, self.log_dir, timeout, self.on_output, name=name,
                                   spec=spec, env_keep=self.limits.run_env_keep,

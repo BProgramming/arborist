@@ -198,8 +198,15 @@ prompts are the main safety mechanism, so read them. Specifically:
   inside it the model can read anything, including `.env` files, keys, and
   credential files in any subfolder. The search tools skip `.gitignore`d
   files, but `read_file` still opens one asked for by name. **Don't start
-  arborist from your home directory or any folder above secrets.** It warns
-  if the workspace is your home directory, and refuses `/`.
+  arborist from your home directory or any folder above secrets.** It refuses
+  `/`, and warns when the workspace is your home directory, `~/Documents`,
+  `~/Desktop` or `~/Downloads`, or a folder holding several separate projects.
+  Repos nested inside the workspace are listed with their own `.gitignore`.
+- **arborist protects itself.** Its own code and config can be read by the
+  model (useful for reviewing arborist with arborist) but never changed:
+  edits are refused before you're asked, and runs see them read-only. Its
+  data folder (`paths.root`: models, memory, chats, checkpoints) can't be
+  read at all, and runs see it empty.
 - **Code the model writes runs in a bubblewrap sandbox.** `run_file`,
   `run_tests` and the dependency checks before them run under `bwrap`, which
   must be installed (package `bubblewrap`); without it nothing runs. Inside,

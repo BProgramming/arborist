@@ -56,6 +56,7 @@ class Spec:
     reads: list[Path] = field(default_factory=list)      # read-only binds
     writable: list[Path] = field(default_factory=list)   # writable binds outside the workspace
     protect: list[Path] = field(default_factory=list)    # read-only, inside writable binds
+    hide: list[Path] = field(default_factory=list)       # replaced with an empty folder
     workspace_writable: bool = True                      # False for probes
     display: bool = False
     gpu: bool = False
@@ -149,7 +150,11 @@ def wrap(argv: list[str], spec: Spec, env: dict[str, str]) -> list[str]:
     for w in _dedupe(spec.writable):
         args += ["--bind", str(w), str(w)]
     for p in _dedupe(protect):
-        args += ["--ro-bind", str(p), str(p)]
+        if os.path.exists(p):
+            args += ["--ro-bind", str(p), str(p)]
+    for h in _dedupe(spec.hide):
+        if os.path.isdir(h):
+            args += ["--tmpfs", str(h)]
     for f in _credential_files(reads + [ws]):
         args += ["--ro-bind", "/dev/null", str(f)]
 
