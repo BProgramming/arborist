@@ -1162,7 +1162,8 @@ class Chat:
                 self.checkpoints = Checkpoints(workspace, Path(cfg["derived"]["checkpoint_dir"]),
                                                exclude=IGNORED_DIRS)
             self.toolbox = Toolbox(
-                Workspace(workspace), TerminalApprover(),
+                Workspace(workspace, hidden=[cfg["derived"]["root"]],
+                          readonly=arborist_paths(cfg)), TerminalApprover(),
                 Limits.from_config(cfg["tools"]),
                 log_dir=cfg["derived"]["log_dir"],
                 on_output=self.ui.run_output,
@@ -1890,6 +1891,39 @@ def prune_old_checkpoints(cfg: dict) -> None:
                   f"{t['checkpoint_days']} days{extra}"))
 
 
+HERE = Path(__file__).resolve().parent
+
+
+def arborist_paths(cfg: dict) -> list[Path]:
+    """arborist's own code and config: readable by the model, never changed."""
+    return [HERE, Path(cfg["derived"]["config_path"]).resolve()]
+
+
+def workspace_warnings(root: Path, cfg: dict) -> list[str]:
+    """Things worth knowing about the folder the model will be able to read."""
+    home = Path.home().resolve()
+    out = []
+    if root == home:
+        out.append(f"the workspace is your whole home directory ({root}); "
+                   "consider starting from a project folder")
+    elif root in {home / d for d in ("Documents", "Desktop", "Downloads")} or root in home.parents:
+        out.append(f"the workspace is {root}: the model can read everything in it, not just one "
+                   "project; consider starting from a project folder")
+    try:
+        repos = sorted(d.name for d in root.iterdir()
+                       if d.is_dir() and not d.name.startswith(".") and (d / ".git").exists())
+    except OSError:
+        repos = []
+    if len(repos) >= 2 and not (root / ".git").exists():
+        shown = ", ".join(repos[:5]) + ("…" if len(repos) > 5 else "")
+        out.append(f"this folder holds {len(repos)} separate projects ({shown}); the model can read "
+                   "all of them. Start in the one you're working on")
+    if root == HERE or root.is_relative_to(HERE) or HERE.is_relative_to(root):
+        out.append(f"arborist's own code ({HERE}) is in this workspace: the model can read it but "
+                   "not change it, and runs see it read-only")
+    return out
+
+
 def resolve_workspace(arg: str | None) -> Path:
     root = Path(os.path.expanduser(arg)) if arg else Path.cwd()
     root = root.resolve()
@@ -1916,9 +1950,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     workspace = None if args.no_tools else resolve_workspace(args.workspace)
-    if workspace is not None and workspace == Path.home().resolve():
-        print(yellow(f"warning: the workspace is your whole home directory ({workspace}); "
-                     "consider starting from a project folder"))
+    for warning in workspace_warnings(workspace, cfg) if workspace is not None else []:
+        print(yellow(f"warning: {warning}"))
 
     # A --no-tools chat still sees the memories for the folder it's started in.
     scope = workspace

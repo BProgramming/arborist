@@ -498,3 +498,105 @@ def test_config_command_opens_nano_and_applies_tools(load_toml, ws_root, monkeyp
     c.command("/config")
     assert c.toolbox.limits.run_timeout == 30  # a bad edit changes nothing
     assert "nothing was applied" in capsys.readouterr().out
+
+
+# --- arborist's own code and data ---------------------------------------------
+
+@pytest.fixture
+def ws_with_arborist(ws_root, tmp_path):
+    """A workspace that contains an arborist install and its data folder,
+    like starting arborist from ~/Documents or ~."""
+    install = ws_root / "arborist"
+    write(ws_root, "arborist/tools.py", "SAFE = True\n")
+    write(ws_root, "arborist/.config/config", "[tools]\nrun_sandbox = true\n")
+    data = ws_root / "data"
+    write(ws_root, "data/memory/memory.toml", "[general]\nmemories = ['private']\n")
+    from tools import Toolbox, Workspace, Limits
+
+    def make(approver=None, **limits):
+        limits.setdefault("run_sandbox", sandbox.available())
+        return Toolbox(Workspace(ws_root, hidden=[data], readonly=[install]),
+                       approver or FakeApprover(), Limits(**limits), log_dir=tmp_path / "logs")
+    return make, install, data
+
+
+def test_model_can_read_but_not_change_arborist(ws_with_arborist, ws_root):
+    make, install, _ = ws_with_arborist
+    approver = FakeApprover()
+    tb = make(approver)
+    assert "SAFE = True" in tb.call("read_file", {"path": "arborist/tools.py"}).content
+    for args in ({"path": "arborist/tools.py", "content": "SAFE = False\n"},
+                 {"path": "arborist/.config/config", "content": "[tools]\nrun_sandbox = false\n"},
+                 {"path": "arborist/new.py", "content": "x\n"}):
+        out = tb.call("write_file", args).content
+        assert out.startswith("error:") and "part of arborist itself" in out
+    assert approver.change_requests == []  # refused before you're even asked
+    assert (install / "tools.py").read_text() == "SAFE = True\n"
+
+
+def test_model_cannot_see_arborists_data(ws_with_arborist):
+    make, _, data = ws_with_arborist
+    tb = make()
+    assert "off limits" in tb.call("read_file", {"path": "data/memory/memory.toml"}).content
+    assert "memory.toml" not in tb.call("list_files", {}).content
+    assert "memory.toml" not in tb.call("grep", {"pattern": "private"}).content
+
+
+@sandboxed
+def test_runs_see_arborist_read_only_and_its_data_not_at_all(ws_with_arborist, ws_root):
+    make, install, data = ws_with_arborist
+    write(ws_root, "probe.py",
+          "import os\n"
+          f"try:\n    open({str(install / 'tools.py')!r}, 'w').write('x'); print('WROTE-CODE')\n"
+          "except OSError:\n    print('code read-only')\n"
+          f"print('DATA', os.listdir({str(data)!r}))\n")
+    tb = make(run_sandbox=True)
+    tb.call("check_dependencies", {"path": "probe.py"})
+    out = tb.call("run_file", {"path": "probe.py"}).content
+    assert "code read-only" in out and "DATA []" in out
+    assert (install / "tools.py").read_text() == "SAFE = True\n"
+
+
+@needs("git")
+def test_nested_repos_are_listed_with_their_own_gitignore(ws_root, make_toolbox):
+    """A workspace inside a git repo, holding another repo: the inner repo's
+    files are listed (they used to vanish), minus what its .gitignore drops."""
+    subprocess.run(["git", "init", "-q", str(ws_root)], check=True)
+    write(ws_root, "notes.txt", "outer\n")
+    inner = ws_root / "proj"
+    write(ws_root, "proj/main.py", "def needle(): pass\n")
+    write(ws_root, "proj/.gitignore", "secret.env\n")
+    write(ws_root, "proj/secret.env", "needle=1\n")
+    subprocess.run(["git", "init", "-q", str(inner)], check=True)
+    tb = make_toolbox()
+    listing = tb.call("list_files", {}).content
+    assert "proj/main.py" in listing and "notes.txt" in listing and "secret.env" not in listing
+    assert "proj/main.py" in tb.call("grep", {"pattern": "needle"}).content
+    assert "main.py" in tb.call("view_tree", {"path": "proj"}).content
+
+
+def test_startup_warns_about_broad_workspaces(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    docs = home / "Documents"
+    for repo in ("arborist", "seymour", "slimeclimb"):
+        (docs / repo / ".git").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(chat, "HERE", docs / "arborist")
+    warnings = " | ".join(chat.workspace_warnings(docs.resolve(), {}))
+    assert "read everything in it" in warnings
+    assert "3 separate projects" in warnings
+    assert "arborist's own code" in warnings and "not change it" in warnings
+    inside = chat.workspace_warnings((docs / "arborist").resolve(), {})
+    assert len(inside) == 1 and "not change it" in inside[0]
+    assert chat.workspace_warnings((docs / "seymour").resolve(), {}) == []
+
+
+def test_chat_protects_arborist_and_hides_its_data(load_toml, tmp_path, monkeypatch):
+    ws = tmp_path / "Documents"
+    install = ws / "arborist"
+    install.mkdir(parents=True)
+    monkeypatch.setattr(chat, "HERE", install.resolve())
+    c = chat.Chat(load_toml(), ws, tools_enabled=True)
+    assert install.resolve() in c.toolbox.ws.readonly
+    assert Path(c.cfg["derived"]["config_path"]).resolve() in c.toolbox.ws.readonly
+    assert Path(c.cfg["derived"]["root"]).resolve() in c.toolbox.ws.hidden
