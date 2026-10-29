@@ -242,3 +242,32 @@ def test_the_compactor_runs_before_every_request_and_sees_usage(ws_root, make_to
     with_usage = tool_reply(("read_file", {"path": "a.py"})) + [{"choices": [], "usage": {"prompt_tokens": 900}}]
     run(FakeModel(with_usage, text_reply("done")), make_toolbox(), compactor=spy)
     assert spy.calls == 2 and spy.usages == [{"prompt_tokens": 900}]
+
+
+def test_sandbox_rule_matches_the_settings():
+    from agent import TOOL_GUIDE, sandbox_rule
+    from tools import Limits
+    default = sandbox_rule(Limits())
+    assert "no network" in default and "no display" in default and "no GPU" in default
+    assert "Tell the user to run it themselves" in default
+    opened = sandbox_rule(Limits(run_display=True, run_gpu=True, run_writable=["~/.cache/x"]))
+    assert "no display" not in opened and "no GPU" not in opened
+    assert "Wayland display" in opened and "use the GPU" in opened and "~/.cache/x" in opened
+    assert "NOT sandboxed" in sandbox_rule(Limits(run_sandbox=False))
+    assert "{" not in TOOL_GUIDE.format(root="/w", sandbox=default)
+
+
+def test_system_prompt_carries_the_rule_and_follows_config(tmp_path, monkeypatch):
+    import chat
+    import config
+    p = tmp_path / "t.toml"
+    p.write_text(f'[paths]\nroot = "{tmp_path / "root"}"\n[model]\nrepo = "a/b"\nfile = "c.gguf"\n')
+    monkeypatch.setenv("ARBORIST_CONFIG", str(p))
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    c = chat.Chat(config.load(), ws, tools_enabled=True)
+    c._env_facts = []  # skip the toolchain probe
+    assert "no display (GUI windows can't open)" in c._system()
+    from tools import Limits
+    c.toolbox.apply_limits(Limits(run_display=True))  # what /config does
+    assert "Wayland display" in c._system() and "no display" not in c._system()
