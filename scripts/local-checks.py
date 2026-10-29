@@ -33,13 +33,13 @@ import runners  # noqa: E402
 import sandbox  # noqa: E402
 from tools import Decision, Limits, MemoryChoice, Toolbox, Workspace  # noqa: E402
 
-GREEN, RED, DIM, BOLD, RESET = ("\033[32m", "\033[31m", "\033[2m", "\033[1m", "\033[0m") \
+GREEN, RED, BLUE, DIM, BOLD, RESET = ("\033[32m", "\033[31m", "\033[34m", "\033[2m", "\033[1m", "\033[0m") \
     if sys.stdout.isatty() else ("",) * 5
 results: list[tuple[str, str]] = []
 
 
 def report(status: str, name: str, detail: str = "") -> None:
-    colour = {"PASS": GREEN, "FAIL": RED}.get(status, DIM)
+    colour = {"PASS": GREEN, "FAIL": RED, "INFO": BLUE}.get(status, DIM)
     print(f"  {colour}{status}{RESET}  {name}" + (f"{DIM}  ({detail}){RESET}" if detail else ""))
     results.append((status, name))
 
@@ -100,7 +100,7 @@ def check_platform() -> bool:
     restrict = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
     if restrict.exists():
         value = restrict.read_text().strip()
-        report("SKIP", "AppArmor user-namespace restriction",
+        report("INFO", "AppArmor user-namespace restriction",
                "off here" if value == "0" else "on, but bwrap is allowed through")
     return ok
 
@@ -334,7 +334,7 @@ def main() -> int:
     if not args.no_suite:
         run_suite()
     failed = [n for s, n in results if s == "FAIL"]
-    print(f"\n{BOLD}{len(results) - len(failed)} ok/skipped, {len(failed)} failed{RESET}")
+    print(f"\n{BOLD}{len(results) - len(failed)} ok/skipped/info, {len(failed)} failed{RESET}")
     for n in failed:
         print(f"  {RED}✗{RESET} {n}")
     return 1 if failed else 0
