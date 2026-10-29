@@ -655,10 +655,9 @@ class Toolbox:
     def _spec(self, plan: runners.RunPlan, probe: bool = False) -> sandbox.Spec:
         build = (self.log_dir / "build").resolve()
         build.mkdir(parents=True, exist_ok=True)
-        writable = [build]
+        writable = [build] + list(plan.writable)
         if not probe:
             writable += [Path(os.path.expanduser(w)).resolve() for w in self.limits.run_writable]
-            writable += plan.writable
         return sandbox.Spec(
             workspace=self.ws.root, cwd=Path(plan.cwd),
             reads=list(plan.reads), writable=writable,
@@ -668,9 +667,12 @@ class Toolbox:
             gpu=self.limits.run_gpu and not probe)
 
     def _probe_wrap(self, cmd: list[str], cwd: Path | None) -> list[str]:
-        """Dependency probes: sandboxed, workspace read-only, no extras."""
-        reads, _ = runners.toolchain_folders([cmd])
-        plan = runners.RunPlan(steps=[cmd], cwd=cwd or self.log_dir / "build", reads=reads)
+        """Dependency probes: sandboxed, workspace read-only, and none of your
+        extras (run_writable, display, GPU). Only a toolchain's own state
+        folder (a Flutter SDK's cache) stays writable, as it must to start."""
+        reads, writable = runners.toolchain_folders([cmd])
+        plan = runners.RunPlan(steps=[cmd], cwd=cwd or self.log_dir / "build", reads=reads,
+                               writable=writable)
         return sandbox.wrap(cmd, self._spec(plan, probe=True), runners.run_env())
 
     def _probing(self):
