@@ -37,8 +37,30 @@ jobs:
         run: |
           python --version; node --version; rustc --version; cargo --version; dart --version
 
+      # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor, which
+      # would make the run-isolation tests skip. Allow them so CI tests the
+      # sandbox for real, then fail early if it still doesn't work.
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare -rn true
+
       - name: Run tests
-        run: python -m pytest -v
+        run: python -m pytest -v --junitxml=pytest-results.xml
+
+      # One annotation per failing test, so failures show on the PR page
+      # without opening the log.
+      - name: Annotate failures
+        if: failure()
+        run: |
+          python - <<'EOF'
+          import xml.etree.ElementTree as ET
+          for case in ET.parse("pytest-results.xml").iter("testcase"):
+              for bad in list(case.iter("failure")) + list(case.iter("error")):
+                  text = ((bad.get("message") or "") + "\n" + (bad.text or ""))[-3000:]
+                  text = text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+                  print(f"::error title={case.get('classname')}.{case.get('name')}::{text}")
+          EOF
 
   shellcheck:
     runs-on: ubuntu-latest

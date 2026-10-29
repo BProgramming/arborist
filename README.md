@@ -195,10 +195,17 @@ prompts are the main safety mechanism, so read them. Specifically:
   files, but `read_file` still opens one asked for by name. **Don't start
   arborist from your home directory or any folder above secrets.** It warns
   if the workspace is your home directory, and refuses `/`.
-- **Running code is not sandboxed.** `run_file` and `run_tests` execute with
-  your user's full permissions: that code can read anything your account can
-  (well outside the workspace), use the network, and delete things. Every run
-  asks first and shows the command; look at what you're approving.
+- **Running code is only partly sandboxed.** `run_file` and `run_tests` run
+  under `unshare -rmn` with no network (loopback only), a minimal environment
+  so API keys in your shell don't reach them, and your home directory
+  read-only apart from the workspace. In the workspace, `.git`, virtualenvs
+  and `node_modules` are read-only too, so a run can't plant a git hook or
+  poison an environment you use yourself (`run_sandbox`, `run_writable`,
+  `run_env_keep` and `run_display` in `[tools]`). The code can still read
+  anything your account can, change other files in the workspace, write to
+  `/tmp`, and talk to local Unix sockets such as Docker's. Every run asks first and shows the command; look at what
+  you're approving. Edit prompts highlight dotted names (`file.py`,
+  `some.host.com`) and list any that are in diff lines not shown.
   `run_tests` runs whatever the project's test setup runs (`conftest.py`,
   `npm test` scripts and so on).
 - **Every web request the model chooses asks first.** The prompt shows the
