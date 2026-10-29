@@ -33,80 +33,158 @@ PROBE_TIMEOUT = 20  # seconds, for version checks and dependency probes
 
 # What a run inherits from arborist's environment. Code the model wrote runs
 # with only these (plus the plan's own env and the user's tools.run_env_keep),
-# so API keys, tokens, SSH_AUTH_SOCK, DISPLAY and the D-Bus address don't
-# reach it. LC_* variables are kept too.
+# so API keys, tokens, SSH_AUTH_SOCK and the D-Bus address don't reach it.
+# LC_* variables are kept too.
 SAFE_ENV = frozenset({
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR",
     "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV",
     "CARGO_HOME", "RUSTUP_HOME", "PUB_CACHE", "FLUTTER_ROOT", "NODE_PATH",
     "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
 })
+# With tools.run_display, also these, so GUI programs (pygame and the like)
+# can open a window. That also hands them XDG_RUNTIME_DIR, where the D-Bus
+# socket lives, so it's off by default.
+DISPLAY_ENV = frozenset({"DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
+                         "XDG_SESSION_TYPE"})
 
 
-def run_env(extra: dict[str, str] | None = None, keep=()) -> dict[str, str]:
+def run_env(extra: dict[str, str] | None = None, keep=(), display: bool = False) -> dict[str, str]:
     """The whole environment a run gets: SAFE_ENV, LC_*, `keep`, then `extra`."""
     env = {k: v for k, v in os.environ.items()
-           if k in SAFE_ENV or k.startswith("LC_") or k in keep}
+           if k in SAFE_ENV or k.startswith("LC_") or k in keep
+           or (display and k in DISPLAY_ENV)}
     env.update(extra or {})
     return env
 
 
-# Runs happen in a new user + network namespace (`unshare -rn`): the process
-# sees only a loopback interface, so nothing it does reaches the internet, the
-# LAN, cloud metadata addresses or the llama-server. This shim, run inside the
-# namespace, brings loopback up (so tests using 127.0.0.1 still work) and then
-# execs the real command. Inside, the process is "root" of its own namespace
-# only; on the host it's still you, and files it writes are owned by you.
-_LO_UP_SHIM = """\
-import fcntl, os, socket, struct, sys
+# Runs happen in new user, mount and network namespaces (`unshare -rmn`).
+# This shim runs first, inside them, and then execs the real command:
+#   - brings loopback up, so tests using 127.0.0.1 work; nothing else is
+#     reachable (no internet, LAN, cloud metadata or llama-server);
+#   - makes your home directory read-only, apart from the workspace and the
+#     build directory, so a run can't plant anything that later runs outside
+#     the sandbox (~/.bashrc, a .pth file in ~/.local, arborist's own memory);
+#   - makes .git, virtualenvs and node_modules in the workspace read-only too
+#     (git hooks, and environments you also use from your own shell).
+# Inside, the process is "root" of its own namespaces only; on the host it's
+# still you, and files it writes are owned by you.
+_SHIM = r"""
+import ctypes, fcntl, json, os, re, socket, struct, sys
+MS_RDONLY, MS_REMOUNT, MS_BIND, MS_REC = 1, 32, 4096, 16384
+libc = ctypes.CDLL(None, use_errno=True)
+
+def mount(src, dst, flags):
+    if libc.mount(src.encode(), dst.encode(), None, flags, None) != 0:
+        e = ctypes.get_errno()
+        raise OSError(e, f"{dst}: {os.strerror(e)}")
+
+def mounts_under(top):
+    with open("/proc/self/mountinfo") as f:
+        for line in f:
+            p = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])
+            if p == top or p.startswith(top.rstrip("/") + "/"):
+                yield p
+
+def inside(p, dirs):
+    return any(p == d or p.startswith(d.rstrip("/") + "/") for d in dirs)
+
+spec = json.loads(sys.argv[1])
 try:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     got = fcntl.ioctl(s, 0x8913, struct.pack("16sH22x", b"lo", 0))  # SIOCGIFFLAGS
-    flags = struct.unpack("16sH", got[:18])[1]
-    fcntl.ioctl(s, 0x8914, struct.pack("16sH22x", b"lo", flags | 1))  # SIOCSIFFLAGS, IFF_UP
+    fcntl.ioctl(s, 0x8914, struct.pack("16sH22x", b"lo", struct.unpack("16sH", got[:18])[1] | 1))
     s.close()
 except OSError:
     pass
-os.execvp(sys.argv[1], sys.argv[1:])
+try:
+    for d in spec["rw"]:  # first, so the copies made below carry them along
+        mount(d, d, MS_BIND | MS_REC)
+    for d in spec["ro"]:
+        mount(d, d, MS_BIND | MS_REC)
+        for m in list(mounts_under(d)):
+            if not inside(m, spec["rw"]) or m == d:
+                mount(m, m, MS_REMOUNT | MS_BIND | MS_RDONLY)
+    for d in spec["inner_ro"]:
+        mount(d, d, MS_BIND | MS_REC)
+        mount(d, d, MS_REMOUNT | MS_BIND | MS_RDONLY)
+except OSError as e:
+    print(f"arborist sandbox: can't set up read-only mounts ({e}); not running", file=sys.stderr)
+    sys.exit(126)
+os.execvp(sys.argv[2], sys.argv[2:])
 """
-_offline: bool | None = None
+# Folders in a project that hold things you'll run yourself, outside arborist.
+_INNER_RO = (".git", ".venv", "venv", "node_modules")
+_sandbox: bool | None = None
 
 
-def offline_prefix() -> list[str]:
-    """What goes before each step to run it with no network."""
-    return [shutil.which("unshare") or "unshare", "-rn", "--",
-            sys.executable, "-I", "-c", _LO_UP_SHIM]
+def sandbox_prefix(spec: dict) -> list[str]:
+    """What goes before each step to run it in the sandbox described by `spec`."""
+    return [shutil.which("unshare") or "unshare", "-rmn", "--",
+            sys.executable, "-I", "-c", _SHIM, json.dumps(spec)]
 
 
-def offline_available() -> bool:
-    """Whether runs can be cut off from the network here (checked once).
+def sandbox_spec(root: Path, cwd: Path, steps: list[list[str]], build_dir: Path,
+                 writable=()) -> dict:
+    """Which folders a run may write (`rw`) and which it may only read."""
+    home = Path.home().resolve()
+    root = root.resolve()
+    build_dir.mkdir(parents=True, exist_ok=True)
+    rw = [root, build_dir.resolve()] + [Path(os.path.expanduser(w)).resolve() for w in writable]
+    # A workspace at or above home would make home writable again anyway.
+    ro = [] if root == home or root in home.parents else [home]
+    inner = set()
+    for d in {root, Path(cwd).resolve()}:
+        inner.update(d / n for n in _INNER_RO)
+    for step in steps:  # the project's own interpreter's venv, wherever it is
+        venv = Path(step[0]).parent.parent
+        if Path(step[0]).is_absolute() and (venv / "pyvenv.cfg").is_file():
+            inner.add(venv)
+    if os.environ.get("VIRTUAL_ENV"):
+        inner.add(Path(os.environ["VIRTUAL_ENV"]))
+    return {"rw": [str(p) for p in rw if p.is_dir()],
+            "ro": [str(p) for p in ro if p.is_dir()],
+            "inner_ro": sorted(str(p) for p in inner if p.is_dir())}
+
+
+def sandbox_available() -> bool:
+    """Whether runs can be sandboxed here (checked once).
 
     False where util-linux's unshare is missing or unprivileged user
     namespaces are disabled (e.g. Ubuntu 24.04's default AppArmor setting,
     kernel.apparmor_restrict_unprivileged_userns = 1).
     """
-    global _offline
-    if _offline is None:
-        # Passes only if the namespace was made AND an outside address is unreachable.
-        probe = ("import socket\n"
-                 "s = socket.socket(); s.settimeout(3)\n"
-                 "try:\n    s.connect(('1.1.1.1', 53))\n"
-                 "except OSError:\n    raise SystemExit(0)\n"
-                 "raise SystemExit(1)\n")
-        try:
-            r = subprocess.run(offline_prefix() + [sys.executable, "-I", "-c", probe],
-                               capture_output=True, timeout=PROBE_TIMEOUT,
-                               stdin=subprocess.DEVNULL, env=run_env())
-            _offline = shutil.which("unshare") is not None and r.returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            _offline = False
-    return _offline
+    global _sandbox
+    if _sandbox is None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            ro, rw = Path(t, "ro"), Path(t, "ro", "rw")
+            rw.mkdir(parents=True)
+            # Passes only if an outside address is unreachable, the read-only
+            # folder refuses writes and the writable one inside it takes them.
+            probe = ("import socket, sys\n"
+                     "s = socket.socket(); s.settimeout(3)\n"
+                     "try:\n    s.connect(('1.1.1.1', 53)); sys.exit(1)\n"
+                     "except OSError:\n    pass\n"
+                     "open(sys.argv[2] + '/ok', 'w').write('x')\n"
+                     "try:\n    open(sys.argv[1] + '/bad', 'w').write('x'); sys.exit(1)\n"
+                     "except OSError:\n    pass\n")
+            spec = {"rw": [str(rw)], "ro": [str(ro)], "inner_ro": []}
+            try:
+                r = subprocess.run(sandbox_prefix(spec) + [sys.executable, "-I", "-c", probe,
+                                                            str(ro), str(rw)],
+                                   capture_output=True, timeout=PROBE_TIMEOUT,
+                                   stdin=subprocess.DEVNULL, env=run_env())
+                _sandbox = (shutil.which("unshare") is not None and r.returncode == 0
+                            and (rw / "ok").exists() and not (ro / "bad").exists())
+            except (OSError, subprocess.TimeoutExpired):
+                _sandbox = False
+    return _sandbox
 
 
-OFFLINE_HELP = ("arborist can't cut runs off from the network on this machine: `unshare -rn` "
-                "(util-linux) is missing or unprivileged user namespaces are disabled. Fix "
-                "that, or set tools.run_offline = false in arborist.toml to run with network "
-                "access.")
+SANDBOX_HELP = ("arborist can't sandbox runs on this machine: `unshare -rmn` (util-linux) is "
+                "missing or unprivileged user namespaces are disabled. Fix that, or set "
+                "tools.run_sandbox = false in arborist.toml to run with network access and "
+                "write access to your home directory.")
 
 
 @dataclass
@@ -666,15 +744,16 @@ def focus_test_output(log: str, passed: bool) -> str:
 
 def execute(plan: RunPlan, log_dir: Path, timeout: int,
             on_output: Callable[[str], None], name: str = "run",
-            offline: bool = False, env_keep=()) -> RunOutcome:
+            sandbox: dict | None = None, env_keep=(), display: bool = False) -> RunOutcome:
     """Run each step with a shared timeout; combined output goes to a log file.
 
     `name` (usually the source file's stem) labels the log file. Steps get a
-    minimal environment (run_env); with `offline`, they also run with no
-    network (the caller checks offline_available() first).
+    minimal environment (run_env). With a `sandbox` spec (sandbox_spec()),
+    they also run with no network and read-only folders; the caller checks
+    sandbox_available() first.
     """
-    env = run_env(plan.env, env_keep)
-    prefix = offline_prefix() if offline else []
+    env = run_env(plan.env, env_keep, display)
+    prefix = sandbox_prefix(sandbox) if sandbox is not None else []
     runs = log_dir / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     name = re.sub(r"[^\w.-]", "_", name) or "run"

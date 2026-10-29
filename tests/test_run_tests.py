@@ -199,6 +199,8 @@ def chat_with_failing_tests(ws_root, tmp_path, monkeypatch):
     write(ws_root, "test_calc.py", "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n")
     c = chat.Chat(config.load(), ws_root, tools_enabled=True)
     c.toolbox.approver = FakeApprover()
+    # Like make_toolbox: offline where this machine can do it, online where it can't.
+    c.toolbox.limits.run_sandbox = runners.sandbox_available()
     requests = []
 
     def call(name, args, cid):

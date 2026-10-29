@@ -66,7 +66,7 @@ def make_toolbox(ws_root, tmp_path):
     def make(approver=None, **limits):
         # Runs are offline by default; on a machine that can't do that (e.g. a
         # CI runner without user namespaces), the other tests run online.
-        limits.setdefault("run_offline", runners.offline_available())
+        limits.setdefault("run_sandbox", runners.sandbox_available())
         output: list[str] = []
         notices: list[str] = []
         tb = Toolbox(Workspace(ws_root), approver or FakeApprover(), Limits(**limits),
