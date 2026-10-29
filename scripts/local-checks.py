@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import config  # noqa: E402
+import runners  # noqa: E402
 import sandbox  # noqa: E402
 from tools import Decision, Limits, MemoryChoice, Toolbox, Workspace  # noqa: E402
 
@@ -98,9 +99,9 @@ def check_platform() -> bool:
           sandbox._supports_disable_userns(), version)
     restrict = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
     if restrict.exists():
-        report("SKIP" if restrict.read_text().strip() == "0" else "PASS",
-               "AppArmor user-namespace restriction",
-               f"={restrict.read_text().strip()}; bwrap works either way: {ok}")
+        value = restrict.read_text().strip()
+        report("SKIP", "AppArmor user-namespace restriction",
+               "off here" if value == "0" else "on, but bwrap is allowed through")
     return ok
 
 
@@ -190,8 +191,14 @@ def check_toolchains() -> None:
              ("tsx", "hi.ts", "const n: number = 6 * 7; console.log('ts', n)", "ts 42"),
              ("rustc", "hi.rs", 'fn main() { println!("rust {}", 6 * 7); }', "rust 42"),
              ("dart", "hi.dart", "void main() { print('dart ${6 * 7}'); }", "dart 42")]
+    nv = runners._node_version()
+    node_strips_types = bool(nv) and nv[1] >= (22, 6)
     for tool, name, code, want in cases:
-        if not shutil.which(tool) and not (tool == "tsx" and shutil.which("node")):
+        if tool == "tsx" and not shutil.which("tsx") and not node_strips_types:
+            report("SKIP", "TypeScript", "no tsx, and Node is older than 22.6 "
+                   f"({'v%d.%d' % nv[1] if nv else 'no node'}); npm install -g tsx to test it")
+            continue
+        if tool != "tsx" and not shutil.which(tool):
             report("SKIP", tool, "not installed")
             continue
         out = run_code(code, name=name)
@@ -301,10 +308,14 @@ def run_suite() -> None:
     env = dict(os.environ, ARBORIST_REQUIRE_SANDBOX="1")
     r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
                        cwd=ROOT, env=env, capture_output=True, text=True)
-    tail = (r.stdout.strip().splitlines() or ["(no output)"])[-1]
+    if "No module named pytest" in r.stderr:
+        report("FAIL", "pytest", f"pytest isn't installed for {sys.executable}: "
+               "sudo apt install python3-pytest, or pip install -r requirements-dev.txt in a venv")
+        return
+    tail = ((r.stdout.strip() or r.stderr.strip()).splitlines() or ["(no output)"])[-1]
     check("pytest", r.returncode == 0, tail)
     if r.returncode:
-        print(textwrap.indent(r.stdout[-3000:], "    "))
+        print(textwrap.indent((r.stdout + r.stderr)[-3000:], "    "))
 
 
 def main() -> int:

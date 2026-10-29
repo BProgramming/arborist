@@ -226,12 +226,12 @@ def toolchain_folders(steps: list[list[str]]) -> tuple[list[Path], list[Path]]:
         name = Path(exe).name
         if name.startswith("python"):
             reads += _python_paths(exe)
-        if name == "flutter":
-            # Flutter takes a lock in, and updates, its own cache on every
-            # command; it won't start without write access to it.
-            for root in sandbox.tool_root(exe):
-                if os.path.isdir(root / "bin" / "cache"):
-                    writable.append((root / "bin" / "cache").resolve())
+        # A Flutter SDK's bin/flutter and bin/dart are wrapper scripts that
+        # take a lock in, and update, the SDK's own cache on every command;
+        # they won't start without write access to it.
+        for root in sandbox.tool_root(exe):
+            if os.path.isfile(root / "bin" / "flutter") and os.path.isdir(root / "bin" / "cache"):
+                writable.append((root / "bin" / "cache").resolve())
     reads += sandbox.home_dir("CARGO_HOME", ".cargo") + sandbox.home_dir("RUSTUP_HOME", ".rustup")
     reads += sandbox.home_dir("PUB_CACHE", ".pub-cache")
     return sandbox._dedupe(reads), sandbox._dedupe(writable)

@@ -2,6 +2,7 @@
 work inside it. The security guarantees themselves are in test_audit.py."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -189,3 +190,32 @@ def test_gpu_arguments_are_accepted(ws_root, make_toolbox):
     """CI has no GPU, but bwrap must still accept the GPU binds (all -try)."""
     write(ws_root, "g.py", "print('GPU-RUN-OK')\n")
     assert "GPU-RUN-OK" in run(make_toolbox(run_sandbox=True, run_gpu=True), "g.py").content
+
+
+@pytest.fixture
+def fake_flutter_sdk(tmp_path, monkeypatch):
+    """An SDK laid out like Flutter's: bin/dart and bin/flutter are wrapper
+    scripts that must write a lock file in bin/cache before doing anything."""
+    sdk = tmp_path / "flutter"
+    (sdk / "bin" / "cache").mkdir(parents=True)
+    for tool in ("dart", "flutter"):
+        script = sdk / "bin" / tool
+        script.write_text("#!/bin/sh\n"
+                          f'echo locked > "{sdk}/bin/cache/lockfile" || exit 1\n'
+                          'echo "Dart SDK version: 3.9.0 (stable)"\n')
+        script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{sdk / 'bin'}:{os.environ['PATH']}")
+    return sdk
+
+
+@sandboxed
+def test_flutter_sdk_dart_works_in_checks_and_runs(ws_root, make_toolbox, fake_flutter_sdk,
+                                                    approver):
+    write(ws_root, "hi.dart", "void main() { print('hi'); }\n")
+    tb = make_toolbox(approver, run_sandbox=True)
+    report = tb.call("check_dependencies", {"path": "hi.dart"}).content
+    assert "Dart SDK version" in report and "not found" not in report
+    assert (fake_flutter_sdk / "bin" / "cache" / "lockfile").exists()
+    tb.call("run_file", {"path": "hi.dart"})
+    cache = str((fake_flutter_sdk / "bin" / "cache").resolve())
+    assert any(cache in n for n in approver.run_notes[-1])  # named on the prompt
