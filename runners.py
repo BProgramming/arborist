@@ -124,12 +124,20 @@ def sandbox_prefix(spec: dict) -> list[str]:
 
 
 def sandbox_spec(root: Path, cwd: Path, steps: list[list[str]], build_dir: Path,
-                 writable=()) -> dict:
-    """Which folders a run may write (`rw`) and which it may only read."""
+                 writable=(), toolchain_writable=()) -> dict:
+    """Which folders a run may write (`rw`) and which it may only read.
+
+    `writable` comes from the user (tools.run_writable); `toolchain_writable`
+    from the plan (RunPlan.writable), and is created if missing, as the
+    toolchain would have done itself.
+    """
     home = Path.home().resolve()
     root = root.resolve()
     build_dir.mkdir(parents=True, exist_ok=True)
-    rw = [root, build_dir.resolve()] + [Path(os.path.expanduser(w)).resolve() for w in writable]
+    for d in toolchain_writable:
+        Path(d).mkdir(parents=True, exist_ok=True)
+    rw = ([root, build_dir.resolve()] + [Path(os.path.expanduser(w)).resolve() for w in writable]
+          + [Path(d).resolve() for d in toolchain_writable])
     # A workspace at or above home would make home writable again anyway.
     ro = [] if root == home or root in home.parents else [home]
     inner = set()
@@ -195,6 +203,7 @@ class RunPlan:
     warnings: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)     # non-empty means "don't run"
     env: dict[str, str] = field(default_factory=dict)     # added to the environment for the run
+    writable: list[Path] = field(default_factory=list)    # home folders the toolchain must write
 
     @property
     def ok(self) -> bool:
@@ -483,8 +492,13 @@ def _plan_rust(path: Path, root: Path, build_dir: Path) -> RunPlan:
 
 # ----------------------------------------------------------------- dart ---
 
+# Dart and Flutter refuse to start without writing their settings here.
+DART_STATE = (".dart-tool",)
+FLUTTER_STATE = (".dart-tool", ".flutter", ".config/flutter")
+
+
 def _plan_dart(path: Path, root: Path, build_dir: Path) -> RunPlan:
-    plan = RunPlan(cwd=path.parent)
+    plan = RunPlan(cwd=path.parent, writable=[Path.home() / d for d in DART_STATE])
     dart = shutil.which("dart")
     v = _version([dart, "--version"]) if dart else None
     if not v:
@@ -640,6 +654,7 @@ def _tests_dart(target: Path, project: Path, rel: str, root: Path, build_dir: Pa
         plan.problems.append(f"can't read pubspec.yaml: {e}")
         return plan
     flutter = bool(re.search(r"^\s*sdk:\s*flutter\b", pubspec, re.MULTILINE))
+    plan.writable = [Path.home() / d for d in (FLUTTER_STATE if flutter else DART_STATE)]
     if flutter:
         exe = shutil.which("flutter")
         if not exe:

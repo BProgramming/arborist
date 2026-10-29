@@ -635,7 +635,7 @@ class Toolbox:
         if not self.limits.run_sandbox:
             return None
         return runners.sandbox_spec(self.ws.root, plan.cwd, plan.steps, self.log_dir / "build",
-                                    self.limits.run_writable)
+                                    self.limits.run_writable, plan.writable)
 
     # run_tests ------------------------------------------------------------
 

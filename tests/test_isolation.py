@@ -164,3 +164,22 @@ def test_display_is_opt_in(ws_root, make_toolbox, monkeypatch):
                              "'RUNTIME', os.environ.get('XDG_RUNTIME_DIR'))\n")
     assert "DISPLAY None RUNTIME None" in run(make_toolbox(), "gui.py").content
     assert "DISPLAY :0 RUNTIME /run/user/1000" in run(make_toolbox(run_display=True), "gui.py").content
+
+
+@sandboxed
+def test_toolchain_state_folders_stay_writable(ws_root, make_toolbox, home_around_workspace,
+                                               monkeypatch):
+    # Stand-in for `dart run`, which won't start unless it can create ~/.dart-tool.
+    plan_for = runners.plan_for
+
+    def with_state(path, root, build_dir):
+        plan = plan_for(path, root, build_dir)
+        plan.writable = [home_around_workspace / ".dart-tool"]
+        return plan
+    monkeypatch.setattr(runners, "plan_for", with_state)
+    state = home_around_workspace / ".dart-tool" / "telemetry"
+    blocked = home_around_workspace / ".other"
+    write(ws_root, "state.py", WRITE_EACH)
+    write(ws_root, "targets.txt", f"{state}\n{blocked}")
+    out = run(make_toolbox(run_sandbox=True), "state.py").content
+    assert f"WROTE {state}" in out and f"BLOCKED {blocked}" in out
