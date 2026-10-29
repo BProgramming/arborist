@@ -53,6 +53,8 @@ check_deps() {
   for c in git cmake curl; do command -v "$c" >/dev/null || missing+=("$c"); done
   command -v c++ >/dev/null || command -v g++ >/dev/null || missing+=("c++ compiler")
   command -v ninja >/dev/null || info "Ninja not found; using make (slower builds, same binary)."
+  command -v bwrap >/dev/null \
+    || info "bubblewrap (bwrap) not found: the model can't run code until it's installed (sudo apt install bubblewrap)."
   hints+=("build-essential cmake ninja-build git curl")
 
   case "$CFG_BACKEND" in

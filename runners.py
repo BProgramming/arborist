@@ -183,7 +183,7 @@ def _python_paths(interp: str) -> list[Path]:
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
             found = []
         cfg = Path(interp).parent.parent / "pyvenv.cfg"  # a venv's base interpreter
-        if cfg.is_file():
+        if os.path.isfile(cfg):
             m = re.search(r"^home\s*=\s*(.+)$", cfg.read_text(errors="replace"), re.MULTILINE)
             if m:
                 found.append(m[1].strip())
@@ -201,12 +201,17 @@ def _python_dir(p: Path) -> bool:
     from. A doctored interpreter could name ~/.ssh to have it shown to later
     runs; anything that doesn't look like Python's is dropped, and so is
     home itself or anything above it."""
-    if not p.is_dir():
-        return p.suffix == ".zip" and p.is_file()  # zipped stdlib on sys.path
+    if not os.path.isdir(p):
+        return p.suffix == ".zip" and os.path.isfile(p)  # zipped stdlib on sys.path
     home = Path.home().resolve()
     if p == home or p in home.parents or p == Path("/"):
         return False
-    return bool(_PYTHONISH.search(str(p))) or any((p / "lib").glob("python3*"))
+    if _PYTHONISH.search(str(p)):
+        return True
+    try:
+        return any((p / "lib").glob("python3*"))
+    except OSError:
+        return False
 
 
 def toolchain_folders(steps: list[list[str]]) -> tuple[list[Path], list[Path]]:
@@ -225,7 +230,7 @@ def toolchain_folders(steps: list[list[str]]) -> tuple[list[Path], list[Path]]:
             # Flutter takes a lock in, and updates, its own cache on every
             # command; it won't start without write access to it.
             for root in sandbox.tool_root(exe):
-                if (root / "bin" / "cache").is_dir():
+                if os.path.isdir(root / "bin" / "cache"):
                     writable.append((root / "bin" / "cache").resolve())
     reads += sandbox.home_dir("CARGO_HOME", ".cargo") + sandbox.home_dir("RUSTUP_HOME", ".rustup")
     reads += sandbox.home_dir("PUB_CACHE", ".pub-cache")

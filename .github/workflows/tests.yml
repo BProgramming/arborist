@@ -37,15 +37,21 @@ jobs:
         run: |
           python --version; node --version; rustc --version; cargo --version; dart --version
 
-      # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor, which
-      # would make the run-isolation tests skip. Allow them so CI tests the
-      # sandbox for real, then fail early if it still doesn't work.
-      - name: Allow unprivileged user namespaces
+      # Runs are sandboxed with bubblewrap. Ubuntu ships an AppArmor profile
+      # that lets bwrap create namespaces; check it works before testing.
+      - name: Install bubblewrap
         run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          unshare -rn true
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          bwrap --version
+          bwrap --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
+                --symlink usr/lib64 /lib64 --proc /proc --dev /dev --unshare-all /usr/bin/true
 
+      # ARBORIST_REQUIRE_SANDBOX: the sandbox and audit tests fail instead of
+      # skipping if the sandbox doesn't work here.
       - name: Run tests
+        env:
+          ARBORIST_REQUIRE_SANDBOX: "1"
         run: python -m pytest -v --junitxml=pytest-results.xml
 
       # One annotation per failing test, so failures show on the PR page

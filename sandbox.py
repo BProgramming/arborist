@@ -119,9 +119,9 @@ def _base_args() -> list[str]:
     args += ["--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc"]
     for d in ("bin", "sbin", "lib", "lib32", "lib64", "libx32"):
         top = Path("/") / d
-        if top.is_symlink():
+        if os.path.islink(top):
             args += ["--symlink", os.readlink(top), str(top)]
-        elif top.is_dir():
+        elif os.path.isdir(top):
             args += ["--ro-bind", str(top), str(top)]
     args += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/var",
              "--tmpfs", "/var/tmp"]
@@ -200,7 +200,7 @@ def _display_args(env: dict[str, str]) -> list[str]:
     env.pop("DISPLAY", None)
     env.update({"XDG_RUNTIME_DIR": runtime, "WAYLAND_DISPLAY": name,
                 "XDG_SESSION_TYPE": "wayland"})
-    return ["--dir", runtime, "--perms", "0700", "--ro-bind", str(sock), str(sock)]
+    return ["--perms", "0700", "--dir", runtime, "--ro-bind", str(sock), str(sock)]
 
 
 def _gpu_args() -> list[str]:
@@ -218,9 +218,11 @@ def _credential_files(dirs: list[Path]) -> list[Path]:
     found = []
     for d in dirs:
         for name in CREDENTIAL_NAMES:
-            for f in (d / name, *d.glob(f"*/{name}")):
-                if f.is_file():
-                    found.append(f)
+            try:
+                candidates = [d / name, *d.glob(f"*/{name}")]
+            except OSError:
+                continue
+            found += [f for f in candidates if os.path.isfile(f)]
     return _dedupe(found)
 
 
@@ -245,11 +247,11 @@ def protected_dirs(workspace: Path, cwd: Path, steps: list[list[str]]) -> list[P
         found.update(d / n for n in PROTECTED_NAMES)
     for step in steps:
         exe = Path(step[0])
-        if exe.is_absolute() and (exe.parent.parent / "pyvenv.cfg").is_file():
+        if exe.is_absolute() and os.path.isfile(exe.parent.parent / "pyvenv.cfg"):
             found.add(exe.parent.parent)
     if os.environ.get("VIRTUAL_ENV"):
         found.add(Path(os.environ["VIRTUAL_ENV"]))
-    return sorted(p.resolve() for p in found if p.is_dir())
+    return sorted(p.resolve() for p in found if os.path.isdir(p))
 
 
 def tool_root(exe: str | os.PathLike | None) -> list[Path]:
@@ -269,7 +271,7 @@ def tool_root(exe: str | os.PathLike | None) -> list[Path]:
     hops, p = [], Path(os.path.abspath(exe))
     for _ in range(40):
         hops.append(p)
-        if not p.is_symlink():
+        if not os.path.islink(p):
             break
         p = Path(os.path.normpath(p.parent / os.readlink(p)))
     hops.append(Path(os.path.realpath(exe)))
@@ -286,4 +288,4 @@ def tool_root(exe: str | os.PathLike | None) -> list[Path]:
 def home_dir(env_var: str, default: str) -> list[Path]:
     """A toolchain's home (CARGO_HOME, RUSTUP_HOME, PUB_CACHE) if it exists."""
     p = Path(os.environ.get(env_var) or Path.home() / default)
-    return [p.resolve()] if p.is_dir() else []
+    return [p.resolve()] if os.path.isdir(p) else []

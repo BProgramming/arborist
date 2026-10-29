@@ -149,3 +149,43 @@ def test_mark_dotted_keeps_the_text(monkeypatch):
     assert chat.marked("x.aliyuncs.com") in out and chat.marked("foo.py") in out
     monkeypatch.setattr(chat, "USE_COLOR", False)
     assert chat.mark_dotted(line, chat.green) == line
+
+
+@sandboxed
+def test_run_display_really_runs(ws_root, tmp_path, make_toolbox, monkeypatch):
+    """With a stand-in Wayland socket (and a D-Bus one beside it): the run
+    reaches the first and nothing else in XDG_RUNTIME_DIR."""
+    import socket as sk
+    runtime = tmp_path / "run"
+    runtime.mkdir(mode=0o700)
+    socks = []
+    for name in ("wayland-0", "bus"):
+        s = sk.socket(sk.AF_UNIX)
+        s.bind(str(runtime / name))
+        s.listen()
+        socks.append(s)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":0")
+    try:
+        write(ws_root, "wl.py",
+              "import os, socket\n"
+              "rt = os.environ['XDG_RUNTIME_DIR']\n"
+              "print('LIST', sorted(os.listdir(rt)), 'X11', os.environ.get('DISPLAY'))\n"
+              "for n in ('wayland-0', 'bus'):\n"
+              "    s = socket.socket(socket.AF_UNIX)\n"
+              "    try:\n        s.connect(os.path.join(rt, n)); print(n, 'reached')\n"
+              "    except OSError:\n        print(n, 'blocked')\n")
+        out = run(make_toolbox(run_sandbox=True, run_display=True), "wl.py").content
+        assert "LIST ['wayland-0'] X11 None" in out
+        assert "wayland-0 reached" in out and "bus blocked" in out
+    finally:
+        for s in socks:
+            s.close()
+
+
+@sandboxed
+def test_gpu_arguments_are_accepted(ws_root, make_toolbox):
+    """CI has no GPU, but bwrap must still accept the GPU binds (all -try)."""
+    write(ws_root, "g.py", "print('GPU-RUN-OK')\n")
+    assert "GPU-RUN-OK" in run(make_toolbox(run_sandbox=True, run_gpu=True), "g.py").content

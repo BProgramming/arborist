@@ -15,13 +15,14 @@ to fiddle with your own version, see [License](#license).
 
 - Linux (the launcher is bash and the install hints are for Debian/Ubuntu/Mint)
 - Python 3.11+ (standard library only; `pytest` for the tests)
+- `bubblewrap` (`bwrap`) to run code the model writes
 - `git`, `cmake`, `curl`, a C++ compiler; `ninja` optional but faster
 - A GPU backend: **Vulkan** (default; `libvulkan-dev glslc spirv-headers
   mesa-vulkan-drivers`) or **ROCm/HIP**. CPU works, slowly.
 - Disk for the build plus the model (~10 GB for the default)
 
 ```sh
-sudo apt install build-essential cmake ninja-build git curl \
+sudo apt install build-essential cmake ninja-build git curl bubblewrap \
   libvulkan-dev glslc spirv-headers mesa-vulkan-drivers
 ```
 
@@ -154,10 +155,14 @@ first time, and renamed `memory.md.migrated`.
 | `/undo [ID]` | restore the workspace's files from before the model's last change (or checkpoint `ID`); previews and asks first |
 | `/checkpoints` | list workspace checkpoints, newest first |
 | `/compact` | shrink the conversation now: stub old tool output, then summarise older turns |
+| `/diff [-f] [PATH…]` | files changed since this session started, in the workspace or under `PATH` (`-f`/`--full`: the whole diff) |
+| `/config` | open `.config/config` in nano; `[tools]` changes apply right away, the rest after a restart |
 
 `"""` on its own line starts and ends a multi-line message. Ctrl-C stops the
 current reply, tool or run. A pasted path like `/etc/hosts` is sent as text,
-not treated as a command; `//help me` sends the literal `/help me`.
+not treated as a command; `//help me` sends the literal `/help me`. Commands
+are handled by arborist and never reach the model. Arguments split like a
+shell's, so quote ones with spaces: `/file "my notes.md"`.
 
 ## What the model can do
 
@@ -195,19 +200,36 @@ prompts are the main safety mechanism, so read them. Specifically:
   files, but `read_file` still opens one asked for by name. **Don't start
   arborist from your home directory or any folder above secrets.** It warns
   if the workspace is your home directory, and refuses `/`.
-- **Running code is only partly sandboxed.** `run_file` and `run_tests` run
-  under `unshare -rmn` with no network (loopback only), a minimal environment
-  so API keys in your shell don't reach them, and your home directory
-  read-only apart from the workspace. In the workspace, `.git`, virtualenvs
-  and `node_modules` are read-only too, so a run can't plant a git hook or
-  poison an environment you use yourself (`run_sandbox`, `run_writable`,
-  `run_env_keep` and `run_display` in `[tools]`). The code can still read
-  anything your account can, change other files in the workspace, write to
-  `/tmp`, and talk to local Unix sockets such as Docker's. Every run asks first and shows the command; look at what
-  you're approving. Edit prompts highlight dotted names (`file.py`,
-  `some.host.com`) and list any that are in diff lines not shown.
-  `run_tests` runs whatever the project's test setup runs (`conftest.py`,
-  `npm test` scripts and so on).
+- **Code the model writes runs in a bubblewrap sandbox.** `run_file`,
+  `run_tests` and the dependency checks before them run under `bwrap`, which
+  must be installed (package `bubblewrap`); without it nothing runs. Inside,
+  a run sees `/usr`, `/etc` and the toolchain folders it needs (read-only,
+  with credential files in them blanked), the workspace (writable), an empty
+  throwaway home directory, and a fresh `/tmp`. It has no network (loopback
+  only, its own), can't reach local sockets (Docker, D-Bus, your desktop,
+  the llama-server), can't read anything else of yours (`~/.ssh`, other
+  projects, arborist's memory), can't see other processes, and can't create
+  namespaces of its own. In the workspace, `.git`, virtualenvs and
+  `node_modules` are read-only, so a run can't plant a git hook or poison an
+  environment you use yourself. Dependency checks get a read-only workspace.
+  Every run asks first and lists any folder outside the workspace it can
+  write; afterwards arborist lists every file it added, changed or deleted
+  (by ctime, so resetting a timestamp doesn't hide an edit). The openings
+  are all off by default and named in `[tools]`: `run_writable`,
+  `run_env_keep`, `run_display` (your Wayland socket only; X11 isn't
+  offered) and `run_gpu`. `run_sandbox = false` turns it all off, and every
+  run prompt then says so in red. The model can't edit anything in `.git`,
+  and arborist's own git calls ignore a repo's `core.fsmonitor`, which could
+  otherwise run a command.
+- **Nothing on screen can be disguised.** Model replies, program output, file
+  contents in diffs, file names and URLs pass through a filter that shows
+  any terminal control sequence as visible text (`␛[2K`), so nothing can
+  erase or redraw a prompt, hide text, or copy to your clipboard (OSC 52).
+  Bidirectional overrides ("Trojan Source") show as `<U+202E>`. Edit prompts
+  highlight dotted names (`file.py`, `some.host.com`); a diff too long to
+  show at once must be viewed in full before `y` is accepted; edits applied
+  without asking (`auto`, or `[a]ll`) are still printed in full; saved
+  memories are shown in full.
 - **Every web request the model chooses asks first.** The prompt shows the
   full URL, so you can see anything tucked into it (a model that has read a
   secret could otherwise send it out inside a query string). Approval covers
@@ -245,8 +267,21 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-Tests for missing toolchains (Rust, Dart, Node) skip themselves. CI runs them
-on Python 3.11 and 3.13, plus `shellcheck` on the launcher.
+Tests for missing toolchains (Rust, Dart, Node) skip themselves. Sandbox tests
+skip if bwrap can't run, unless `ARBORIST_REQUIRE_SANDBOX=1` is set; CI sets it,
+so they never skip there. `tests/test_audit.py` holds the two security audits:
+nothing leaves without your approval or a config option, and nothing changes
+on disk without being shown to you. CI runs everything on Python 3.11 and 3.13,
+plus `shellcheck` on the launcher.
+
+For what CI can't check (your distro's bwrap, your toolchains, your Wayland
+session, GPU, D-Bus and Docker sockets, a running llama-server, your real
+home folder):
+
+```sh
+python3 scripts/local-checks.py           # checks, then the test suite
+python3 scripts/local-checks.py --window  # also opens a pygame window via Wayland
+```
 
 ## License
 
