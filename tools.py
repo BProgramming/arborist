@@ -611,6 +611,15 @@ class Toolbox:
             # .git/config and hooks hold commands that git runs (arborist's own
             # git calls included), outside any sandbox and without asking.
             raise ToolError(f"{rel} is inside .git; the model can't change git's files")
+        owner = sandbox.protected_owner(p, self.ws.root)
+        if owner is not None:
+            # The same folders runs see read-only: a .pth file or an edited
+            # package runs whenever you use that environment, and a one-line
+            # .pth doesn't look dangerous in a diff.
+            raise ToolError(f"{rel} is inside {self.ws.rel(owner)}, an installed environment "
+                            "(virtualenv or node_modules); the model can't change it. Change "
+                            "the project's dependency files instead, and tell the user what "
+                            "to install.")
 
     def tool_edit_file(self, path: str, old_string: str, new_string: str,
                        replace_all: bool = False) -> str:
@@ -715,11 +724,14 @@ class Toolbox:
         writable = [build] + list(plan.writable)
         if not probe:
             writable += [Path(os.path.expanduser(w)).resolve() for w in self.limits.run_writable]
+        # Probes see the whole workspace read-only, so they skip the walk
+        # that finds the folders to protect (it runs once per probe).
+        protect = [] if probe else sandbox.protected_dirs(
+            self.ws.root, Path(plan.cwd), plan.steps, skip=self.ws.hidden)
         return sandbox.Spec(
             workspace=self.ws.root, cwd=Path(plan.cwd),
             reads=list(plan.reads), writable=writable,
-            protect=sandbox.protected_dirs(self.ws.root, Path(plan.cwd), plan.steps)
-            + self.ws.inside(self.ws.readonly),
+            protect=protect + self.ws.inside(self.ws.readonly),
             hide=self.ws.inside(self.ws.hidden),
             workspace_writable=not probe,
             display=self.limits.run_display and not probe,
@@ -831,7 +843,13 @@ class Toolbox:
         if not found:
             return outcome, "Files changed by the run: none\n"
         listing = "\n".join(changes.format_changes(found, limit=20))
-        return outcome, f"Files changed by the run:\n{listing}\n"
+        text = f"Files changed by the run:\n{listing}\n"
+        risky = changes.runs_later(found)
+        if risky:
+            text += (changes.RUNS_LATER_WARNING + "\n"
+                     + "\n".join(changes.describe_runs_later(risky)) + "\n"
+                     "Tell the user about these files.\n")
+        return outcome, text
 
     # run_tests ------------------------------------------------------------
 
