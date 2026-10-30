@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+import changes
 import chat
 import runners
 import sandbox
@@ -404,6 +405,83 @@ def test_runs_cannot_write_outside_the_workspace(ws_root, tmp_path, make_toolbox
     # Home is a throwaway copy: the write "works" and then disappears.
     run(tb, "rc.py")
     assert (fake_home / ".bashrc").read_text() == "# original\n"
+
+
+@sandboxed
+def test_runs_cannot_write_nested_repos_or_venvs(ws_root, make_toolbox):
+    """The same protection at any depth: a repo cloned into a subfolder, a
+    venv with an unusual name, a submodule's .git pointer file."""
+    (ws_root / "vendor/lib/.git/hooks").mkdir(parents=True)
+    (ws_root / "tools/env").mkdir(parents=True)
+    (ws_root / "tools/env/pyvenv.cfg").write_text("home = /usr/bin\n")
+    (ws_root / "sub").mkdir()
+    (ws_root / "sub/.git").write_text("gitdir: ../.git/modules/sub\n")
+    (ws_root / "web/node_modules").mkdir(parents=True)
+    targets = [ws_root / "vendor/lib/.git/hooks/pre-commit", ws_root / "tools/env/evil.pth",
+               ws_root / "sub/.git", ws_root / "web/node_modules/x.js"]
+    write(ws_root, "w.py",
+          f"for p in {[str(t) for t in targets]!r}:\n"
+          "    try:\n        open(p, 'a').write('x'); print('WROTE', p)\n"
+          "    except OSError:\n        print('blocked', p)\n")
+    out = run(make_toolbox(run_sandbox=True), "w.py").content
+    assert "WROTE" not in out and out.count("blocked") == len(targets)
+
+
+@sandboxed
+def test_a_repo_the_run_creates_is_flagged(ws_root, make_toolbox):
+    """Existing repos are read-only, but nothing stops a run making a new one
+    and filling in its hooks. That's called out, by name, to you and the model."""
+    write(ws_root, "mk.py",
+          "import os\n"
+          "os.makedirs('fresh/.git/hooks')\n"
+          "open('fresh/.git/hooks/post-checkout', 'w').write('#!/bin/sh\\n')\n"
+          "open('fresh/.git/hooks/pre-commit.sample', 'w').write('')\n"
+          "open('fresh/.git/config', 'w').write('')\n")
+    seen: list = []
+    tb = make_toolbox(run_sandbox=True)
+    tb.on_changes = seen.append
+    out = run(tb, "mk.py").content
+    assert changes.RUNS_LATER_WARNING in out
+    # git's inert .sample hooks are counted but not named
+    assert "  fresh/.git/: 3 files, including config, hooks/post-checkout\n" in out
+    assert changes.runs_later(seen[0])
+
+
+def test_protected_dirs_finds_repos_and_venvs_at_any_depth(ws_root, tmp_path, monkeypatch):
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)  # would be added wherever it is
+    (ws_root / ".git").mkdir()
+    (ws_root / "a/b/.git").mkdir(parents=True)
+    (ws_root / "a/b/.git/nested/.git").mkdir(parents=True)  # inside a protected one: not listed
+    (ws_root / "wt").mkdir()
+    (ws_root / "wt/.git").write_text("gitdir: /elsewhere\n")
+    (ws_root / "py/myenv").mkdir(parents=True)
+    (ws_root / "py/myenv/pyvenv.cfg").write_text("")
+    (ws_root / "js/node_modules/dep/node_modules").mkdir(parents=True)
+    (ws_root / "secret/.git").mkdir(parents=True)
+    outside = tmp_path / "outside-repo"
+    (outside / ".git").mkdir(parents=True)
+    (ws_root / "linked").symlink_to(outside)
+    got = sandbox.protected_dirs(ws_root, ws_root / "py", [], skip=[ws_root / "secret"])
+    rel = sorted(p.relative_to(ws_root.resolve()).as_posix() for p in got)
+    assert rel == [".git", "a/b/.git", "js/node_modules", "py/myenv", "wt/.git"]
+
+
+def test_runs_later_names_what_executes():
+    found = [changes.Change("A", f"r/.git/{n}") for n in
+             ("HEAD", "config", "hooks/pre-push", "hooks/update.sample", "objects/ab/cd")]
+    found += [changes.Change("A", "env/pyvenv.cfg"),
+              changes.Change("M", "env/lib/python3.13/site-packages/x.pth"),
+              changes.Change("A", "sub/.git"),
+              changes.Change("D", "old/.git/config"),  # a deletion can't run anything
+              changes.Change("A", "src/app.py")]
+    risky = changes.runs_later(found)
+    assert {c.path for c in risky} == {c.path for c in found[:8]}
+    assert changes.describe_runs_later(risky) == [
+        "  env/: 1 file, including pyvenv.cfg",
+        "  env/lib/python3.13/site-packages/: 1 file, including x.pth",
+        "  r/.git/: 5 files, including config, hooks/pre-push",
+        "  sub/.git (a file pointing git at another folder)",
+    ]
 
 
 def test_dependency_checks_cannot_write_the_workspace(ws_root):

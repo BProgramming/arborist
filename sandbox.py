@@ -10,9 +10,10 @@ wrap(). Inside, the process sees:
     but the writes vanish when the run ends
   - the toolchain folders the run needs (RunPlan.reads), read-only, with
     credential files in them hidden
-  - the workspace, writable, except .git, virtualenvs and node_modules, which
-    are read-only (git hooks and .pth files would otherwise run later, outside
-    the sandbox)
+  - the workspace, writable, except every .git, virtualenv and node_modules
+    in it, at any depth, which are read-only (git hooks and .pth files would
+    otherwise run later, outside the sandbox). A run can still create a new
+    repo or venv; changes.runs_later() flags that after the run.
   - the build directory, plus tools.run_writable and RunPlan.writable, writable
   - a fresh /tmp, /proc and minimal /dev
   - no network but loopback, no further user namespaces, its own process,
@@ -243,20 +244,49 @@ class SandboxError(Exception):
     pass
 
 
-def protected_dirs(workspace: Path, cwd: Path, steps: list[list[str]]) -> list[Path]:
-    """Folders in the workspace that stay read-only: PROTECTED_NAMES at the
-    workspace root and the run's folder, plus the virtualenv of any
-    interpreter a step uses."""
-    found = set()
-    for d in {workspace.resolve(), cwd.resolve()}:
-        found.update(d / n for n in PROTECTED_NAMES)
+def protected_dirs(workspace: Path, cwd: Path, steps: list[list[str]],
+                   skip: list[Path] = ()) -> list[Path]:
+    """Paths in the workspace that stay read-only, at any depth: every .git
+    (the folder, or the pointer file a worktree or submodule has), every folder
+    in PROTECTED_NAMES, and every virtualenv (any folder with a pyvenv.cfg,
+    whatever it's called). Plus the virtualenv of any interpreter a step uses.
+    A repo or venv nested in a subfolder runs hooks and .pth files just like
+    the top-level one, the next time you use it. `skip`: folders not to look
+    in (arborist's hidden data)."""
+    ws = workspace.resolve()
+    found = set(_find_protected(ws, {Path(s).resolve() for s in skip}))
+    run_dir = cwd.resolve()
+    if not _within(run_dir, ws):  # inside the workspace, the walk covered it
+        found.update(run_dir / n for n in PROTECTED_NAMES)
     for step in steps:
         exe = Path(step[0])
         if exe.is_absolute() and os.path.isfile(exe.parent.parent / "pyvenv.cfg"):
             found.add(exe.parent.parent)
     if os.environ.get("VIRTUAL_ENV"):
         found.add(Path(os.environ["VIRTUAL_ENV"]))
-    return sorted(p.resolve() for p in found if os.path.isdir(p))
+    return sorted({p.resolve() for p in found if os.path.exists(p)})
+
+
+def _find_protected(root: Path, skip: set[Path]) -> list[Path]:
+    """The walk behind protected_dirs. Symlinks aren't followed or protected:
+    a bind on one would land on whatever it points at. A protected folder is
+    read-only as a whole, so the walk doesn't look inside it."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        if ".git" in filenames and not os.path.islink(here / ".git"):
+            out.append(here / ".git")  # "gitdir: ..." pointer; a run could repoint it
+        kept = []
+        for d in dirnames:
+            p = here / d
+            if p in skip or os.path.islink(p):
+                continue
+            if d in PROTECTED_NAMES or os.path.isfile(p / "pyvenv.cfg"):
+                out.append(p)
+                continue
+            kept.append(d)
+        dirnames[:] = kept
+    return out
 
 
 def tool_root(exe: str | os.PathLike | None) -> list[Path]:

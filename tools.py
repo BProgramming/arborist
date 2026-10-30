@@ -715,11 +715,14 @@ class Toolbox:
         writable = [build] + list(plan.writable)
         if not probe:
             writable += [Path(os.path.expanduser(w)).resolve() for w in self.limits.run_writable]
+        # Probes see the whole workspace read-only, so they skip the walk
+        # that finds the folders to protect (it runs once per probe).
+        protect = [] if probe else sandbox.protected_dirs(
+            self.ws.root, Path(plan.cwd), plan.steps, skip=self.ws.hidden)
         return sandbox.Spec(
             workspace=self.ws.root, cwd=Path(plan.cwd),
             reads=list(plan.reads), writable=writable,
-            protect=sandbox.protected_dirs(self.ws.root, Path(plan.cwd), plan.steps)
-            + self.ws.inside(self.ws.readonly),
+            protect=protect + self.ws.inside(self.ws.readonly),
             hide=self.ws.inside(self.ws.hidden),
             workspace_writable=not probe,
             display=self.limits.run_display and not probe,
@@ -831,7 +834,13 @@ class Toolbox:
         if not found:
             return outcome, "Files changed by the run: none\n"
         listing = "\n".join(changes.format_changes(found, limit=20))
-        return outcome, f"Files changed by the run:\n{listing}\n"
+        text = f"Files changed by the run:\n{listing}\n"
+        risky = changes.runs_later(found)
+        if risky:
+            text += (changes.RUNS_LATER_WARNING + "\n"
+                     + "\n".join(changes.describe_runs_later(risky)) + "\n"
+                     "Tell the user about these files.\n")
+        return outcome, text
 
     # run_tests ------------------------------------------------------------
 
