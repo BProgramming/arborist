@@ -611,6 +611,15 @@ class Toolbox:
             # .git/config and hooks hold commands that git runs (arborist's own
             # git calls included), outside any sandbox and without asking.
             raise ToolError(f"{rel} is inside .git; the model can't change git's files")
+        owner = sandbox.protected_owner(p, self.ws.root)
+        if owner is not None:
+            # The same folders runs see read-only: a .pth file or an edited
+            # package runs whenever you use that environment, and a one-line
+            # .pth doesn't look dangerous in a diff.
+            raise ToolError(f"{rel} is inside {self.ws.rel(owner)}, an installed environment "
+                            "(virtualenv or node_modules); the model can't change it. Change "
+                            "the project's dependency files instead, and tell the user what "
+                            "to install.")
 
     def tool_edit_file(self, path: str, old_string: str, new_string: str,
                        replace_all: bool = False) -> str:

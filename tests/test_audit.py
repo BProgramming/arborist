@@ -251,6 +251,33 @@ def test_model_cannot_edit_git_files(ws_root, make_toolbox, approver):
     assert approver.change_requests == [] and (ws_root / ".git/config").read_text() == "[core]\n"
 
 
+def test_model_cannot_edit_installed_environments(ws_root, make_toolbox, approver):
+    """What runs see read-only, edits can't change either: a .pth file runs on
+    every Python start in that venv, and one line of it looks harmless in a diff."""
+    (ws_root / "tools/env/lib/python3.13/site-packages").mkdir(parents=True)
+    (ws_root / "tools/env/pyvenv.cfg").write_text("home = /usr/bin\n")
+    (ws_root / "web/node_modules/dep").mkdir(parents=True)
+    write(ws_root, "web/node_modules/dep/index.js", "module.exports = 1;\n")
+    tb = make_toolbox(approver)
+    for path in ("tools/env/lib/python3.13/site-packages/evil.pth", "tools/env/pyvenv.cfg",
+                 "web/node_modules/dep/index.js", ".venv/x.py"):
+        out = tb.call("write_file", {"path": path, "content": "x"}).content
+        assert out.startswith("error:") and "installed environment" in out, (path, out)
+    assert approver.change_requests == []
+    # Next to a venv, not in it, is ordinary project code.
+    assert not tb.call("write_file", {"path": "tools/run.py", "content": "x"}).content.startswith("error:")
+
+
+def test_protected_owner_matches_the_run_walk(ws_root):
+    (ws_root / "a/venv2").mkdir(parents=True)
+    (ws_root / "a/venv2/pyvenv.cfg").write_text("")
+    ws = ws_root.resolve()
+    assert sandbox.protected_owner(ws / "a/venv2/lib/x.pth", ws) == ws / "a/venv2"
+    assert sandbox.protected_owner(ws / "a/b/node_modules/y.js", ws) == ws / "a/b/node_modules"
+    assert sandbox.protected_owner(ws / "a/app.py", ws) is None
+    assert sandbox.protected_owner(ws, ws) is None
+
+
 # --- web ----------------------------------------------------------------
 
 def test_web_visit_asks_before_any_lookup(make_toolbox, monkeypatch):

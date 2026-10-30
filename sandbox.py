@@ -267,6 +267,25 @@ def protected_dirs(workspace: Path, cwd: Path, steps: list[list[str]],
     return sorted({p.resolve() for p in found if os.path.exists(p)})
 
 
+def _is_protected(p: Path) -> bool:
+    """The one definition, shared by runs (protected_dirs) and the model's
+    edits (protected_owner): a .git, a PROTECTED_NAMES folder, or a venv."""
+    return p.name in PROTECTED_NAMES or os.path.isfile(p / "pyvenv.cfg")
+
+
+def protected_owner(p: Path, workspace: Path) -> Path | None:
+    """The protected folder (or .git file) that `p` is, or is inside, within
+    the workspace; None if it's in none. Checks only p's own ancestors, so
+    it's cheap enough to run on every edit."""
+    ws = workspace.resolve()
+    d = p
+    while d != ws and _within(d, ws):
+        if _is_protected(d):
+            return d
+        d = d.parent
+    return None
+
+
 def _find_protected(root: Path, skip: set[Path]) -> list[Path]:
     """The walk behind protected_dirs. Symlinks aren't followed or protected:
     a bind on one would land on whatever it points at. A protected folder is
@@ -281,7 +300,7 @@ def _find_protected(root: Path, skip: set[Path]) -> list[Path]:
             p = here / d
             if p in skip or os.path.islink(p):
                 continue
-            if d in PROTECTED_NAMES or os.path.isfile(p / "pyvenv.cfg"):
+            if _is_protected(p):
                 out.append(p)
                 continue
             kept.append(d)
