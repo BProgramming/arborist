@@ -10,6 +10,11 @@
 #   ./arborist.sh rebuild  rebuild from the current source
 #   ./arborist.sh status   show what's installed and whether a server is up
 #   ./arborist.sh stop     stop a server this script left running
+#   ./arborist.sh task run --task FILE [--mode auto|interactive]
+#                          delegate one task: the model works on a copy of the
+#                          project and writes a report and a patch for review
+#                          (starts the server if needed and leaves it running)
+#   ./arborist.sh task list | clean ID… | clean --all
 #
 # Settings, including which model, live in .config/config (or point
 # ARBORIST_CONFIG at another file). Inference runs in C++ (llama.cpp, or the
@@ -306,6 +311,17 @@ cmd_chat() {
   trap 'exit 130' INT
 }
 
+cmd_task() {
+  # Only `task run` needs the model; list and clean just read the task folders.
+  if [[ "${1:-}" == run ]]; then
+    setup >&2
+    start_server >&2
+    # Left running on purpose: tasks tend to come in batches, and loading the
+    # model takes a while. `./arborist.sh stop` frees the GPU.
+  fi
+  exec "$PY" "$HERE/task.py" "$@"
+}
+
 cmd_server() {
   setup
   server_up && die "A server is already running at $CFG_BASE_URL."
@@ -351,8 +367,9 @@ main() {
     update)  check_deps; fetch_source 1; build 1 ;;
     rebuild) check_deps; fetch_source 0; build 1 ;;
     status)  cmd_status ;;
+    task)    cmd_task "$@" ;;
     stop)    stop_server; info "Stopped" ;;
-    -h|--help|help) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+    -h|--help|help) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
     *) die "Unknown command: $1 (try --help)." ;;
   esac
 }

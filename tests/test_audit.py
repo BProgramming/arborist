@@ -7,7 +7,9 @@
 
 2. EDITS: no file changes without being shown to you. Every edit is shown
    in full (and asked about, unless you chose auto), every run's changes are
-   listed afterwards, and nothing on screen can be disguised.
+   listed afterwards, and nothing on screen can be disguised. A delegated
+   task (task.py) changes only its own copy of the project; its work reaches
+   yours as a patch, applied after review.
 
 Each test names the channel it covers. CI runs these with
 ARBORIST_REQUIRE_SANDBOX=1, so a machine that can't sandbox fails instead of
@@ -754,3 +756,34 @@ def test_terminal_run_prompt_can_show_the_file(monkeypatch, capsys):
                                             view="import os\nos.remove('x')\n")
     out = capsys.readouterr().out
     assert d.approved and "os.remove('x')" in out and "CHANGED" in out
+
+
+def test_a_delegated_task_changes_only_its_copy(ws_root, load_toml, monkeypatch):
+    """EDITS: an auto-mode task edits without asking, but only in its own copy
+    of the project; each edit is logged, and reaches the real project only as
+    a patch someone applies after reviewing it."""
+    import subprocess
+
+    import task
+    from test_agent import text_reply, tool_reply
+    from test_task import FakeClient
+
+    monkeypatch.setattr(sandbox, "status", lambda: (True, ""))
+    for args in (["init", "-q"], ["config", "user.email", "t@example.com"],
+                 ["config", "user.name", "t"]):
+        subprocess.run(["git", "-C", str(ws_root), *args], check=True)
+    write(ws_root, "app.py", "x = 1\n")
+    subprocess.run(["git", "-C", str(ws_root), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(ws_root), "commit", "-qm", "init"], check=True)
+    client = FakeClient(tool_reply(("read_file", {"path": "app.py"})),
+                        tool_reply(("edit_file", {"path": "app.py", "old_string": "x = 1",
+                                                  "new_string": "x = 2"})),
+                        tool_reply(("write_file", {"path": "new.py", "content": "y = 1\n"})),
+                        text_reply("RESULT: DONE"))
+    report = task.run_task(load_toml(), ws_root, "change x", client=client)
+    assert (ws_root / "app.py").read_text() == "x = 1\n" and not (ws_root / "new.py").exists()
+    assert {f["path"] for f in report["files"]} == {"app.py", "new.py"}
+    patch = Path(report["patch"]).read_text()
+    assert "+x = 2" in patch and "+y = 1" in patch
+    transcript = Path(report["transcript"]).read_text()
+    assert "edit_file" in transcript and "write_file" in transcript
