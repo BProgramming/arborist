@@ -159,7 +159,10 @@ def make_copy(source: Path, dest: Path) -> Copy:
         notes.append("submodules weren't copied")
     if (repo / "node_modules").is_dir():
         notes.append("node_modules wasn't copied (it's ignored), so JS code needing packages won't run")
-    return Copy(repo, dest, dest / source.resolve().relative_to(repo), base, notes)
+    # An empty folder isn't in git, so the copy may not have the one you started in.
+    workspace = dest / source.resolve().relative_to(repo)
+    workspace.mkdir(parents=True, exist_ok=True)
+    return Copy(repo, dest, workspace, base, notes)
 
 
 def project_venv(source: Path, repo: Path) -> Path | None:

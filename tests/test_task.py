@@ -94,6 +94,12 @@ def test_copy_of_a_subfolder_works_in_the_same_subfolder(repo, tmp_path):
     assert c.workspace == c.work / "pkg"
 
 
+def test_copy_of_an_empty_subfolder_still_has_it(repo, tmp_path):
+    (repo / "empty").mkdir()  # git doesn't track empty folders
+    c = task.make_copy(repo / "empty", tmp_path / "copy")
+    assert c.workspace.is_dir()
+
+
 def test_copy_needs_a_git_repository_with_a_commit(ws_root, tmp_path):
     with pytest.raises(task.TaskError, match="isn't in a git repository"):
         task.make_copy(ws_root, tmp_path / "copy")
