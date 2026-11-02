@@ -94,6 +94,12 @@ def test_copy_of_a_subfolder_works_in_the_same_subfolder(repo, tmp_path):
     assert c.workspace == c.work / "pkg"
 
 
+def test_copy_of_an_empty_subfolder_still_has_it(repo, tmp_path):
+    (repo / "empty").mkdir()  # git doesn't track empty folders
+    c = task.make_copy(repo / "empty", tmp_path / "copy")
+    assert c.workspace.is_dir()
+
+
 def test_copy_needs_a_git_repository_with_a_commit(ws_root, tmp_path):
     with pytest.raises(task.TaskError, match="isn't in a git repository"):
         task.make_copy(ws_root, tmp_path / "copy")
@@ -234,3 +240,44 @@ def test_list_and_clean(repo, cfg, no_sandbox_check):
         task.clean_tasks(c, ["../../etc"], everything=False)
     assert task.clean_tasks(c, [report["id"]], everything=False) == [report["id"]]
     assert task.list_tasks(c) == []
+
+
+# ---------------------------------------------------------------- progress ---
+
+def test_progress_is_recorded_and_status_reports_it(repo, cfg, no_sandbox_check):
+    c = cfg()
+    client = FakeClient(
+        tool_reply(("read_file", {"path": "app.py"})),
+        text_reply(REPORT),
+    )
+    report = task.run_task(c, repo, "Read app.py.", client=client)
+    p = json.loads((Path(report["task_dir"]) / "progress.json").read_text())
+    assert p["state"] == "done" and p["steps"] == 1 and p["turn"] == 1
+    assert p["last"].startswith("read_file")
+    out = task.task_status(c)
+    assert out.startswith(f"{report['id']}: done") and "report.json" in out
+    assert task.task_status(c, report["id"]) == out
+
+
+def test_status_while_running_and_after_the_process_died(repo, cfg, no_sandbox_check):
+    c = cfg()
+    d = task.tasks_dir(c) / "20990101-000000-x"
+    d.mkdir(parents=True)
+    prog = task.Progress(d, d.name, "auto")
+    prog.update(turn=1, steps=3, doing="run_tests(path=test_app.py)", tests=["failed"])
+    out = task.task_status(c, d.name, now=prog.data["updated"] + 5)
+    assert ": running," in out and "now: run_tests(path=test_app.py) (for 5s)" in out
+    assert "tests: failed" in out
+    assert task.list_tasks(c)[0]["status"] == "running"
+
+    prog.update(pid=2 ** 31 - 2)  # no such process
+    assert ": died," in task.task_status(c, d.name)
+    assert task.list_tasks(c)[0]["status"] == "died"
+
+
+def test_status_with_no_tasks_or_a_bad_id(cfg):
+    c = cfg()
+    with pytest.raises(task.TaskError):
+        task.task_status(c)
+    with pytest.raises(task.TaskError):
+        task.task_status(c, "../../etc")

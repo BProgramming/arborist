@@ -2,6 +2,7 @@
 """Delegated tasks: hand the model one job, let it work on its own, review the result.
 
     ./arborist.sh task run --task task.md [--mode auto|interactive] [--workspace DIR]
+    ./arborist.sh task status [ID]
     ./arborist.sh task list
     ./arborist.sh task clean ID… | --all
 
@@ -159,7 +160,10 @@ def make_copy(source: Path, dest: Path) -> Copy:
         notes.append("submodules weren't copied")
     if (repo / "node_modules").is_dir():
         notes.append("node_modules wasn't copied (it's ignored), so JS code needing packages won't run")
-    return Copy(repo, dest, dest / source.resolve().relative_to(repo), base, notes)
+    # An empty folder isn't in git, so the copy may not have the one you started in.
+    workspace = dest / source.resolve().relative_to(repo)
+    workspace.mkdir(parents=True, exist_ok=True)
+    return Copy(repo, dest, workspace, base, notes)
 
 
 def project_venv(source: Path, repo: Path) -> Path | None:
@@ -232,12 +236,63 @@ def task_tools(cfg_tools: dict, mode: str) -> dict:
     return t
 
 
-class TaskUI(chat.TerminalUI):
-    """The chat's display, plus a note of every test result."""
+class Progress:
+    """progress.json in the task folder: what a running task is doing now.
 
-    def __init__(self, show_thinking: bool):
+    A task usually runs in the background, with nobody reading its output;
+    `task status` reads this file instead. Writes are atomic (temp file +
+    rename), so a reader never sees half a file."""
+
+    THROTTLE = 2.0  # seconds between writes while the model is only generating
+
+    def __init__(self, task_dir: Path, task_id: str, mode: str):
+        self.path = task_dir / "progress.json"
+        self.data = {"id": task_id, "mode": mode, "state": "running", "pid": os.getpid(),
+                     "started": time.time(), "turn": 0, "steps": 0, "tests": [],
+                     "doing": "setting up the copy", "last": None}
+        self._written = 0.0
+        self.write()
+
+    def update(self, throttle: bool = False, **fields) -> None:
+        self.data.update(fields)
+        if not throttle or time.monotonic() - self._written >= self.THROTTLE:
+            self.write()
+
+    def write(self) -> None:
+        self.data["updated"] = time.time()
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(self.data) + "\n", encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError:
+            pass  # progress is a convenience; never let it fail the task
+        self._written = time.monotonic()
+
+
+class TaskUI(chat.TerminalUI):
+    """The chat's display, plus a note of every test result, mirrored to
+    progress.json when there is one."""
+
+    def __init__(self, show_thinking: bool, progress: Progress | None = None):
         super().__init__(show_thinking)
         self.tests: list[str] = []  # "passed" / "failed" / "timed out", in order
+        self.progress = progress
+
+    def reasoning(self, text: str) -> None:
+        super().reasoning(text)
+        if self.progress and self.progress.data["doing"] != "thinking":
+            self.progress.update(doing="thinking")
+
+    def text(self, text: str) -> None:
+        super().text(text)
+        if self.progress and self.progress.data["doing"] != "writing a reply":
+            self.progress.update(doing="writing a reply")
+
+    def tool_call(self, name: str, arguments: str) -> None:
+        super().tool_call(name, arguments)
+        if self.progress:
+            self.progress.update(steps=self.progress.data["steps"] + 1,
+                                 doing=chat.describe_call(name, arguments))
 
     def tool_result(self, name: str, result: ToolResult) -> None:
         super().tool_result(name, result)
@@ -245,17 +300,27 @@ class TaskUI(chat.TerminalUI):
             m = re.match(r"Tests for .* (passed|failed|timed out)", result.content)
             if m:
                 self.tests.append(m[1])
+        if self.progress:
+            first = (result.content.splitlines() or [""])[0][:120]
+            self.progress.update(last=f"{name}: {first}", doing="waiting for the model",
+                                 tests=list(self.tests))
+
+    def notice(self, message: str) -> None:
+        super().notice(message)
+        if self.progress:
+            self.progress.update(last=message)
 
 
 class TaskChat(chat.Chat):
     """A chat session over the task's copy, with no memory tool."""
 
-    def __init__(self, cfg: dict, c: Copy, source: Path, mode: str, task_dir: Path):
+    def __init__(self, cfg: dict, c: Copy, source: Path, mode: str, task_dir: Path,
+                 progress: Progress | None = None):
         cfg = copy.deepcopy(cfg)
         cfg["tools"] = task_tools(cfg["tools"], mode)
         self.mode = mode
         super().__init__(cfg, c.workspace, tools_enabled=True)
-        self.ui = TaskUI(cfg["chat"]["show_thinking"])
+        self.ui = TaskUI(cfg["chat"]["show_thinking"], progress)
         self.run_changes: list[str] = []
         self.warnings: list[str] = []
         approver = AutoApprover(self.ui.notice) if mode == "auto" else chat.TerminalApprover()
@@ -336,6 +401,8 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
     task_dir = Path(cfg["derived"]["root"]) / "tasks" / task_id
     task_dir.mkdir(parents=True)
     (task_dir / "task.md").write_text(task_text, encoding="utf-8")
+    progress = Progress(task_dir, task_id, mode)
+    print(f"task {task_id}: started (check it with `./arborist.sh task status`)", flush=True)
     report: dict = {"id": task_id, "mode": mode, "status": "error", "task_dir": str(task_dir),
                     "source": str(source)}
     try:
@@ -343,6 +410,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
     except TaskError as e:
         report["error"] = str(e)
         _write_report(task_dir, report)
+        progress.update(state="error", doing=None, last=str(e))
         raise
     report.update(repo=str(c.repo), work=str(c.workspace), base=c.base, notes=list(c.notes))
     venv = project_venv(source, c.repo)
@@ -350,7 +418,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         os.environ["VIRTUAL_ENV"] = str(venv)
         report["notes"].append(f"runs use the project's virtualenv {venv}, read-only")
 
-    session = TaskChat(cfg, c, source, mode, task_dir)
+    session = TaskChat(cfg, c, source, mode, task_dir, progress)
     if client is not None:
         session.client = client
     if effort:
@@ -374,6 +442,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
     try:
         while True:
             turns += 1
+            progress.update(turn=turns, doing="waiting for the model")
             session.toolbox.begin_turn(f"task {task_id} turn {turns}")
             result = agent.run_turn(messages, session._body, session.client.stream_chat,
                                     session.agent_tools, session.ui, max_steps=t["max_steps"],
@@ -416,6 +485,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         signal.signal(signal.SIGALRM, old_alarm)
         signal.signal(signal.SIGINT, old_int)
 
+    progress.update(doing="collecting the changes")
     patch = task_dir / "changes.patch"
     try:
         files, stat = collect_changes(c, patch)
@@ -445,6 +515,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         logs=str(task_dir / "logs"),
     )
     _write_report(task_dir, report)
+    progress.update(state=status, doing=None, turn=turns, steps=steps, tests=list(tests))
     return report
 
 
@@ -458,6 +529,26 @@ def tasks_dir(cfg: dict) -> Path:
     return Path(cfg["derived"]["root"]) / "tasks"
 
 
+def _pid_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def read_progress(task_dir: Path) -> dict | None:
+    """The task's progress.json, with "state" corrected to "died" when it says
+    running but its process is gone (killed, or the machine restarted)."""
+    try:
+        p = json.loads((task_dir / "progress.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if p.get("state") == "running" and not _pid_alive(p.get("pid")):
+        p["state"] = "died"
+    return p
+
+
 def list_tasks(cfg: dict) -> list[dict]:
     out = []
     root = tasks_dir(cfg)
@@ -465,9 +556,50 @@ def list_tasks(cfg: dict) -> list[dict]:
         try:
             r = json.loads((d / "report.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            r = {"id": d.name, "status": "running or unfinished"}
+            p = read_progress(d) or {}
+            state = p.get("state")
+            r = {"id": d.name, "mode": p.get("mode", ""),
+                 "status": state if state in ("running", "died") else "unfinished"}
         out.append(r)
     return out
+
+
+def _ago(seconds: float) -> str:
+    s = max(0, int(seconds))
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def task_status(cfg: dict, task_id: str | None = None, now: float | None = None) -> str:
+    """One short block saying what a task (the newest by default) is doing."""
+    root = tasks_dir(cfg)
+    if task_id:
+        d = (root / task_id).resolve()
+        if d.parent != root.resolve() or not d.is_dir():
+            raise TaskError(f"no task {task_id!r} in {root}")
+    else:
+        dirs = sorted(root.iterdir() if root.is_dir() else [], reverse=True)
+        if not dirs:
+            raise TaskError("no tasks yet")
+        d = dirs[0]
+    now = time.time() if now is None else now
+    p = read_progress(d)
+    if p is None:
+        r = next((t for t in list_tasks(cfg) if t["id"] == d.name), {"status": "unknown"})
+        return f"{d.name}: {r['status']} (no progress recorded)"
+    state = p["state"]
+    elapsed = (p["updated"] if state != "running" else now) - p["started"]
+    tests = p.get("tests") or []
+    lines = [f"{p['id']}: {state}, {_ago(elapsed)}, turn {p.get('turn', 0)}, "
+             f"{p.get('steps', 0)} step(s), tests: {tests[-1] if tests else 'not run'}"]
+    if state == "running":
+        lines.append(f"  now: {p.get('doing') or '?'} (for {_ago(now - p['updated'])})")
+    if p.get("last"):
+        lines.append(f"  last: {p['last']}")
+    if state == "died":
+        lines.append("  the task's process is gone without writing a report")
+    elif state != "running":
+        lines.append(f"  report: {d / 'report.json'}")
+    return "\n".join(lines)
 
 
 def clean_tasks(cfg: dict, ids: list[str], everything: bool) -> list[str]:
@@ -498,6 +630,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--timeout", type=int, default=1800,
                    help="seconds before the task is stopped (default 1800; 0 = none)")
     r.add_argument("--effort", help="reasoning effort for this task (from model.efforts)")
+    st = sub.add_parser("status", help="what a task is doing (the newest by default)")
+    st.add_argument("id", nargs="?")
     sub.add_parser("list", help="list tasks, newest first")
     c = sub.add_parser("clean", help="delete tasks' copies, patches and reports")
     c.add_argument("ids", nargs="*")
@@ -513,6 +647,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        if args.cmd == "status":
+            print(task_status(cfg, args.id))
+            return 0
         if args.cmd == "list":
             for t in list_tasks(cfg):
                 files = len(t.get("files") or [])

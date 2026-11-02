@@ -64,8 +64,23 @@ cd <project> && ~/Documents/arborist/arborist.sh task run --task <task.md>
 
 Run it with `run_in_background: true`. It starts the model server if needed
 (loading takes a minute) and stops the task after 30 minutes (`--timeout`). Don't
-poll and don't read its output stream, which is long. When it finishes, read only
-the `report:` path from the last lines. Options: `--max-turns N` (default 6),
+read its output stream, which is long. When it finishes, read only the `report:`
+path from the last lines.
+
+### While it runs
+
+Right after launching, tell the user in one line that the task is running and
+how they can check on it. To see what it's doing, run
+`~/Documents/arborist/arborist.sh task status` (newest task, or pass an ID). It
+prints a few lines: state, elapsed time, turn, steps, the last test result, what
+the model is doing now and for how long, and the last tool result. Run it when the
+user asks how it's going, or before you tell them anything about the task. Don't
+loop on it: you're notified when the background command exits.
+
+- `running` with "now: … (for N)" growing for minutes while it's only `thinking`
+  is normal for a small model on a hard step; the 30-minute timeout still applies.
+- `died` means the process is gone without a report (killed, or the PC
+  restarted). Check `task list` and say so; don't wait for a notification. Options: `--max-turns N` (default 6),
 `--effort none|medium|xhigh`, `--workspace DIR`.
 
 ## Reviewing
