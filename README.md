@@ -216,9 +216,13 @@ prompts are the main safety mechanism, so read them. Specifically:
   only, its own), can't reach local sockets (Docker, D-Bus, your desktop,
   the llama-server), can't read anything else of yours (`~/.ssh`, other
   projects, arborist's memory), can't see other processes, and can't create
-  namespaces of its own. In the workspace, `.git`, virtualenvs and
-  `node_modules` are read-only, so a run can't plant a git hook or poison an
-  environment you use yourself. Dependency checks get a read-only workspace.
+  namespaces of its own. In the workspace, every `.git`, virtualenv and
+  `node_modules`, however deep (a cloned repo in a subfolder, a venv called
+  `env`), is read-only, so a run can't plant a git hook or poison an
+  environment you use yourself. A run can still create a new repo or venv;
+  if it does, arborist warns you and names the hooks and `.pth` files to check
+  before you use git or Python there. Dependency checks get a read-only
+  workspace.
   Every run asks first, says whether the model wrote the file this session
   and whether it changed after the diff you were shown (`[v]iew` shows it),
   warns when web content is in the conversation, and lists any folder

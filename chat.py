@@ -1626,6 +1626,11 @@ class Chat:
         print(bold("Files the run changed:"))
         for line in changes_mod.format_changes(found, colour=self.CHANGE_COLOURS):
             print(line)
+        risky = changes_mod.runs_later(found)
+        if risky:
+            print(red(bold(changes_mod.RUNS_LATER_WARNING)))
+            for line in changes_mod.describe_runs_later(risky):
+                print(line)
 
     def _mark_session_start(self) -> None:
         if self.checkpoints is None or not self.checkpoints.available:
