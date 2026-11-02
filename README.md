@@ -75,6 +75,7 @@ its own config wherever it's called from. (On zsh, use `~/.zshrc` instead.)
 | `./arborist.sh rebuild` | rebuild from the current source |
 | `./arborist.sh status` | what's built, downloaded and running |
 | `./arborist.sh stop` | stop a server the script left running |
+| `./arborist.sh task run --task FILE` | delegate one task (see [Delegated tasks](#delegated-tasks)) |
 
 ## Configuration
 
@@ -272,6 +273,55 @@ prompts are the main safety mechanism, so read them. Specifically:
   hash once you have a build you trust. The model checksum comes from the same
   Hugging Face repo as the file, so it catches a corrupt download, not a
   compromised repo.
+
+## Delegated tasks
+
+`task run` hands the model one job to do on its own, so another assistant (or
+you) can assign work and review the result afterwards:
+
+```sh
+cd ~/some/project
+agent task run --task task.md                     # auto mode (default)
+agent task run --task task.md --mode interactive  # you approve each edit and run
+agent task list                                   # tasks, newest first
+agent task clean ID…                              # or: clean --all
+```
+
+The model never works on your project directly. It gets a copy under
+`paths.root/tasks/ID/work`, made with git: your commits plus anything
+uncommitted (staged, unstaged and untracked, minus what `.gitignore` excludes).
+Runs use your project's `.venv`/`venv` read-only, since the copy has none. After
+a run, the harness tells the model to carry on (or to fix failing tests) until
+it finishes, gets stuck, or uses up `--max-turns` (default 6) or `--timeout`
+(default 30 minutes). Then the task folder holds:
+
+| File | What's in it |
+|---|---|
+| `report.json` | status, the model's final report, files changed, test results, warnings |
+| `changes.patch` | everything the task changed; `git -C REPO apply --3way changes.patch` |
+| `transcript.md` | the whole conversation, tool calls included |
+| `task.md`, `logs/` | the task as given, and output from every run |
+
+The status is `done`, `tests_failing` (the model said it was done but its last
+test run failed), `blocked`, `out_of_steps`, `out_of_turns`, `stopped`,
+`interrupted`, `timed_out` or `error`.
+
+**auto** asks nothing: edits apply in the copy, and runs go ahead only in the
+bwrap sandbox with every `[tools]` opening (`run_writable`, `run_env_keep`,
+`run_display`, `run_gpu`) forced off. It refuses to start without a working
+sandbox. Web and memory tools are off. **interactive** uses the same copy and
+report, but asks you about every edit and run as the chat does (web tools
+follow `web_enabled`), and asks before telling the model to carry on. It needs
+a terminal. Either way, nothing reaches your project until someone reviews and
+applies the patch.
+
+`task run` starts the server if it isn't up and leaves it running, since tasks
+tend to come in batches; `agent stop` frees the GPU.
+
+[`claude/arborist-delegate/SKILL.md`](claude/arborist-delegate/SKILL.md) is a
+Claude Code skill for using this from Claude Code: when to delegate, how to
+write a task a small model can follow, and how to review the result. Link it
+into `~/.claude/skills/` to use it.
 
 ## Tests
 
