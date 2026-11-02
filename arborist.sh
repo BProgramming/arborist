@@ -14,7 +14,7 @@
 #                          delegate one task: the model works on a copy of the
 #                          project and writes a report and a patch for review
 #                          (starts the server if needed and leaves it running)
-#   ./arborist.sh task list | clean ID… | clean --all
+#   ./arborist.sh task status [ID] | list | clean ID… | clean --all
 #
 # Settings, including which model, live in .config/config (or point
 # ARBORIST_CONFIG at another file). Inference runs in C++ (llama.cpp, or the

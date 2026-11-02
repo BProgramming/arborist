@@ -283,6 +283,7 @@ you) can assign work and review the result afterwards:
 cd ~/some/project
 agent task run --task task.md                     # auto mode (default)
 agent task run --task task.md --mode interactive  # you approve each edit and run
+agent task status [ID]                            # what the newest (or named) task is doing now
 agent task list                                   # tasks, newest first
 agent task clean ID…                              # or: clean --all
 ```
