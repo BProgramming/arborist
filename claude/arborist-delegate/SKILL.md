@@ -12,6 +12,12 @@ result and decide what reaches the user's project. The point is to spend the use
 GPU instead of your tokens, so keep your own share small: a short task, the
 report, the patch, and a check.
 
+## Only when asked
+
+Delegate only when the user asks you to use the agent. Never decide on your own to
+hand work to it. If it's unclear whether they're asking (e.g. "save tokens on
+this", or a request that might mean the agent), ask them before delegating.
+
 ## Mode: auto unless the user asks for interactive
 
 **Always use `--mode auto`** (the default) unless the user explicitly asks for
