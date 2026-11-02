@@ -48,6 +48,10 @@ Keep it under about 30 lines. Save it to your scratchpad as a `.md` file.
 The project must be a git repository with at least one commit; uncommitted work
 is copied too.
 
+Before the first task, run `~/Documents/arborist/arborist.sh status` and note
+whether the server is Up or Down. If it's Down, the task will start it, and it's
+yours to stop afterwards (see "When you're done").
+
 ```sh
 cd <project> && ~/Documents/arborist/arborist.sh task run --task <task.md>
 ```
@@ -89,5 +93,10 @@ Report to the user in a few lines: status, files changed, your verdict and anyth
 you fixed. Then delete the task: `~/Documents/arborist/arborist.sh task clean <id>`
 (`task list` shows them all).
 
-When the batch is done, mention that the model server is still running and using
-GPU memory; `~/Documents/arborist/arborist.sh stop` frees it.
+## When you're done
+
+`task run` leaves the server running so a batch of tasks doesn't reload the model
+each time. Once you've finished delegating for now (no more tasks planned in this
+piece of work), and the server was Down before your first task, stop it yourself
+with `~/Documents/arborist/arborist.sh stop` and tell the user you did. If it was
+already Up when you started, the user is using it: leave it running.
