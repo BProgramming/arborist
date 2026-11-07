@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -41,8 +42,7 @@ import changes as changes_mod
 import config as model_config
 import runners
 from checkpoints import CheckpointError, Checkpoints, prune_store
-from tools import (IGNORED_DIRS, Decision, Limits, MemoryChoice, ToolResult, Toolbox, Workspace,
-                   TOOL_SCHEMAS)
+from tools import (IGNORED_DIRS, Decision, Limits, MemoryChoice, ToolResult, Toolbox, Workspace)
 
 # ---------------------------------------------------------------- terminal ---
 
@@ -1787,10 +1787,22 @@ class Chat:
         self._reply(label="fix the failing tests")
         return True
 
+    @staticmethod
+    def _stdin_pending(self, timeout: float = 0.03) -> bool:
+        """True if more input is already queued, i.e. we're mid-paste."""
+        try:
+            return bool(select.select([sys.stdin], [], [], timeout)[0])
+        except (OSError, ValueError):
+            return False
+
+    @staticmethod
     def _read_input(self) -> str | None:
         line = input(PROMPT)
         if line.strip() != '"""':
-            return line
+            lines = [line]
+            while _stdin_pending():
+                lines.append(input(""))
+            return "\n".join(lines)
         block = []
         while True:
             nxt = input(CONT_PROMPT)
