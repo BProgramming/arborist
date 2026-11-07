@@ -145,6 +145,18 @@ show_stats = true
 # shown too, when set. Names only; never list anything holding a secret.
 env_vars = ["VIRTUAL_ENV", "CONDA_DEFAULT_ENV"]
 
+# PERF: when you leave a chat, park it: the conversation is saved, and so is
+# the server's KV cache for it (the model's already-processed reading of the
+# whole conversation). /resume in the same folder picks it up, and the next
+# reply only processes your new message instead of re-reading everything.
+# One parked chat per folder; the next one you leave there replaces it.
+# The cache costs disk: about ctx tokens x 64 KiB at f16 (a 30k-token chat is
+# ~2 GB). Turning this on also starts the server with --slot-save-path.
+resume = true
+# Parked chats (and their caches) older than this many days are deleted at
+# startup. 0 keeps them forever.
+resume_days = 7
+
 [tools]
 # Let the model read, search, edit and create files in the directory you start
 # the chat from, and run single .py/.rs/.dart/.js/.ts files. /tools toggles

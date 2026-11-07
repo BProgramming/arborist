@@ -318,6 +318,8 @@ class TaskUI(chat.TerminalUI):
 class TaskChat(chat.Chat):
     """A chat session over the task's copy, with no memory tool."""
 
+    resumable = False  # a task's conversation isn't parked for /resume
+
     def __init__(self, cfg: dict, c: Copy, source: Path, mode: str, task_dir: Path,
                  progress: Progress | None = None):
         cfg = copy.deepcopy(cfg)

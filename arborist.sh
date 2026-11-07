@@ -47,7 +47,7 @@ load_config() {
   out="$("$PY" "$HERE/config.py" --shell)" || die "could not load config"
   eval "$out"
   mapfile -t SERVER_ARGS < <("$PY" "$HERE/config.py" --server-args)
-  mkdir -p "$CFG_ROOT" "$CFG_MODEL_DIR" "$CFG_LOG_DIR" "$CFG_HISTORY_DIR"
+  mkdir -p "$CFG_ROOT" "$CFG_MODEL_DIR" "$CFG_LOG_DIR" "$CFG_HISTORY_DIR" "$CFG_KV_DIR"
   PID_FILE="$CFG_ROOT/server.pid"
   SERVER_LOG="$CFG_LOG_DIR/server.log"
 }
