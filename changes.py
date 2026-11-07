@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,7 +24,7 @@ class Change:
     path: str    # relative to the workspace, with / separators
 
 
-def snapshot(root: Path, skip: list[Path] = ()) -> Snapshot:
+def snapshot(root: Path, skip: Sequence[Path] = ()) -> Snapshot:
     root = Path(root).resolve()
     skip_set = {Path(s).resolve() for s in skip}
     out: Snapshot = {}

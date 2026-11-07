@@ -49,9 +49,11 @@ def site():
     hits: list[str] = []
 
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *a):
+        # noinspection PyShadowingBuiltins
+        def log_message(self, format, *args):
             pass
 
+        # noinspection PyPep8Naming
         def do_GET(self):
             hits.append(self.path)
             if self.path in REDIRECTS:
@@ -61,7 +63,7 @@ def site():
                 return
             if self.path == "/docs/to-localhost":
                 self.send_response(302)
-                self.send_header("Location", f"http://localhost:{self.server.server_port}/docs/a.html")
+                self.send_header("Location", f"http://localhost:{server.server_port}/docs/a.html")
                 self.end_headers()
                 return
             if self.path not in PAGES:

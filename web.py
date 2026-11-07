@@ -79,9 +79,11 @@ def scope_prefix(url: str) -> str:
 
 
 def in_scope(url: str, start: str, prefix: str) -> bool:
-    a, b = urlsplit(url), urlsplit(start)
-    return (a.netloc == b.netloc and (a.path or "/").startswith(prefix)
-            and not a.path.lower().endswith(SKIP_EXTENSIONS))
+    a = urlsplit(url)
+    b = urlsplit(start)
+    path = a.path or "/"
+    return (a.netloc == b.netloc and path.startswith(prefix)
+            and not path.lower().endswith(SKIP_EXTENSIONS))
 
 
 def check_address(host: str, port: int | None, allow_private: bool) -> None:
@@ -96,10 +98,10 @@ def check_address(host: str, port: int | None, allow_private: bool) -> None:
         infos = socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
     except socket.gaierror as e:
         raise WebError(f"can't resolve {host}: {e.strerror or e}") from None
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split("%")[0])
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-            ip = ip.ipv4_mapped
+    for *_, sockaddr in infos:
+        ip = ipaddress.ip_address(str(sockaddr[0]).split("%")[0])
+        if isinstance(ip, ipaddress.IPv6Address) and (mapped := ip.ipv4_mapped) is not None:
+            ip = mapped
         if not ip.is_global or ip.is_multicast:
             raise WebError(f"{host} resolves to a private or local address ({ip}); "
                            "only public websites can be fetched")
@@ -145,10 +147,11 @@ class _TextExtractor(HTMLParser):
         a = dict(attrs)
         if tag == "title" and not self.title:
             self._in_title = True
-        if tag == "base" and a.get("href"):
-            self.base = urljoin(self.base, a["href"])
-        if tag == "a" and a.get("href") and not self._skip:
-            link = normalize(a["href"], self.base)
+        href = a.get("href")
+        if tag == "base" and href:
+            self.base = urljoin(self.base, href)
+        if tag == "a" and href and not self._skip:
+            link = normalize(href, self.base)
             if link and link not in self._seen_links:
                 self._seen_links.add(link)
                 self.links.append(link)
@@ -194,7 +197,7 @@ class _TextExtractor(HTMLParser):
                 del self._stack[i:]
                 break
 
-    def _close(self, tag, skips, is_main):
+    def _close(self, tag: str, skips: bool, is_main: bool):
         if re.fullmatch(r"h[1-6]", tag):
             self._newline()
         elif tag == "pre":
@@ -283,7 +286,10 @@ class Fetcher:
     def _check(self, url: str) -> None:
         parts = urlsplit(url)
         self.allow(url)
-        check_address(parts.hostname, parts.port, self.allow_private)
+        host = parts.hostname
+        if not host:
+            raise WebError(f"no host in {url}")
+        check_address(host, parts.port, self.allow_private)
 
     def _open(self, url: str):
         self._check(url)

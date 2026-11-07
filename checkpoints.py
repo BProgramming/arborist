@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -125,7 +126,7 @@ class Checkpoints:
         self._git("commit", "--quiet", "--no-verify", "--allow-empty", *message)
         return self._git("rev-parse", "HEAD").stdout.decode().strip()
 
-    def list(self, limit: int = 20) -> list[Checkpoint]:
+    def recent(self, limit: int = 20) -> list[Checkpoint]:
         """Newest first."""
         if not self.available or not (self.git_dir / "HEAD").exists() or not self._has_commits():
             return []
@@ -136,7 +137,7 @@ class Checkpoints:
             if not record:
                 continue
             sha, ts, subject, body = record.split("\0", 3)
-            m = re.match(r"\[(\w+)\] (.*)", subject)
+            m = re.match(r"\[(\w+)] (.*)", subject)
             kind, label = (m[1], m[2]) if m else ("turn", subject)
             r = re.search(r"^restored: ([0-9a-f]+)$", body, re.MULTILINE)
             result.append(Checkpoint(sha, datetime.fromtimestamp(int(ts)), kind, label,
@@ -145,7 +146,7 @@ class Checkpoints:
 
     def find(self, prefix: str) -> Checkpoint | None:
         prefix = prefix.lower()
-        matches = [c for c in self.list(limit=500) if c.sha.startswith(prefix)]
+        matches = [c for c in self.recent(limit=500) if c.sha.startswith(prefix)]
         return matches[0] if len(matches) == 1 else None
 
     def changes_since(self, sha: str, staged: bool = False) -> list[Change]:
@@ -156,7 +157,7 @@ class Checkpoints:
         fields = [f for f in out.decode("utf-8", "surrogateescape").split("\0") if f]
         return [Change(fields[i][0], fields[i + 1]) for i in range(0, len(fields) - 1, 2)]
 
-    def diff_text(self, sha: str, paths: list[str] = ()) -> str:
+    def diff_text(self, sha: str, paths: Sequence[str] = ()) -> str:
         """The full unified diff from a checkpoint to the workspace now
         (binary files are named, not shown). `paths` limits it, relative to
         the workspace."""
@@ -170,7 +171,7 @@ class Checkpoints:
         differs from. Right after an undo (nothing new since), only
         checkpoints older than the one restored count, so repeated /undo
         keeps going back instead of bouncing forward again."""
-        history = self.list(limit)
+        history = self.recent(limit)
         if history and history[0].kind == "safety" and history[0].restored:
             floor = next((i for i, cp in enumerate(history) if cp.sha == history[0].restored), None)
             if floor is None:
@@ -218,7 +219,7 @@ class Checkpoints:
         History is linear, so the kept checkpoints are re-chained onto a new
         root (same trees, messages and dates) and the rest is garbage
         collected. If nothing is recent, the whole store is deleted."""
-        cps = self.list(limit=1_000_000)  # newest first
+        cps = self.recent(limit=1_000_000)  # newest first
         keep = [c for c in cps if c.when >= cutoff]
         dropped = len(cps) - len(keep)
         if not dropped:
@@ -227,20 +228,25 @@ class Checkpoints:
             shutil.rmtree(self.git_dir)
             return dropped
         new_sha: dict[str, str] = {}
-        parent = None
+
+        def renumber(m: re.Match[str]) -> str:
+            return f"restored: {new_sha.get(m[1], m[1])}"
+
+        parent: str | None = None
         for cp in reversed(keep):  # oldest first
             info = self._git("log", "-1", "--format=%T%x00%ad%x00%cd%x00%B", "--date=raw",
                              cp.sha).stdout.decode(errors="replace")
             tree, author_date, commit_date, message = info.split("\0", 3)
             # A safety snapshot names the checkpoint it restored; follow the rewrite.
             message = re.sub(r"^restored: ([0-9a-f]+)$",
-                             lambda m: f"restored: {new_sha.get(m[1], m[1])}",
+                             renumber,
                              message.strip(), flags=re.MULTILINE)
             args = ["commit-tree", tree, "-m", message] + (["-p", parent] if parent else [])
-            parent = self._git(*args, extra_env={"GIT_AUTHOR_DATE": author_date,
-                                                 "GIT_COMMITTER_DATE": commit_date}
-                               ).stdout.decode().strip()
-            new_sha[cp.sha] = parent
+            sha = self._git(*args, extra_env={"GIT_AUTHOR_DATE": author_date,
+                                              "GIT_COMMITTER_DATE": commit_date}
+                            ).stdout.decode().strip()
+            new_sha[cp.sha] = parent = sha
+        assert parent is not None  # keep isn't empty
         self._git("update-ref", "HEAD", parent)
         self._git("reflog", "expire", "--expire=now", "--all")
         self._git("gc", "--prune=now", "--quiet")

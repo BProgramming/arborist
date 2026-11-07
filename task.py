@@ -43,6 +43,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import agent
 import chat
@@ -91,13 +92,13 @@ class TaskError(Exception):
 
 # --------------------------------------------------------------- the copy ---
 
-def _git(cwd: Path, *args: str, input: bytes | None = None, check: bool = True,
+def _git(cwd: Path, *args: str, stdin_bytes: bytes | None = None, check: bool = True,
          timeout: int = 300) -> subprocess.CompletedProcess:
     """git with the repo's own fsmonitor and hooks switched off: a project's
     config must never get to run a command through arborist."""
     cmd = ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
            "-C", str(cwd), *args]
-    kw = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+    kw = {"input": stdin_bytes} if stdin_bytes is not None else {"stdin": subprocess.DEVNULL}
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=timeout, **kw)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -136,7 +137,7 @@ def make_copy(source: Path, dest: Path) -> Copy:
     # Staged and unstaged changes to tracked files.
     diff = _git(repo, "diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv").stdout
     if diff.strip():
-        _git(dest, "apply", "--binary", "--whitespace=nowarn", "-", input=diff)
+        _git(dest, "apply", "--binary", "--whitespace=nowarn", "-", stdin_bytes=diff)
     # Untracked files git would show (so .gitignore'd ones stay behind).
     raw = _git(repo, "ls-files", "--others", "--exclude-standard", "-z").stdout
     for entry in raw.decode("utf-8", "surrogateescape").split("\0"):
@@ -199,6 +200,9 @@ def collect_changes(c: Copy, patch_path: Path) -> tuple[list[dict], str]:
 
 # -------------------------------------------------------------- the model ---
 
+# The methods implement tools.Approver, so they take its parameters even when
+# auto mode's answer doesn't depend on them.
+# noinspection PyUnusedParameter,PyMethodMayBeStatic
 class AutoApprover:
     """Auto mode's answers. Edits and runs only happen in the copy, and runs
     only in the sandbox (TaskChat refuses to start auto mode without one);
@@ -247,7 +251,7 @@ class Progress:
 
     def __init__(self, task_dir: Path, task_id: str, mode: str):
         self.path = task_dir / "progress.json"
-        self.data = {"id": task_id, "mode": mode, "state": "running", "pid": os.getpid(),
+        self.data: dict[str, Any] = {"id": task_id, "mode": mode, "state": "running", "pid": os.getpid(),
                      "started": time.time(), "turn": 0, "steps": 0, "tests": [],
                      "doing": "setting up the copy", "last": None}
         self._written = 0.0
@@ -327,11 +331,12 @@ class TaskChat(chat.Chat):
         # The copy lives under paths.root, which the chat's toolbox hides, so
         # this one has its own: the whole copy is the model's, arborist's code
         # included when that's the project (changes to it are reviewed like any).
-        self.toolbox = Toolbox(Workspace(c.workspace), approver, Limits.from_config(cfg["tools"]),
-                               log_dir=task_dir / "logs", on_output=self.ui.run_output,
-                               on_notice=self.ui.notice, checkpoints=None,
-                               on_changes=self._record_run_changes)
-        self.compactor.forget_file = self.toolbox.ws.unsee
+        self.toolbox = toolbox = Toolbox(
+            Workspace(c.workspace), approver, Limits.from_config(cfg["tools"]),
+            log_dir=task_dir / "logs", on_output=self.ui.run_output,
+            on_notice=self.ui.notice, checkpoints=None,
+            on_changes=self._record_run_changes)
+        self.compactor.forget_file = toolbox.ws.unsee
         # The project's memories, as a chat started in the real folder sees them.
         self.memory = chat.Memory(cfg["derived"]["memory_path"], source)
         self.memory_block = self._memory_block()
@@ -341,15 +346,18 @@ class TaskChat(chat.Chat):
         return self.toolbox if self.tools_enabled else None
 
     def _system(self) -> str:
+        toolbox = self.toolbox
+        assert toolbox is not None  # set in __init__
         parts = [self.system_prompt] if self.system_prompt else []
-        parts.append(agent.TOOL_GUIDE.format(root=self.toolbox.ws.root,
-                                             sandbox=agent.sandbox_rule(self.toolbox.limits)))
-        parts.append(TASK_GUIDE.format(who=WHO[self.mode], root=self.toolbox.ws.root))
-        if self._env_facts is None:
-            with self.toolbox._probing():
-                self._env_facts = chat.environment_facts(self.toolbox.ws.root,
-                                                         self.cfg["chat"]["env_vars"])
-        parts.append("Environment:\n" + "\n".join([self.date_line] + self._env_facts))
+        parts.append(agent.TOOL_GUIDE.format(root=toolbox.ws.root,
+                                             sandbox=agent.sandbox_rule(toolbox.limits)))
+        parts.append(TASK_GUIDE.format(who=WHO[self.mode], root=toolbox.ws.root))
+        facts = self._env_facts
+        if facts is None:
+            with toolbox.probing():
+                facts = chat.environment_facts(toolbox.ws.root, self.cfg["chat"]["env_vars"])
+            self._env_facts = facts
+        parts.append("Environment:\n" + "\n".join([self.date_line] + facts))
         if self.memory_block:
             parts.append(self.memory_block)
         return "\n\n".join(parts)
@@ -419,6 +427,8 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         report["notes"].append(f"runs use the project's virtualenv {venv}, read-only")
 
     session = TaskChat(cfg, c, source, mode, task_dir, progress)
+    toolbox = session.toolbox
+    assert toolbox is not None  # TaskChat always has one
     if client is not None:
         session.client = client
     if effort:
@@ -432,7 +442,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
     final = ""
     status = "error"
 
-    def on_signal(signum, frame):
+    def on_signal(_signum, _frame):
         raise chat.Interrupted()
 
     old_int = signal.signal(signal.SIGINT, on_signal)
@@ -443,8 +453,8 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         while True:
             turns += 1
             progress.update(turn=turns, doing="waiting for the model")
-            session.toolbox.begin_turn(f"task {task_id} turn {turns}")
-            result = agent.run_turn(messages, session._body, session.client.stream_chat,
+            toolbox.begin_turn(f"task {task_id} turn {turns}")
+            result = agent.run_turn(messages, session.request_body, session.client.stream_chat,
                                     session.agent_tools, session.ui, max_steps=t["max_steps"],
                                     compactor=session.compactor,
                                     max_consecutive_errors=t["max_consecutive_errors"],
@@ -470,7 +480,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
                     status = "stopped"
                     break
             messages.append({"role": "user",
-                             "content": FIX if session.toolbox.tests_failed else CONTINUE})
+                             "content": FIX if toolbox.tests_failed else CONTINUE})
     except chat.Interrupted:
         session.ui.end_message()
         timed_out = timeout and time.monotonic() - started >= timeout - 1
@@ -492,7 +502,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
     except TaskError as e:
         files, stat = [], ""
         report.setdefault("error", str(e))
-    session._save([str(task_dir / "transcript.md")])
+    session.save_transcript([str(task_dir / "transcript.md")])
     tests = session.ui.tests
     if status == "done" and tests and tests[-1] != "passed":
         # A small model will say it's done with the tests still failing.
@@ -549,10 +559,15 @@ def read_progress(task_dir: Path) -> dict | None:
     return p
 
 
+def _task_dirs(root: Path) -> list[Path]:
+    """The task folders under root, newest first."""
+    return sorted(root.iterdir(), reverse=True) if root.is_dir() else []
+
+
 def list_tasks(cfg: dict) -> list[dict]:
     out = []
     root = tasks_dir(cfg)
-    for d in sorted(root.iterdir() if root.is_dir() else [], reverse=True):
+    for d in _task_dirs(root):
         try:
             r = json.loads((d / "report.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -577,7 +592,7 @@ def task_status(cfg: dict, task_id: str | None = None, now: float | None = None)
         if d.parent != root.resolve() or not d.is_dir():
             raise TaskError(f"no task {task_id!r} in {root}")
     else:
-        dirs = sorted(root.iterdir() if root.is_dir() else [], reverse=True)
+        dirs = _task_dirs(root)
         if not dirs:
             raise TaskError("no tasks yet")
         d = dirs[0]

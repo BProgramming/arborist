@@ -1,7 +1,5 @@
 """Tests for the wordcount module."""
 
-import pytest
-
 from wordcount import count_words
 
 

@@ -24,7 +24,8 @@ import re
 import subprocess
 import traceback
 from collections import Counter
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Protocol
 from urllib.parse import urlsplit
@@ -69,7 +70,7 @@ class Approver(Protocol):
     def approve_change(self, rel_path: str, diff: str, is_new: bool) -> Decision: ...
     def show_change(self, rel_path: str, diff: str, is_new: bool) -> None: ...
     def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int,
-                    notes: list[str] = (), view: str | None = None) -> Decision: ...
+                    notes: Sequence[str] = (), view: str | None = None) -> Decision: ...
     def approve_fetch(self, host: str, url: str, reason: str = "", scope: str = "") -> Decision: ...
     def approve_memory(self, fact: str, block: str, similar: list[str], web_tainted: bool) -> MemoryChoice: ...
 
@@ -99,7 +100,7 @@ class Limits:
 
     @classmethod
     def from_config(cls, tools_cfg: dict) -> "Limits":
-        return cls(**{k: tools_cfg[k] for k in cls.__dataclass_fields__ if k in tools_cfg})
+        return cls(**{f.name: tools_cfg[f.name] for f in fields(cls) if f.name in tools_cfg})
 
 
 @dataclass
@@ -264,8 +265,8 @@ def _count_files(node: dict) -> int:
 def render_tree(node: dict, depth: int, lines: list[str], budget: int, indent: str = "  ") -> None:
     """Indented tree, directories first. Below `depth`, a directory is one line
     with its file count; a directory with many files lists some plus a summary."""
-    dirs = sorted(k for k, v in node.items() if v is not None)
-    files = sorted(k for k, v in node.items() if v is None)
+    dirs: list[str] = sorted(k for k, v in node.items() if v is not None)
+    files: list[str] = sorted(k for k, v in node.items() if v is None)
     for name in dirs:
         if len(lines) >= budget:
             return
@@ -352,7 +353,7 @@ class Toolbox:
         # shown. Run prompts say whether the file to run is one of them, and
         # whether it has changed since. Kept across /clear: it's about the
         # files on disk, not the conversation.
-        self.model_writes: dict[Path, str] = {}
+        self.model_writes: dict[Path, str | None] = {}
         # Shown to the user after every run: the files it added, changed or deleted.
         self.on_changes = on_changes or (lambda found: None)
         self.auto_edits = self.limits.approve_edits == "auto"
@@ -666,7 +667,7 @@ class Toolbox:
         if problem:
             return (f"Can't check or run {rel}: {problem} Tell the user this; don't try another "
                     "way to run it.")
-        with self._probing():
+        with self.probing():
             plan = runners.plan_for(p, self.ws.root, self.log_dir / "build")
         lines = [f"Dependency check for {rel}:"]
         lines += [f"  ok: {d}" for d in plan.checked]
@@ -740,13 +741,13 @@ class Toolbox:
     def _probe_wrap(self, cmd: list[str], cwd: Path | None) -> list[str]:
         """Dependency probes: sandboxed, workspace read-only, and none of your
         extras (run_writable, display, GPU). Only a toolchain's own state
-        folder (a Flutter SDK's cache) stays writable, as it must to start."""
+        folder (a Flutter SDK's cache) stays writable, as it must in order to start."""
         reads, writable = runners.toolchain_folders([cmd])
         plan = runners.RunPlan(steps=[cmd], cwd=cwd or self.log_dir / "build", reads=reads,
                                writable=writable)
         return sandbox.wrap(cmd, self._spec(plan, probe=True), runners.run_env())
 
-    def _probing(self):
+    def probing(self):
         """Context for planning: probes go through the sandbox when it's on."""
         if self.limits.run_sandbox and sandbox.available():
             return runners.probe_sandbox(self._probe_wrap)
@@ -760,12 +761,13 @@ class Toolbox:
             return why
         if self.limits.run_display:
             try:
-                sandbox._display_args({})
+                sandbox.display_args({})
             except sandbox.SandboxError as e:
                 return str(e)
         return None
 
-    def _run_notes(self, spec: sandbox.Spec | None) -> list[str]:
+    @staticmethod
+    def _run_notes(spec: sandbox.Spec | None) -> list[str]:
         """What the approval prompt says about where the run can reach."""
         if spec is None:
             return ["NOT sandboxed (run_sandbox = false): full network access, and it can "
@@ -862,7 +864,7 @@ class Toolbox:
         if problem:
             return ToolResult(f"The tests were not run: {problem} Tell the user this and stop; "
                               "don't try another way to run them.", hard_stop=True)
-        with self._probing():
+        with self.probing():
             plan = runners.plan_tests(p, self.ws.root, self.log_dir / "build")
         if not plan.ok:
             lines = [f"Can't run tests for {rel}:"]
@@ -885,7 +887,7 @@ class Toolbox:
                   f"{notes}{changed}--- {'summary' if passed else 'failures and summary'} ---\n")
         self.tests_failed = not passed
         if passed:
-            footer = ("\n--- end ---\nNow tell the user the result briefly. Don't call any more tools.")
+            footer = "\n--- end ---\nNow tell the user the result briefly. Don't call any more tools."
         else:
             footer = ("\n--- end ---\nNow present the bugs to the user. For each failure: what's "
                       "wrong, where (file and line), and the fix you propose. Don't change anything "
@@ -956,7 +958,8 @@ class Toolbox:
             out.append(self._link_list(page))
         return "\n".join(out)
 
-    def _link_list(self, page: web.Page, limit: int = 40) -> str:
+    @staticmethod
+    def _link_list(page: web.Page, limit: int = 40) -> str:
         base = urlsplit(page.url)
         same = [link for link in page.links
                 if urlsplit(link).netloc == base.netloc and link != page.url

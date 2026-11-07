@@ -26,6 +26,7 @@ import sys
 import time
 import tomllib
 import traceback
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -216,7 +217,10 @@ class Interrupted(BaseException):
 class Client:
     def __init__(self, base_url: str):
         u = urlparse(base_url)
-        self.host, self.port = u.hostname, u.port
+        host = u.hostname
+        if not host:
+            raise ValueError(f"no host in the server URL {base_url!r}")
+        self.host, self.port = host, u.port
 
     def _conn(self, timeout: float | None) -> http.client.HTTPConnection:
         return http.client.HTTPConnection(self.host, self.port, timeout=timeout)
@@ -243,7 +247,7 @@ class Client:
                 detail = resp.read().decode(errors="replace")
                 try:
                     detail = json.loads(detail)["error"]["message"]
-                except Exception:
+                except (ValueError, LookupError, TypeError):
                     pass
                 raise RuntimeError(f"server returned HTTP {resp.status}: {detail}")
             for raw in resp:
@@ -290,7 +294,11 @@ class TerminalUI:
 
     def __init__(self, show_thinking: bool):
         self.show_thinking = show_thinking
-        self._reset()
+        self.started = time.monotonic()
+        self.thinking_chars = 0
+        self.thinking_open = False
+        self.status_shown = False
+        self.wrote_text = False
 
     def _reset(self):
         self.started = time.monotonic()
@@ -350,7 +358,8 @@ class TerminalUI:
     def notice(self, message: str) -> None:
         print(yellow(message))
 
-    def run_output(self, line: str) -> None:
+    @staticmethod
+    def run_output(line: str) -> None:
         print(dim("  │ ") + line)
 
 
@@ -392,7 +401,8 @@ class TerminalApprover:
             if ans in ("n", "no"):
                 return Decision(False, ask("Reason for the model (optional): ").strip())
 
-    def show_change(self, rel_path: str, diff: str, is_new: bool) -> None:
+    @staticmethod
+    def show_change(rel_path: str, diff: str, is_new: bool) -> None:
         """An edit applied without asking (approve_edits = auto, or [a]ll):
         still shown in full, so nothing changes unseen."""
         print()
@@ -400,7 +410,8 @@ class TerminalApprover:
         for line in diff.splitlines():
             print(_colour_diff_line(line))
 
-    def approve_fetch(self, host: str, url: str, reason: str = "", scope: str = "") -> Decision:
+    @staticmethod
+    def approve_fetch(host: str, url: str, reason: str = "", scope: str = "") -> Decision:
         print()
         print(bold(yellow(f"The model wants to {'crawl' if scope else 'visit'} {host}:")))
         print("  " + url)
@@ -414,7 +425,8 @@ class TerminalApprover:
             return Decision(True)
         return Decision(False, ask("Reason for the model (optional): ").strip())
 
-    def approve_memory(self, fact: str, block: str, similar: list[str], web_tainted: bool) -> MemoryChoice:
+    @staticmethod
+    def approve_memory(fact: str, block: str, similar: list[str], web_tainted: bool) -> MemoryChoice:
         print()
         print(bold(f"The model wants to remember, in [{block}]:"))
         print(green("  + " + fact))
@@ -445,8 +457,9 @@ class TerminalApprover:
                     return MemoryChoice("replace", picks)
                 print(dim(f"  pick numbers from 1 to {len(similar)}"))
 
-    def approve_run(self, rel_path: str, steps: list[list[str]], cwd: str, timeout: int,
-                    notes: list[str] = (), view: str | None = None) -> Decision:
+    @staticmethod
+    def approve_run(rel_path: str, steps: list[list[str]], cwd: str, timeout: int,
+                    notes: Sequence[str] = (), view: str | None = None) -> Decision:
         print()
         print(bold(yellow(f"Run {rel_path}?")))
         for step in steps:
@@ -456,15 +469,14 @@ class TerminalApprover:
             loud = note.startswith(("NOT sandboxed", "CHANGED", "WEB:"))
             print(("  " + red(bold(note))) if loud else dim("  " + note))
         choices = "[v]iew the file / [y]es / [N]o" if view is not None else "[y/N]"
-        while True:
+        ans = ask(f"Run it? {choices}: ").strip().lower()
+        while view is not None and ans in ("v", "view"):
+            for i, line in enumerate(view.splitlines(), 1):
+                print(dim(f"{i:5} ") + mark_dotted(line, str))
             ans = ask(f"Run it? {choices}: ").strip().lower()
-            if view is not None and ans in ("v", "view"):
-                for i, line in enumerate(view.splitlines(), 1):
-                    print(dim(f"{i:5} ") + mark_dotted(line, str))
-                continue
-            if ans in ("y", "yes"):
-                return Decision(True)
-            return Decision(False, ask("Reason for the model (optional): ").strip())
+        if ans in ("y", "yes"):
+            return Decision(True)
+        return Decision(False, ask("Reason for the model (optional): ").strip())
 
 
 # ------------------------------------------------------------------ memory ---
@@ -486,7 +498,7 @@ GENERAL = "general"
 WORKSPACE = "workspace"  # what the model calls the block for the session's folder
 _KEYS = ("memories", "outdated")
 
-# Notes are strings, "2026-10-22: the fact". Hand-written ones without a date
+# Notes are strings, "2026-10-22: the fact". Handwritten ones without a date
 # are fine too.
 _DATED = re.compile(r"^(\d{4}-\d{2}-\d{2}): (.+)$")
 # The pre-TOML memory.md format, read once to migrate it.
@@ -642,7 +654,8 @@ def _blocks(text: str) -> list[tuple[str, int, int]]:
             for n, (name, _, body) in enumerate(heads)]
 
 
-def _find(text: str, block: str, key: str):
+def _find(text: str, block: str, key: str) \
+        -> tuple[int, int, tuple[int, int, list[tuple[int, int, str]]] | None] | None:
     """(block body start, body end, array) for block.key; array is
     (open, close, elements), or None when the block has no such key. Returns
     None when there's no such block."""
@@ -689,7 +702,8 @@ def toml_append(text: str, block: str, key: str, value: str) -> str:
     comma = after.lstrip(" \t").startswith(",")
     if closer_alone:
         el_line = text.rfind("\n", 0, elems[-1][0]) + 1
-        indent = re.match(r"[ \t]*", text[el_line:]).group(0) or "    "
+        rest = text[el_line:]
+        indent = rest[:len(rest) - len(rest.lstrip(" \t"))] or "    "
         if not comma:
             text = text[:last_end] + "," + text[last_end:]
             line_start += 1
@@ -704,7 +718,8 @@ def toml_remove(text: str, block: str, key: str, value: str) -> str:
     """Take the first element equal to value out of block.key."""
     found = _find(text, block, key)
     arr = found[2] if found else None
-    hit = next((e for e in (arr[2] if arr else []) if e[2] == value), None)
+    elems: list[tuple[int, int, str]] = arr[2] if arr else []
+    hit = next((e for e in elems if e[2] == value), None)
     if hit is None:
         raise EditError(f"couldn't find that note in [{block}] {key}")
     start, end, _ = hit
@@ -729,6 +744,14 @@ class Note:
 
     def label(self) -> str:
         return f"[{self.block}]" + (" (outdated)" if self.outdated else "") + f" {self.entry}"
+
+
+def _block_name(folder: Path) -> str:
+    """How a folder's memory block is written: ~/… under the home directory."""
+    home = Path.home().resolve()
+    if folder.is_relative_to(home) and folder != home:
+        return "~/" + folder.relative_to(home).as_posix()
+    return folder.as_posix()
 
 
 class Memory:
@@ -857,15 +880,13 @@ class Memory:
         """The file's name for a block the model can write to."""
         if where == GENERAL:
             return GENERAL
-        if self.scope is None:
+        scope = self.scope
+        if scope is None:
             raise ValueError("there's no workspace folder in this session; use scope \"general\"")
         for block in data:
-            if block != GENERAL and self._folder(block) == self.scope:
+            if block != GENERAL and self._folder(block) == scope:
                 return block  # keep however it's already written
-        home = Path.home().resolve()
-        if self.scope.is_relative_to(home) and self.scope != home:
-            return "~/" + self.scope.relative_to(home).as_posix()
-        return self.scope.as_posix()
+        return _block_name(scope)
 
     # -- notes ----------------------------------------------------------------
 
@@ -927,7 +948,7 @@ class Memory:
         data = self._read()
         self._check_new(self.clean(fact), data.get(self._block_for(data, where), {}))
 
-    def add(self, fact: str, where: str = GENERAL, replaces: list[str] = ()) -> str:
+    def add(self, fact: str, where: str = GENERAL, replaces: Sequence[str] = ()) -> str:
         """Save a note to [general] or this folder's block, moving `replaces`
         (current notes in that block) to its outdated list. Returns the note as
         saved; raises ValueError if it can't be saved."""
@@ -981,7 +1002,7 @@ class Memory:
                 head = "[general]"
             elif self._folder(block) == self.scope:
                 head = f"[{block}] (this workspace)"
-            elif self._folder(block).is_relative_to(self.scope):
+            elif self.scope is not None and self._folder(block).is_relative_to(self.scope):
                 head = f"[{block}] (a folder inside this workspace)"
             else:
                 head = f"[{block}] (a folder this workspace is inside)"
@@ -1084,12 +1105,14 @@ def environment_facts(workspace: Path, env_vars: list[str]) -> list[str]:
 
     tools = []
     interp = runners.python_for_dir(workspace, workspace)
-    if interp and (v := runners._version([interp, "--version"])):
+    if interp and (v := runners.tool_version([interp, "--version"])):
         where = " (project venv)" if "/venv/" in interp or "/.venv/" in interp else ""
         tools.append(f"{v}{where}")
-    for label, cmd in (("Node.js", ["node", "--version"]), ("", ["rustc", "--version"]),
-                       ("", ["cargo", "--version"]), ("", ["dart", "--version"])):
-        if shutil.which(cmd[0]) and (v := runners._version(cmd)):
+    probes: list[tuple[str, list[str]]] = [
+        ("Node.js", ["node", "--version"]), ("", ["rustc", "--version"]),
+        ("", ["cargo", "--version"]), ("", ["dart", "--version"])]
+    for label, cmd in probes:
+        if shutil.which(cmd[0]) and (v := runners.tool_version(cmd)):
             tools.append(f"{label} {v}".strip())
     if shutil.which("flutter"):
         tools.append("Flutter")
@@ -1213,10 +1236,12 @@ class Chat:
             parts.append(agent.TOOL_GUIDE.format(root=self.toolbox.ws.root,
                                                  sandbox=agent.sandbox_rule(self.toolbox.limits)))
             parts.append(MEMORY_GUIDE)
-            if self._env_facts is None:
-                with self.toolbox._probing():  # version probes run the project's interpreter
-                    self._env_facts = environment_facts(self.toolbox.ws.root, self.cfg["chat"]["env_vars"])
-            env += self._env_facts
+            facts = self._env_facts
+            if facts is None:
+                with self.toolbox.probing():  # version probes run the project's interpreter
+                    facts = environment_facts(self.toolbox.ws.root, self.cfg["chat"]["env_vars"])
+                self._env_facts = facts
+            env += facts
         parts.append("Environment:\n" + "\n".join(env))
         if self.memory_block:
             parts.append(self.memory_block)
@@ -1261,7 +1286,7 @@ class Chat:
                 text.append((choice.get("delta") or {}).get("content") or "")
         return "".join(text)
 
-    def _body(self, messages: list[dict], with_tools: bool) -> dict:
+    def request_body(self, messages: list[dict], with_tools: bool) -> dict:
         ch = self.cfg["chat"]
         system = self._system()
         body = {
@@ -1291,8 +1316,8 @@ class Chat:
         return body
 
     def _print_stats(self, compact: bool = False) -> None:
-        ctx = self.cfg["server"]["ctx_size"] // self.cfg["server"]["parallel"]
-        pct = 100 * self.ctx_used / ctx if ctx else 0
+        ctx: int = self.cfg["server"]["ctx_size"] // self.cfg["server"]["parallel"]
+        pct: float = 100 * self.ctx_used / ctx if ctx else 0.0
         compacting = self.cfg["compaction"]["enabled"]
         parts = []
         t = self.last.timings if self.last else {}
@@ -1327,7 +1352,7 @@ class Chat:
         t = self.cfg["tools"]
         try:
             result = agent.run_turn(
-                self.messages, self._body, self.client.stream_chat,
+                self.messages, self.request_body, self.client.stream_chat,
                 self.agent_tools, self.ui,
                 max_steps=t["max_steps"],
                 compactor=self.compactor,
@@ -1411,7 +1436,7 @@ class Chat:
             self.pending_files.append((str(path), text))
             print(dim(f"attached {path} ({len(text):,} chars, ~{len(text) // 4:,} tokens)"))
 
-    def _save(self, args: list[str]) -> None:
+    def save_transcript(self, args: list[str]) -> None:
         arg = args[0] if args else ""
         path = Path(os.path.expanduser(arg)) if arg else \
             self.history_dir / f"chat-{datetime.now():%Y%m%d-%H%M%S}.md"
@@ -1484,22 +1509,24 @@ class Chat:
 
     # -- checkpoints -------------------------------------------------------------
 
-    def _checkpoints_ready(self) -> bool:
+    def _ready_checkpoints(self) -> Checkpoints | None:
+        """The checkpoint store, or None (saying why) when there isn't a usable one."""
         if self.checkpoints is None:
             why = ("tools are off for this session (--no-tools)" if self.toolbox is None
                    else "tools.checkpoints is off in the config")
             print(red(f"no checkpoints: {why}"))
-            return False
+            return None
         if not self.checkpoints.available:
             print(red("no checkpoints: git isn't installed"))
-            return False
-        return True
+            return None
+        return self.checkpoints
 
     def _list_checkpoints(self) -> None:
-        if not self._checkpoints_ready():
+        store = self._ready_checkpoints()
+        if store is None:
             return
         try:
-            cps = self.checkpoints.list(limit=15)
+            cps = store.recent(limit=15)
         except CheckpointError as e:
             print(red(f"can't list checkpoints: {e}"))
             return
@@ -1515,17 +1542,18 @@ class Chat:
 
     def _undo(self, args: list[str]) -> None:
         arg = args[0] if args else ""
-        if not self._checkpoints_ready():
+        store = self._ready_checkpoints()
+        if store is None:
             return
         try:
             if arg:
-                cp = self.checkpoints.find(arg)
+                cp = store.find(arg)
                 if cp is None:
                     print(red(f"no single checkpoint matches {arg!r}; see /checkpoints"))
                     return
-                changes = self.checkpoints.changes_since(cp.sha)
+                changes = store.changes_since(cp.sha)
             else:
-                found = self.checkpoints.latest_different()
+                found = store.latest_different()
                 if found is None:
                     print(dim("nothing to undo: the files match the latest checkpoint"))
                     return
@@ -1543,7 +1571,7 @@ class Chat:
             if ask("Restore? [y/N]: ").strip().lower() not in ("y", "yes"):
                 print(dim("left as is"))
                 return
-            reverted, safety = self.checkpoints.restore(cp.sha)
+            reverted, safety = store.restore(cp.sha)
         except CheckpointError as e:
             print(red(f"undo failed: {e}"))
             return
@@ -1593,7 +1621,7 @@ class Chat:
         fn(args, raw)
         return True
 
-    def _commands(self) -> dict:
+    def _commands(self) -> dict[str, tuple[Callable[[list[str], str], None], int | None]]:
         """Command name -> (handler(args, raw), most arguments it takes or None)."""
         return {
             "help": (lambda a, r: print(HELP), 0),
@@ -1604,7 +1632,7 @@ class Chat:
             "file": (lambda a, r: self._attach(a), None),
             "system": (self._cmd_system, None),
             "retry": (self._cmd_retry, 0),
-            "save": (lambda a, r: self._save(a), 1),
+            "save": (lambda a, r: self.save_transcript(a), 1),
             "stats": (lambda a, r: self._print_stats(), 0),
             "recall": (lambda a, r: self._recall(a), None),
             "undo": (lambda a, r: self._undo(a), 1),
@@ -1647,8 +1675,11 @@ class Chat:
         if unknown:
             print(red(f"unknown option {unknown[0]}; usage: /diff [-f|--full] [PATH…]"))
             return
-        if not self._checkpoints_ready():
+        store = self._ready_checkpoints()
+        if store is None:
             return
+        toolbox = self.toolbox
+        assert toolbox is not None  # checkpoints come with the toolbox
         if self.session_base is None:
             self._mark_session_start()
             print(dim("no starting point was recorded for this session; tracking from now"))
@@ -1656,16 +1687,16 @@ class Chat:
         rels = []
         for a in (a for a in args if not a.startswith("-")):
             try:
-                p = self.toolbox.ws.resolve(a)
+                p = toolbox.ws.resolve(a)
             except Exception as e:
                 print(red(str(e)))
                 return
-            rels.append(self.toolbox.ws.rel(p))
+            rels.append(toolbox.ws.rel(p))
         rels = [r for r in rels if r != "."]
         try:
-            found = [c for c in self.checkpoints.changes_since(self.session_base)
+            found = [c for c in store.changes_since(self.session_base)
                      if not rels or any(c.path == r or c.path.startswith(r + "/") for r in rels)]
-            text = self.checkpoints.diff_text(self.session_base, rels) if full and found else ""
+            text = store.diff_text(self.session_base, rels) if full and found else ""
         except CheckpointError as e:
             print(red(f"can't diff: {e}"))
             return
@@ -1683,7 +1714,7 @@ class Chat:
 
     # -- config ---------------------------------------------------------------
 
-    def _cmd_config(self, args, raw) -> None:
+    def _cmd_config(self, _args, _raw) -> None:
         """Open the config file in nano, then apply what can change live."""
         path = Path(self.cfg["derived"]["config_path"])
         nano = shutil.which("nano")
@@ -1713,11 +1744,11 @@ class Chat:
         if later:
             print(yellow(f"restart arborist for changes to [{'], ['.join(later)}] to take effect"))
 
-    def _cmd_clear(self, args, raw) -> None:
+    def _cmd_clear(self, _args, _raw) -> None:
         self._clear()
         print(dim("conversation cleared"))
 
-    def _cmd_effort(self, args, raw) -> None:
+    def _cmd_effort(self, args, _raw) -> None:
         if not self.efforts:
             print(red(f"{self.model_name} has no effort levels (model.efforts is empty)"))
         elif args and args[0] in self.efforts:
@@ -1726,18 +1757,18 @@ class Chat:
         else:
             print(red(f"usage: /effort {'|'.join(self.efforts)}  (now: {self.effort})"))
 
-    def _cmd_think(self, args, raw) -> None:
+    def _cmd_think(self, _args, _raw) -> None:
         self.ui.show_thinking = not self.ui.show_thinking
         print(dim(f"show thinking: {'on' if self.ui.show_thinking else 'off'}"))
 
-    def _cmd_tools(self, args, raw) -> None:
+    def _cmd_tools(self, _args, _raw) -> None:
         if self.toolbox is None:
             print(red("tools are unavailable in this session (started with --no-tools)"))
         else:
             self.tools_enabled = not self.tools_enabled
             print(dim(f"tools: {'on' if self.tools_enabled else 'off'}  (workspace {self.toolbox.ws.root})"))
 
-    def _cmd_system(self, args, raw) -> None:
+    def _cmd_system(self, _args, raw) -> None:
         # Free text: the raw remainder, so quotes and spacing survive.
         if not raw:
             print(dim(f"system prompt: {self.system_prompt}"))
@@ -1746,15 +1777,15 @@ class Chat:
             self._clear()
             print(dim("system prompt replaced; conversation cleared"))
 
-    def _cmd_retry(self, args, raw) -> None:
-        last_user = max((i for i, m in enumerate(self.messages) if m["role"] == "user"), default=None)
-        if last_user is None or last_user == len(self.messages) - 1:
+    def _cmd_retry(self, _args, _raw) -> None:
+        last_user = max((i for i, m in enumerate(self.messages) if m["role"] == "user"), default=-1)
+        if last_user < 0 or last_user == len(self.messages) - 1:
             print(red("nothing to retry"))
-        else:
-            self._rollback(last_user + 1)
-            self._reply()
+            return
+        self._rollback(last_user + 1)
+        self._reply()
 
-    def _cmd_compact(self, args, raw) -> None:
+    def _cmd_compact(self, _args, _raw) -> None:
         if len(self.messages) < 2:
             print(dim("nothing to compact yet"))
             return
@@ -1788,7 +1819,7 @@ class Chat:
         return True
 
     @staticmethod
-    def _stdin_pending(self, timeout: float = 0.03) -> bool:
+    def _stdin_pending(timeout: float = 0.03) -> bool:
         """True if more input is already queued, i.e. we're mid-paste."""
         try:
             return bool(select.select([sys.stdin], [], [], timeout)[0])
@@ -1796,11 +1827,11 @@ class Chat:
             return False
 
     @staticmethod
-    def _read_input(self) -> str | None:
+    def _read_input() -> str | None:
         line = input(PROMPT)
         if line.strip() != '"""':
             lines = [line]
-            while _stdin_pending():
+            while Chat._stdin_pending():
                 lines.append(input(""))
             return "\n".join(lines)
         block = []
@@ -1923,7 +1954,7 @@ def arborist_paths(cfg: dict) -> list[Path]:
     return [HERE, Path(cfg["derived"]["config_path"]).resolve()]
 
 
-def workspace_warnings(root: Path, cfg: dict) -> list[str]:
+def workspace_warnings(root: Path) -> list[str]:
     """Things worth knowing about the folder the model will be able to read."""
     home = Path.home().resolve()
     out = []
@@ -1974,7 +2005,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     workspace = None if args.no_tools else resolve_workspace(args.workspace)
-    for warning in workspace_warnings(workspace, cfg) if workspace is not None else []:
+    for warning in workspace_warnings(workspace) if workspace is not None else []:
         print(yellow(f"warning: {warning}"))
 
     # A --no-tools chat still sees the memories for the folder it's started in.
@@ -1987,7 +2018,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Ctrl-C while a turn is in progress (streaming, a tool, an approval
     # prompt or a run) cancels the turn; at the prompt it just clears the line.
-    def on_sigint(signum, frame):
+    def on_sigint(_signum, _frame):
         if chat.busy:
             raise Interrupted()
         raise KeyboardInterrupt()

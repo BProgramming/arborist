@@ -15,6 +15,7 @@ class NullUI:
     def reasoning(self, text): pass
     def text(self, text): self.texts.append(text)  # noqa: E704
     def end_message(self): pass
+    # noinspection PyUnusedParameter
     def tool_call(self, name, arguments): self.calls.append(name)  # noqa: E704
     def tool_result(self, name, result): pass
     def notice(self, message): self.notices.append(message)  # noqa: E704
@@ -46,7 +47,8 @@ class FakeModel:
         self.replies = list(replies)
         self.requests: list[dict] = []
 
-    def make_body(self, messages, with_tools):
+    @staticmethod
+    def make_body(messages, with_tools):
         return {"messages": json.loads(json.dumps(messages)), "with_tools": with_tools}
 
     def stream(self, body):
@@ -56,7 +58,7 @@ class FakeModel:
 
 
 def run(model, toolbox, ui=None, max_steps=25, prompt="go", **kw):
-    messages = [{"role": "user", "content": prompt}]
+    messages: list[dict] = [{"role": "user", "content": prompt}]
     result = agent.run_turn(messages, model.make_body, model.stream, toolbox, ui or NullUI(), max_steps, **kw)
     return result, messages
 
@@ -231,7 +233,7 @@ def test_the_compactor_runs_before_every_request_and_sees_usage(ws_root, make_to
         def __init__(self):
             self.calls, self.usages = 0, []
 
-        def maybe_compact(self, messages, force=False):
+        def maybe_compact(self, *_args, **_kwargs):
             self.calls += 1
             return False
 
@@ -266,6 +268,7 @@ def test_system_prompt_carries_the_rule_and_follows_config(tmp_path, monkeypatch
     ws = tmp_path / "ws"
     ws.mkdir()
     c = chat.Chat(config.load(), ws, tools_enabled=True)
+    assert c.toolbox is not None
     c._env_facts = []  # skip the toolchain probe
     assert "no display (GUI windows can't open)" in c._system()
     from tools import Limits

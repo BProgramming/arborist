@@ -29,6 +29,7 @@ import glob
 import os
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -101,7 +102,7 @@ def available() -> bool:
     return status()[0]
 
 
-def _supports_disable_userns() -> bool:
+def supports_disable_userns() -> bool:
     global _disable_userns
     if _disable_userns is None:
         try:
@@ -116,7 +117,7 @@ def _supports_disable_userns() -> bool:
 def _base_args() -> list[str]:
     """The system part of the sandbox: everything but the per-run binds."""
     args = ["--die-with-parent", "--new-session", "--unshare-all", "--unshare-user"]
-    if _supports_disable_userns():
+    if supports_disable_userns():
         args.append("--disable-userns")  # no nested namespaces (the classic escalation start)
     args += ["--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc"]
     for d in ("bin", "sbin", "lib", "lib32", "lib64", "libx32"):
@@ -134,7 +135,7 @@ def wrap(argv: list[str], spec: Spec, env: dict[str, str]) -> list[str]:
     """`argv` rewritten to run inside the sandbox, with exactly `env`."""
     home = Path(env.get("HOME") or Path.home())
     ws = spec.workspace.resolve()
-    args = [bwrap_path() or "bwrap", *_base_args(), "--tmpfs", str(home)]
+    args: list[str] = [bwrap_path() or "bwrap"] + _base_args() + ["--tmpfs", str(home)]
 
     # Reads already visible through another bind are skipped: under /usr or
     # /etc, or inside the workspace or a writable folder (where a separate
@@ -142,18 +143,18 @@ def wrap(argv: list[str], spec: Spec, env: dict[str, str]) -> list[str]:
     # compiled binary's own folder). Project folders that must stay read-only
     # are in spec.protect.
     reads, protect = [], list(spec.protect)
-    for r in _dedupe(spec.reads):
+    for r in dedupe(spec.reads):
         if not any(_within(r, d) for d in (Path("/usr"), Path("/etc"), ws, *spec.writable)):
             reads.append(r)
     for r in reads:
         args += ["--ro-bind", str(r), str(r)]
     args += ["--bind" if spec.workspace_writable else "--ro-bind", str(ws), str(ws)]
-    for w in _dedupe(spec.writable):
+    for w in dedupe(spec.writable):
         args += ["--bind", str(w), str(w)]
-    for p in _dedupe(protect):
+    for p in dedupe(protect):
         if os.path.exists(p):
             args += ["--ro-bind", str(p), str(p)]
-    for h in _dedupe(spec.hide):
+    for h in dedupe(spec.hide):
         if os.path.isdir(h):
             args += ["--tmpfs", str(h)]
     for f in _credential_files(reads + [ws]):
@@ -162,7 +163,7 @@ def wrap(argv: list[str], spec: Spec, env: dict[str, str]) -> list[str]:
     env = dict(env)
     env["TMPDIR"] = "/tmp"
     if spec.display:
-        args += _display_args(env)
+        args += display_args(env)
     else:
         for k in ("WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DISPLAY"):
             env.pop(k, None)
@@ -172,7 +173,7 @@ def wrap(argv: list[str], spec: Spec, env: dict[str, str]) -> list[str]:
     args.append("--clearenv")
     for k, v in sorted(env.items()):
         args += ["--setenv", k, v]
-    args += ["--chdir", str(spec.cwd.resolve()), "--", *argv]
+    args += ["--chdir", str(spec.cwd.resolve()), "--"] + argv
     return args
 
 
@@ -181,16 +182,16 @@ def wrap_system_readonly(argv: list[str]) -> list[str]:
     (asking an interpreter where it loads code from): the whole filesystem
     read-only, no network, no environment beyond PATH. It can read, but not
     write or send anything; its answer is checked before it's used."""
-    args = [bwrap_path() or "bwrap", "--die-with-parent", "--new-session", "--unshare-all",
-            "--unshare-user"]
-    if _supports_disable_userns():
+    args: list[str] = [bwrap_path() or "bwrap", "--die-with-parent", "--new-session",
+                       "--unshare-all", "--unshare-user"]
+    if supports_disable_userns():
         args.append("--disable-userns")
     return args + ["--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
                    "--clearenv", "--setenv", "PATH", os.environ.get("PATH", "/usr/bin:/bin"),
-                   "--", *argv]
+                   "--"] + argv
 
 
-def _display_args(env: dict[str, str]) -> list[str]:
+def display_args(env: dict[str, str]) -> list[str]:
     """Just the Wayland socket, in an otherwise empty XDG_RUNTIME_DIR.
 
     X11 isn't offered: any X client can read every keystroke and the whole
@@ -229,10 +230,10 @@ def _credential_files(dirs: list[Path]) -> list[Path]:
             except OSError:
                 continue
             found += [f for f in candidates if os.path.isfile(f)]
-    return _dedupe(found)
+    return dedupe(found)
 
 
-def _dedupe(paths) -> list[Path]:
+def dedupe(paths) -> list[Path]:
     out: dict[str, Path] = {}
     for p in paths:
         p = Path(p)
@@ -245,7 +246,7 @@ class SandboxError(Exception):
 
 
 def protected_dirs(workspace: Path, cwd: Path, steps: list[list[str]],
-                   skip: list[Path] = ()) -> list[Path]:
+                   skip: Sequence[Path] = ()) -> list[Path]:
     """Paths in the workspace that stay read-only, at any depth: every .git
     (the folder, or the pointer file a worktree or submodule has), every folder
     in PROTECTED_NAMES, and every virtualenv (any folder with a pyvenv.cfg,
@@ -322,6 +323,7 @@ def tool_root(exe: str | os.PathLike | None) -> list[Path]:
         return []
     home = Path.home().resolve()
     broad = {Path("/"), home, home / ".local"}
+    exe = str(exe)
     hops, p = [], Path(os.path.abspath(exe))
     for _ in range(40):
         hops.append(p)
@@ -336,7 +338,7 @@ def tool_root(exe: str | os.PathLike | None) -> list[Path]:
             continue
         d = h.parent
         out.append(d.parent if d.name == "bin" and d.parent not in broad else d)
-    return _dedupe(out)
+    return dedupe(out)
 
 
 def home_dir(env_var: str, default: str) -> list[Path]:

@@ -14,7 +14,6 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -116,7 +115,7 @@ def _probe(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProce
         return None
 
 
-def _version(cmd: list[str]) -> str | None:
+def tool_version(cmd: list[str]) -> str | None:
     r = _probe(cmd)
     if r is None or r.returncode != 0:
         return None
@@ -234,14 +233,14 @@ def toolchain_folders(steps: list[list[str]]) -> tuple[list[Path], list[Path]]:
                 writable.append((root / "bin" / "cache").resolve())
     reads += sandbox.home_dir("CARGO_HOME", ".cargo") + sandbox.home_dir("RUSTUP_HOME", ".rustup")
     reads += sandbox.home_dir("PUB_CACHE", ".pub-cache")
-    return sandbox._dedupe(reads), sandbox._dedupe(writable)
+    return sandbox.dedupe(reads), sandbox.dedupe(writable)
 
 
 def _with_toolchain(plan: RunPlan) -> RunPlan:
     if plan.ok:
         reads, writable = toolchain_folders(plan.steps)
-        plan.reads = sandbox._dedupe(plan.reads + reads)
-        plan.writable = sandbox._dedupe(plan.writable + writable)
+        plan.reads = sandbox.dedupe(plan.reads + reads)
+        plan.writable = sandbox.dedupe(plan.writable + writable)
     return plan
 
 
@@ -294,9 +293,8 @@ def python_imports(source: str) -> tuple[set[str], set[str]]:
     """
     tree = ast.parse(source)
     guarded: set[int] = set()
-    try_types = tuple(t for t in (ast.Try, getattr(ast, "TryStar", None)) if t)
     for node in ast.walk(tree):
-        if isinstance(node, try_types):
+        if isinstance(node, (ast.Try, ast.TryStar)):
             for stmt in node.body:
                 guarded.update(id(n) for n in ast.walk(stmt))
     required, optional = set(), set()
@@ -320,8 +318,8 @@ def _is_local_module(name: str, path: Path, root: Path) -> bool:
 def _plan_python(path: Path, root: Path, build_dir: Path) -> RunPlan:
     plan = RunPlan(cwd=path.parent)
     interp = _python_interpreter(path, root)
-    version = _version([interp, "--version"]) if interp else None
-    if not version:
+    version = tool_version([interp, "--version"]) if interp else None
+    if not interp or not version:
         plan.problems.append("Python interpreter (python3) not found")
         return plan
     where = "project venv" if "/venv/" in interp or "/.venv/" in interp else "system"
@@ -364,11 +362,11 @@ def _plan_python(path: Path, root: Path, build_dir: Path) -> RunPlan:
 
 # -------------------------------------------------------------- js / ts ---
 
-def _node_version() -> tuple[str, tuple[int, int]] | None:
+def node_version() -> tuple[str, tuple[int, int]] | None:
     node = shutil.which("node")
-    v = _version([node, "--version"]) if node else None
+    v = tool_version([node, "--version"]) if node else None
     m = re.match(r"v(\d+)\.(\d+)", v or "")
-    return (node, (int(m[1]), int(m[2]))) if m else None
+    return (node, (int(m[1]), int(m[2]))) if node and m else None
 
 
 def _check_node_packages(path: Path, root: Path, plan: RunPlan) -> Path:
@@ -393,9 +391,9 @@ def _check_node_packages(path: Path, root: Path, plan: RunPlan) -> Path:
     return pkg_dir
 
 
-def _plan_js(path: Path, root: Path, build_dir: Path) -> RunPlan:
+def _plan_js(path: Path, root: Path, _build_dir: Path) -> RunPlan:
     plan = RunPlan()
-    nv = _node_version()
+    nv = node_version()
     if nv is None:
         plan.problems.append("Node.js (node) not found")
         return plan
@@ -406,9 +404,9 @@ def _plan_js(path: Path, root: Path, build_dir: Path) -> RunPlan:
     return plan
 
 
-def _plan_ts(path: Path, root: Path, build_dir: Path) -> RunPlan:
+def _plan_ts(path: Path, root: Path, _build_dir: Path) -> RunPlan:
     plan = RunPlan()
-    nv = _node_version()
+    nv = node_version()
     if nv is None:
         plan.problems.append("Node.js (node) not found")
         return plan
@@ -465,8 +463,8 @@ def _plan_rust(path: Path, root: Path, build_dir: Path) -> RunPlan:
         return plan
 
     rustc = shutil.which("rustc")
-    v = _version([rustc, "--version"]) if rustc else None
-    if not v:
+    v = tool_version([rustc, "--version"]) if rustc else None
+    if not rustc or not v:
         plan.problems.append("rustc not found (install Rust with rustup)")
         return plan
     plan.checked.append(v)
@@ -480,11 +478,11 @@ def _plan_rust(path: Path, root: Path, build_dir: Path) -> RunPlan:
 
 # ----------------------------------------------------------------- dart ---
 
-def _plan_dart(path: Path, root: Path, build_dir: Path) -> RunPlan:
+def _plan_dart(path: Path, root: Path, _build_dir: Path) -> RunPlan:
     plan = RunPlan(cwd=path.parent)
     dart = shutil.which("dart")
-    v = _version([dart, "--version"]) if dart else None
-    if not v:
+    v = tool_version([dart, "--version"]) if dart else None
+    if not dart or not v:
         plan.problems.append("Dart SDK (dart) not found")
         return plan
     plan.checked.append(v)
@@ -572,6 +570,7 @@ def plan_tests(target: Path, root: Path, build_dir: Path) -> RunPlan:
             return RunPlan(problems=["couldn't tell how to run tests here: no Cargo.toml, "
                                      "pubspec.yaml, pyproject.toml/setup.cfg/pytest.ini or "
                                      "package.json, and no test_*.py files. Pass a test file"])
+    assert project is not None  # set whenever kind is
     rel = os.path.relpath(target, project)
     planner = {"python": _tests_python, "rust": _tests_rust, "dart": _tests_dart, "node": _tests_node}[kind]
     return _with_toolchain(planner(target, project, rel, root, build_dir))
@@ -580,8 +579,8 @@ def plan_tests(target: Path, root: Path, build_dir: Path) -> RunPlan:
 def _tests_python(target: Path, project: Path, rel: str, root: Path, build_dir: Path) -> RunPlan:
     plan = RunPlan(cwd=project, env=dict(PYTHON_ENV))
     interp = python_for_dir(project, root)
-    version = _version([interp, "--version"]) if interp else None
-    if not version:
+    version = tool_version([interp, "--version"]) if interp else None
+    if not interp or not version:
         plan.problems.append("Python interpreter (python3) not found")
         return plan
     plan.checked.append(f"{version} ({interp})")
@@ -603,8 +602,8 @@ def _tests_python(target: Path, project: Path, rel: str, root: Path, build_dir: 
 def _cargo_offline_ready(pkg: Path, plan: RunPlan) -> str | None:
     """cargo's path if it's installed and every crate is already downloaded."""
     cargo = shutil.which("cargo")
-    v = _version([cargo, "--version"]) if cargo else None
-    if not v:
+    v = tool_version([cargo, "--version"]) if cargo else None
+    if not cargo or not v:
         plan.problems.append("cargo not found (install Rust with rustup)")
         return None
     plan.checked.append(v)
@@ -624,7 +623,7 @@ def _cargo_offline_ready(pkg: Path, plan: RunPlan) -> str | None:
     return cargo
 
 
-def _tests_rust(target: Path, project: Path, rel: str, root: Path, build_dir: Path) -> RunPlan:
+def _tests_rust(_target: Path, project: Path, rel: str, _root: Path, _build_dir: Path) -> RunPlan:
     plan = RunPlan(cwd=project)
     cargo = _cargo_offline_ready(project, plan)
     if cargo is None:
@@ -636,7 +635,7 @@ def _tests_rust(target: Path, project: Path, rel: str, root: Path, build_dir: Pa
     return plan
 
 
-def _tests_dart(target: Path, project: Path, rel: str, root: Path, build_dir: Path) -> RunPlan:
+def _tests_dart(_target: Path, project: Path, rel: str, _root: Path, _build_dir: Path) -> RunPlan:
     plan = RunPlan(cwd=project)
     try:
         pubspec = (project / "pubspec.yaml").read_text(encoding="utf-8")
@@ -652,8 +651,8 @@ def _tests_dart(target: Path, project: Path, rel: str, root: Path, build_dir: Pa
         plan.checked.append(f"Flutter ({exe})")  # `flutter --version` is slow; skip it
     else:
         exe = shutil.which("dart")
-        v = _version([exe, "--version"]) if exe else None
-        if not v:
+        v = tool_version([exe, "--version"]) if exe else None
+        if not exe or not v:
             plan.problems.append("Dart SDK (dart) not found")
             return plan
         plan.checked.append(v)
@@ -670,9 +669,9 @@ def _tests_dart(target: Path, project: Path, rel: str, root: Path, build_dir: Pa
     return plan
 
 
-def _tests_node(target: Path, project: Path, rel: str, root: Path, build_dir: Path) -> RunPlan:
+def _tests_node(target: Path, project: Path, rel: str, root: Path, _build_dir: Path) -> RunPlan:
     plan = RunPlan(cwd=project)
-    nv = _node_version()
+    nv = node_version()
     if nv is None:
         plan.problems.append("Node.js (node) not found")
         return plan
@@ -723,10 +722,10 @@ _FAILURE_START = re.compile(
     r"^(=+ (FAILURES|ERRORS) =+"          # pytest
     r"|(FAIL|ERROR): "                     # unittest
     r"|failures:\s*$"                      # cargo test
-    r"|error(\[E\d+\])?: "                 # rustc compile errors
+    r"|error(\[E\d+])?: "                  # rustc compile errors
     r"|not ok \d+"                         # node --test (TAP)
     r"|\s*✖ "                              # node --test (spec reporter)
-    r"|.*\[E\]"                            # dart/flutter test
+    r"|.*\[E]"                             # dart/flutter test
     r")")
 
 
@@ -790,7 +789,7 @@ def execute(plan: RunPlan, log_dir: Path, timeout: int,
     return RunOutcome(exit_code, timed_out, time.monotonic() - start, log_path)
 
 
-def _run_step(cmd: list[str], cwd: Path, timeout: float, log, on_output,
+def _run_step(cmd: list[str], cwd: Path | None, timeout: float, log, on_output,
               env: dict[str, str] | None = None) -> tuple[int | None, bool]:
     try:
         # New session: Ctrl-C at the terminal doesn't reach it directly, and on
@@ -806,6 +805,7 @@ def _run_step(cmd: list[str], cwd: Path, timeout: float, log, on_output,
         return 127, False
 
     def pump():
+        assert proc.stdout is not None  # stdout=PIPE
         for line in proc.stdout:
             log.write(line)
             log.flush()

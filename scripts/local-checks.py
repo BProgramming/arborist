@@ -49,19 +49,26 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 class YesToEverything:
-    def approve_change(self, *a, **k):
+    """A tools.Approver that never asks; its answers don't depend on the request."""
+
+    @staticmethod
+    def approve_change(*_a, **_k):
         return Decision(True)
 
-    def show_change(self, *a, **k):
+    @staticmethod
+    def show_change(*_a, **_k):
         pass
 
-    def approve_run(self, *a, **k):
+    @staticmethod
+    def approve_run(*_a, **_k):
         return Decision(True)
 
-    def approve_fetch(self, *a, **k):
+    @staticmethod
+    def approve_fetch(*_a, **_k):
         return Decision(False)  # these checks never fetch
 
-    def approve_memory(self, *a, **k):
+    @staticmethod
+    def approve_memory(*_a, **_k):
         return MemoryChoice("skip")
 
 
@@ -96,7 +103,7 @@ def check_platform() -> bool:
     ok, why = sandbox.status()
     check("bwrap can create a sandbox", ok, version if ok else why)
     check("bwrap blocks nested user namespaces (--disable-userns, 0.8+)",
-          sandbox._supports_disable_userns(), version)
+          sandbox.supports_disable_userns(), version)
     restrict = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
     if restrict.exists():
         value = restrict.read_text().strip()
@@ -146,7 +153,7 @@ def check_secrets() -> None:
     try:
         cfg = config.load()
         host, port = cfg["server"]["host"], cfg["server"]["port"]
-    except Exception:
+    except (config.ConfigError, OSError, KeyError):
         host, port = "127.0.0.1", 8091
     listening = False
     try:
@@ -191,8 +198,8 @@ def check_toolchains() -> None:
              ("tsx", "hi.ts", "const n: number = 6 * 7; console.log('ts', n)", "ts 42"),
              ("rustc", "hi.rs", 'fn main() { println!("rust {}", 6 * 7); }', "rust 42"),
              ("dart", "hi.dart", "void main() { print('dart ${6 * 7}'); }", "dart 42")]
-    nv = runners._node_version()
-    node_strips_types = bool(nv) and nv[1] >= (22, 6)
+    nv = runners.node_version()
+    node_strips_types = nv is not None and nv[1] >= (22, 6)
     for tool, name, code, want in cases:
         if tool == "tsx" and not shutil.which("tsx") and not node_strips_types:
             report("SKIP", "TypeScript", "no tsx, and Node is older than 22.6 "
@@ -319,7 +326,7 @@ def run_suite() -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     ap.add_argument("--no-suite", action="store_true", help="skip the pytest suite")
     ap.add_argument("--window", action="store_true", help="open a pygame test window (Wayland)")
     args = ap.parse_args()

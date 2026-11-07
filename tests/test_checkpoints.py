@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from checkpoints import Checkpoints
+from checkpoints import Change, Checkpoint, Checkpoints
 from conftest import FakeApprover, needs, write
 from tools import IGNORED_DIRS
 
@@ -15,6 +15,19 @@ pytestmark = needs("git")
 @pytest.fixture
 def cps(ws_root, tmp_path):
     return Checkpoints(ws_root, tmp_path / "store", exclude=IGNORED_DIRS)
+
+
+def latest(store: Checkpoints) -> tuple[Checkpoint, list[Change]]:
+    """latest_different(), which these tests expect to find something."""
+    found = store.latest_different()
+    assert found is not None
+    return found
+
+
+def find(store: Checkpoints, prefix: str) -> Checkpoint:
+    cp = store.find(prefix)
+    assert cp is not None
+    return cp
 
 
 def test_restore_reverts_edits_deletions_and_new_files(ws_root, cps):
@@ -33,7 +46,8 @@ def test_restore_reverts_edits_deletions_and_new_files(ws_root, cps):
     assert (ws_root / "gone.py").read_text() == "will be deleted\n"
     assert not (ws_root / "pkg").exists()  # emptied directories are cleaned up
     # The state before the restore was saved, so the undo can be undone.
-    assert cps.list()[0].kind == "safety" and cps.list()[0].sha == safety
+    assert cps.recent()[0].kind == "safety" and cps.recent()[0].sha == safety
+    assert safety is not None
     cps.restore(safety)
     assert (ws_root / "keep.py").read_text() == "changed\n"
     assert (ws_root / "pkg/new/added.py").exists()
@@ -73,13 +87,13 @@ def test_latest_different_walks_back_one_turn_at_a_time(ws_root, cps):
     cps.snapshot("turn two")
     write(ws_root, "a.py", "3\n")
 
-    cp, changes = cps.latest_different()
+    cp, changes = latest(cps)
     assert cp.label == "turn two" and [c.path for c in changes] == ["a.py"]
     cps.restore(cp.sha)
     assert (ws_root / "a.py").read_text() == "2\n"
 
     # The safety snapshot isn't a target, and "turn two" now matches.
-    cp, _ = cps.latest_different()
+    cp, _ = latest(cps)
     assert cp.label == "turn one"
     cps.restore(cp.sha)
     assert (ws_root / "a.py").read_text() == "1\n"
@@ -87,10 +101,10 @@ def test_latest_different_walks_back_one_turn_at_a_time(ws_root, cps):
 
 
 def test_find_by_prefix_and_empty_store(ws_root, cps):
-    assert cps.list() == [] and cps.find("abc") is None
+    assert cps.recent() == [] and cps.find("abc") is None
     write(ws_root, "a.py", "x\n")
     sha = cps.snapshot("only")
-    assert cps.find(sha[:7]).label == "only"
+    assert find(cps, sha[:7]).label == "only"
 
 
 def test_the_users_hooks_and_identity_dont_apply(ws_root, cps, tmp_path, monkeypatch):
@@ -116,15 +130,15 @@ def test_one_checkpoint_per_turn_before_the_first_change(ws_root, make_toolbox, 
     tb.checkpoints = cps
     tb.begin_turn("make it v3")
     tb.call("read_file", {"path": "a.py"})
-    assert cps.list() == []  # reading changes nothing, so no snapshot
+    assert cps.recent() == []  # reading changes nothing, so no snapshot
     tb.call("edit_file", {"path": "a.py", "old_string": "v1", "new_string": "v2"})
     tb.call("edit_file", {"path": "a.py", "old_string": "v2", "new_string": "v3"})
-    assert [c.label for c in cps.list()] == ["make it v3"]
+    assert [c.label for c in cps.recent()] == ["make it v3"]
 
     tb.begin_turn("next")
     tb.call("write_file", {"path": "b.py", "content": "new\n"})
-    assert [c.label for c in cps.list()] == ["next", "make it v3"]
-    cps.restore(cps.list()[1].sha)
+    assert [c.label for c in cps.recent()] == ["next", "make it v3"]
+    cps.restore(cps.recent()[1].sha)
     assert (ws_root / "a.py").read_text() == "v1\n" and not (ws_root / "b.py").exists()
 
 
@@ -135,7 +149,7 @@ def test_a_declined_edit_takes_no_checkpoint(ws_root, make_toolbox, cps):
     tb.checkpoints = cps
     tb.call("read_file", {"path": "a.py"})
     tb.call("edit_file", {"path": "a.py", "old_string": "v1", "new_string": "v2"})
-    assert cps.list() == []
+    assert cps.recent() == []
 
 
 def test_a_broken_checkpoint_never_blocks_the_edit(ws_root, make_toolbox):
@@ -159,6 +173,7 @@ from datetime import datetime, timedelta  # noqa: E402
 from checkpoints import prune_store  # noqa: E402
 
 
+# noinspection PyProtectedMember
 def aged_snapshot(cps, label, days_ago, kind="turn"):
     """A checkpoint dated `days_ago` days back."""
     cps._ensure()
@@ -181,12 +196,12 @@ def test_old_checkpoints_are_dropped_and_recent_ones_still_restore(ws_root, cps,
     write(ws_root, "a.py", "v5\n")
 
     assert prune_store(tmp_path / "store", 14) == (2, 0)
-    assert [c.label for c in cps.list()] == ["today", "recent"]
+    assert [c.label for c in cps.recent()] == ["today", "recent"]
     # The kept checkpoints still hold the right files.
-    cp, _ = cps.latest_different()
+    cp, _ = latest(cps)
     cps.restore(cp.sha)
     assert (ws_root / "a.py").read_text() == "v4\n"
-    cps.restore(cps.find(cps.list()[-1].short).sha)
+    cps.restore(find(cps, cps.recent()[-1].short).sha)
     assert (ws_root / "a.py").read_text() == "v3\n"
     # And the old commits are really gone from the store.
     with pytest.raises(Exception):
@@ -201,14 +216,14 @@ def test_undo_chain_survives_the_rewrite(ws_root, cps, tmp_path):
     write(ws_root, "a.py", "3\n")
     cps.snapshot("turn two")
     write(ws_root, "a.py", "4\n")
-    cp, _ = cps.latest_different()
+    cp, _ = latest(cps)
     cps.restore(cp.sha)  # back to "turn two"; a safety snapshot points at it
 
     prune_store(tmp_path / "store", 14)
-    safety = cps.list()[0]
-    assert safety.kind == "safety" and safety.restored == cps.list()[1].sha
+    safety = cps.recent()[0]
+    assert safety.kind == "safety" and safety.restored == cps.recent()[1].sha
     # The next /undo still goes further back, not forward.
-    cp, _ = cps.latest_different()
+    cp, _ = latest(cps)
     assert cp.label == "turn one"
 
 
@@ -218,7 +233,7 @@ def test_a_store_with_nothing_recent_is_deleted_and_recreated(ws_root, cps, tmp_
     assert prune_store(tmp_path / "store", 14) == (1, 1)
     assert not cps.git_dir.exists()
     cps.snapshot("fresh start")
-    assert [c.label for c in cps.list()] == ["fresh start"]
+    assert [c.label for c in cps.recent()] == ["fresh start"]
 
 
 def test_a_deleted_workspaces_store_is_removed(ws_root, cps, tmp_path):
@@ -261,4 +276,4 @@ def test_zero_days_keeps_everything(ws_root, cps, tmp_path):
     write(ws_root, "a.py", "x\n")
     aged_snapshot(cps, "ancient", 400)
     assert prune_store(tmp_path / "store", 0) == (0, 0)
-    assert len(cps.list()) == 1
+    assert len(cps.recent()) == 1

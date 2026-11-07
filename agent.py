@@ -17,7 +17,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Protocol
 
-from tools import ToolResult, Toolbox
+from tools import ToolResult
 
 TOOL_GUIDE = """\
 You are working in the directory {root} on the user's computer. Tools let you \
@@ -77,6 +77,11 @@ def sandbox_rule(limits) -> str:
     return (rule + " If a run fails for one of those reasons (a download, a package install, "
             "a GUI window, a file outside the project), the code isn't the problem: don't change "
             "it or look for a way around. Tell the user to run it themselves, and stop.")
+
+
+class ToolRunner(Protocol):
+    """What run_turn needs from the tools: tools.Toolbox, or chat.AgentTools."""
+    def call(self, name: str, raw_args: str | dict) -> ToolResult: ...
 
 
 class AgentUI(Protocol):
@@ -167,7 +172,7 @@ def consume_stream(chunks: Iterable[dict], ui: AgentUI) -> StreamResult:
 def run_turn(messages: list[dict],
              make_body: Callable[[list[dict], bool], dict],
              stream: Callable[[dict], Iterator[dict]],
-             toolbox: Toolbox | None,
+             toolbox: ToolRunner | None,
              ui: AgentUI,
              max_steps: int = 25,
              *,
@@ -201,6 +206,7 @@ def run_turn(messages: list[dict],
         if not (tools_on and res.tool_calls):
             messages.append({"role": "assistant", "content": res.text})
             return TurnResult(res.text, steps, hard_stopped, res.timings, res.usage, paused)
+        assert toolbox is not None  # tools_on
 
         messages.append({
             "role": "assistant",

@@ -24,7 +24,7 @@ from the server's reported prompt size after every request.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Callable
 
 STUB_PREFIX = "[compacted]"
@@ -60,7 +60,7 @@ class CompactionSettings:
 
     @classmethod
     def from_config(cls, cfg: dict) -> "CompactionSettings":
-        return cls(**{k: cfg[k] for k in cls.__dataclass_fields__ if k in cfg})
+        return cls(**{f.name: cfg[f.name] for f in fields(cls) if f.name in cfg})
 
 
 class Compactor:
@@ -148,7 +148,7 @@ class Compactor:
             content = m.get("content") or ""
             if content.startswith(STUB_PREFIX) or len(content) <= _KEEP_SHORT:
                 continue
-            name, args = calls.get(m.get("tool_call_id"), ("tool", {}))
+            name, args = calls.get(m.get("tool_call_id", ""), ("tool", {}))
             messages[i] = {**m, "content": f"{STUB_PREFIX} The output of {_describe(name, args)} "
                                            "was removed to save context. Call it again if you "
                                            "need it."}

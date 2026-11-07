@@ -28,7 +28,8 @@ def chars(messages):
     return sum(len(m.get("content") or "") + len(json.dumps(m.get("tool_calls") or [])) for m in messages)
 
 
-def make(context_tokens=10_000, summary="Goal: things.\nDone so far: stuff.", **settings):
+def make(context_tokens=10_000, summary: str | Exception = "Goal: things.\nDone so far: stuff.",
+         **settings):
     log = {"notices": [], "forgot": [], "transcripts": []}
 
     def summarize(text):

@@ -263,7 +263,10 @@ class TestRobustness:
 
     def test_a_bug_in_a_tool_is_contained_and_logged(self, make_toolbox, monkeypatch):
         tb = make_toolbox()
-        monkeypatch.setattr(tb, "tool_list_files", lambda **kw: 1 / 0)
+        def buggy(**_kw):
+            raise ZeroDivisionError("division by zero")
+
+        monkeypatch.setattr(tb, "tool_list_files", buggy)
         out = tb.call("list_files", {}).content
         assert out.startswith("error: internal error in list_files (ZeroDivisionError")
         assert "ZeroDivisionError" in (tb.log_dir / "tool-errors.log").read_text()
@@ -272,7 +275,7 @@ class TestRobustness:
         class FakeInterrupt(BaseException):
             pass
 
-        def boom(**kw):
+        def boom(**_kw):
             raise FakeInterrupt()
 
         tb = make_toolbox()

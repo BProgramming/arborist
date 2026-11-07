@@ -55,7 +55,8 @@ class FakeClient:
         self.requests.append(body)
         yield from (self.replies.pop(0) if self.replies else text_reply("(out of script)"))
 
-    def healthy(self):
+    @staticmethod
+    def healthy():
         return True
 
 

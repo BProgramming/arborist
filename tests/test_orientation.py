@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import subprocess
 
-import pytest
-
 import outline
 from conftest import needs, write
 

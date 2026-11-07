@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import io
 import os
-import shutil
 import socket
 import subprocess
 import threading
@@ -174,7 +173,7 @@ def test_run_cannot_see_other_processes(ws_root, make_toolbox):
 @sandboxed
 def test_run_cannot_create_namespaces(ws_root, make_toolbox):
     """No nested user namespaces: the usual first step of a kernel exploit."""
-    if not sandbox._supports_disable_userns():
+    if not sandbox.supports_disable_userns():
         pytest.skip("this bwrap is too old for --disable-userns (needs 0.8+)")
     write(ws_root, "ns.py",
           "import os\n"
@@ -219,7 +218,8 @@ def test_nothing_runs_when_the_sandbox_is_unavailable(ws_root, make_toolbox, app
     tb = make_toolbox(approver, run_sandbox=True)
     check = tb.call("check_dependencies", {"path": "hello.py"}).content
     assert "bwrap" in check and probes == []  # not even a probe
-    out = tb.call("run_file", {"path": "hello.py"}).content
+    out = tb.call("run_file", {"path": "hello.py"})
+    assert out.content.startswith("error:")  # refused: the check failed
     tests = tb.call("run_tests", {"path": "."})
     assert "bwrap" in tests.content and tests.hard_stop
     assert approver.run_requests == [] and probes == []
@@ -325,8 +325,7 @@ def test_safe_stdout_keeps_only_arborists_own_colours(monkeypatch):
 
 # --- options that open things up are explicit -------------------------------
 
-def test_openings_are_off_by_default_and_named_on_the_prompt(ws_root, make_toolbox, approver,
-                                                             monkeypatch):
+def test_openings_are_off_by_default_and_named_on_the_prompt(ws_root, make_toolbox, approver):
     tb = make_toolbox(approver)
     lim = tb.limits
     assert lim.run_sandbox and not lim.run_display and not lim.run_gpu
@@ -540,10 +539,12 @@ def test_symlinks_cannot_point_edits_outside(ws_root, tmp_path, make_toolbox, ap
 
 def test_saved_memories_are_shown_in_full(load_toml, ws_root):
     c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    agent_tools = c.agent_tools
+    assert c.toolbox is not None and agent_tools is not None
     notices: list[str] = []
     c.toolbox.on_notice = notices.append
     fact = "Uses tabs; " + "long detail " * 15
-    c.agent_tools.call("remember", {"memory": fact, "scope": "general"})
+    agent_tools.call("remember", {"memory": fact, "scope": "general"})
     assert any(fact.strip() in n for n in notices)
 
 
@@ -587,10 +588,11 @@ def test_diff_shows_changes_since_the_session_started(load_toml, ws_root, capsys
 
 def test_config_command_opens_nano_and_applies_tools(load_toml, ws_root, monkeypatch, capsys):
     c = chat.Chat(load_toml("[tools]\nrun_timeout = 120\n"), ws_root, tools_enabled=True)
+    assert c.toolbox is not None
     path = Path(c.cfg["derived"]["config_path"])
     opened: list = []
 
-    def fake_nano(cmd, *a, **k):
+    def fake_nano(cmd, *_a, **_k):
         opened.append(cmd)
         path.write_text(path.read_text().replace("run_timeout = 120", "run_timeout = 30"))
     monkeypatch.setattr(chat.shutil, "which", lambda name: "/usr/bin/nano" if name == "nano" else None)
@@ -599,7 +601,7 @@ def test_config_command_opens_nano_and_applies_tools(load_toml, ws_root, monkeyp
     assert opened == [["/usr/bin/nano", str(path)]]
     assert c.toolbox.limits.run_timeout == 30 and "applied" in capsys.readouterr().out
 
-    def broken(cmd, *a, **k):
+    def broken(*_a, **_k):
         path.write_text(path.read_text().replace("run_timeout = 30", "run_timeout = -1"))
     monkeypatch.setattr(chat.subprocess, "run", broken)
     c.command("/config")
@@ -689,13 +691,13 @@ def test_startup_warns_about_broad_workspaces(tmp_path, monkeypatch):
         (docs / repo / ".git").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(chat, "HERE", docs / "arborist")
-    warnings = " | ".join(chat.workspace_warnings(docs.resolve(), {}))
+    warnings = " | ".join(chat.workspace_warnings(docs.resolve()))
     assert "read everything in it" in warnings
     assert "3 separate projects" in warnings
     assert "arborist's own code" in warnings and "not change it" in warnings
-    inside = chat.workspace_warnings((docs / "arborist").resolve(), {})
+    inside = chat.workspace_warnings((docs / "arborist").resolve())
     assert len(inside) == 1 and "not change it" in inside[0]
-    assert chat.workspace_warnings((docs / "seymour").resolve(), {}) == []
+    assert chat.workspace_warnings((docs / "seymour").resolve()) == []
 
 
 def test_chat_protects_arborist_and_hides_its_data(load_toml, tmp_path, monkeypatch):
@@ -704,6 +706,7 @@ def test_chat_protects_arborist_and_hides_its_data(load_toml, tmp_path, monkeypa
     install.mkdir(parents=True)
     monkeypatch.setattr(chat, "HERE", install.resolve())
     c = chat.Chat(load_toml(), ws, tools_enabled=True)
+    assert c.toolbox is not None
     assert install.resolve() in c.toolbox.ws.readonly
     assert Path(c.cfg["derived"]["config_path"]).resolve() in c.toolbox.ws.readonly
     assert Path(c.cfg["derived"]["root"]).resolve() in c.toolbox.ws.hidden

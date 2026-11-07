@@ -12,6 +12,12 @@ import sandbox
 from tools import Decision, Limits, MemoryChoice, Toolbox, Workspace
 
 
+class RecordingToolbox(Toolbox):
+    """A Toolbox that keeps what it streamed, for assertions."""
+    output: list[str]   # lines streamed during runs and crawls
+    notices: list[str]
+
+
 class FakeApprover:
     """Records every approval request and answers from a script.
 
@@ -78,10 +84,10 @@ def make_toolbox(ws_root, tmp_path):
         limits.setdefault("run_sandbox", sandbox.available())
         output: list[str] = []
         notices: list[str] = []
-        tb = Toolbox(Workspace(ws_root), approver or FakeApprover(), Limits(**limits),
-                     log_dir=tmp_path / "logs", on_output=output.append,
-                     on_notice=notices.append)
-        tb.output = output    # lines streamed during runs and crawls, for assertions
+        tb = RecordingToolbox(Workspace(ws_root), approver or FakeApprover(), Limits(**limits),
+                              log_dir=tmp_path / "logs", on_output=output.append,
+                              on_notice=notices.append)
+        tb.output = output
         tb.notices = notices
         return tb
     return make

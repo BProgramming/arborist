@@ -251,6 +251,9 @@ def load(path: str | os.PathLike | None = None) -> dict:
     root = Path(os.path.expanduser(cfg["paths"]["root"])).resolve()
     m = cfg["model"]
     model_file = m["file"]
+    # Plain HTTP on purpose: llama-server runs locally and speaks no TLS.
+    # noinspection HttpUrlsUsage
+    base_url = f"http://{cfg['server']['host']}:{cfg['server']['port']}"
     cfg["derived"] = {
         "config_path": str(path.resolve()),
         "root": str(root),
@@ -269,7 +272,7 @@ def load(path: str | os.PathLike | None = None) -> dict:
         "history_dir": str(root / "history"),
         "memory_path": str(root / "memory" / "memory.toml"),
         "checkpoint_dir": str(root / "checkpoints"),
-        "base_url": f"http://{cfg['server']['host']}:{cfg['server']['port']}",
+        "base_url": base_url,
     }
     return cfg
 

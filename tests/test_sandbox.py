@@ -93,7 +93,7 @@ def test_tool_root_follows_symlink_chains(tmp_path):
     assert tmp_path / "pkgs/node_modules" in roots  # the package and its siblings
 
 
-def test_doctored_interpreter_cant_name_secret_folders(tmp_path, monkeypatch, fake_home):
+def test_doctored_interpreter_cant_name_secret_folders(tmp_path, fake_home):
     """An interpreter's answer about its own paths is filtered before use."""
     assert not runners._python_dir(fake_home / ".ssh")
     assert not runners._python_dir(fake_home)
@@ -107,7 +107,7 @@ def test_display_needs_wayland(monkeypatch):
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
     monkeypatch.setenv("DISPLAY", ":0")
     with pytest.raises(sandbox.SandboxError, match="Wayland"):
-        sandbox._display_args({})
+        sandbox.display_args({})
 
 
 def test_display_passes_only_the_wayland_socket(tmp_path, monkeypatch):
@@ -119,7 +119,7 @@ def test_display_passes_only_the_wayland_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
     monkeypatch.setenv("DISPLAY", ":0")
     env = {"DISPLAY": ":0"}
-    args = sandbox._display_args(env)
+    args = sandbox.display_args(env)
     assert str(runtime / "wayland-1") in args and str(runtime / "bus") not in args
     assert "DISPLAY" not in env and env["WAYLAND_DISPLAY"] == "wayland-1"
 
@@ -134,6 +134,7 @@ def test_gpu_binds_only_when_asked(ws_root):
 
 # ------------------------------------------------------------ highlighting ---
 
+# noinspection HttpUrlsUsage
 def test_dotted_names_include_lines_past_the_cutoff():
     diff = ["+++ b/rule.py", "@@ -1 +1,3 @@", "+import os.path",
             "-old = 'gone.txt'", " ctx", "+# see notes.md",

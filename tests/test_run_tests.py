@@ -199,11 +199,10 @@ def chat_with_failing_tests(ws_root, tmp_path, monkeypatch):
     write(ws_root, "calc.py", "def add(a, b):\n    return a - b\n")
     write(ws_root, "test_calc.py", "from calc import add\n\ndef test_add():\n    assert add(2, 2) == 4\n")
     c = chat.Chat(config.load(), ws_root, tools_enabled=True)
+    assert c.toolbox is not None
     c.toolbox.approver = FakeApprover()
     # Like make_toolbox: offline where this machine can do it, online where it can't.
     c.toolbox.limits.run_sandbox = sandbox.available()
-    requests = []
-
     def call(name, args, cid):
         return {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": cid, "type": "function",
                 "function": {"name": name, "arguments": json.dumps(args)}}]}}]}
@@ -221,12 +220,10 @@ def chat_with_failing_tests(ws_root, tmp_path, monkeypatch):
         [text("Fixed; tests pass.")],
     ]
 
-    def stream(body):
-        requests.append(body)
+    def stream(_body):
         yield from script.pop(0)
 
     c.client.stream_chat = stream
-    c.requests = requests
     return c
 
 
@@ -263,7 +260,7 @@ def test_ctrl_c_at_the_offer_is_a_no(chat_with_failing_tests, monkeypatch):
     c = chat_with_failing_tests
     c.fix_offer = True
 
-    def interrupt(prompt=""):
+    def interrupt(_prompt=""):
         raise KeyboardInterrupt
 
     monkeypatch.setattr("builtins.input", interrupt)
