@@ -74,6 +74,11 @@ DEFAULTS: dict = {
         # Environment variables shown to the model in its system prompt (only
         # the ones that are set). Names only; never put secrets here.
         "env_vars": ["VIRTUAL_ENV", "CONDA_DEFAULT_ENV"],
+        # Park the conversation and the server's KV cache on exit, so /resume
+        # can carry on without the model reading it all again.
+        "resume": True,
+        # Parked conversations older than this are deleted at startup. 0 keeps them.
+        "resume_days": 7,
     },
     "tools": {
         "enabled": True,
@@ -212,6 +217,9 @@ def _validate(c: dict) -> None:
         'tools.run_env_keep must be a list of variable names, e.g. ["DATABASE_URL"]')
     _check(isinstance(t["checkpoint_days"], int) and not isinstance(t["checkpoint_days"], bool)
            and t["checkpoint_days"] >= 0, "tools.checkpoint_days must be a whole number (0 keeps them forever)")
+    _check(isinstance(ch["resume"], bool), "chat.resume must be true or false")
+    _check(isinstance(ch["resume_days"], int) and not isinstance(ch["resume_days"], bool)
+           and ch["resume_days"] >= 0, "chat.resume_days must be a whole number (0 keeps them forever)")
     _check(isinstance(ch["env_vars"], list) and all(
         isinstance(v, str) and v.replace("_", "").isalnum() for v in ch["env_vars"]),
         'chat.env_vars must be a list of variable names, e.g. ["VIRTUAL_ENV"]')
@@ -272,6 +280,10 @@ def load(path: str | os.PathLike | None = None) -> dict:
         "history_dir": str(root / "history"),
         "memory_path": str(root / "memory" / "memory.toml"),
         "checkpoint_dir": str(root / "checkpoints"),
+        # Parked conversations (/resume), and the KV caches llama-server saves
+        # for them (its --slot-save-path).
+        "session_dir": str(root / "sessions"),
+        "kv_dir": str(root / "kv"),
         "base_url": base_url,
     }
     return cfg
@@ -333,6 +345,11 @@ def server_args(cfg: dict) -> list[str]:
         args += ["--threads", str(s["threads"])]
     if cfg["model"]["vision"]:
         args += ["--mmproj", d["mmproj_path"]]
+    if cfg["chat"]["resume"]:
+        # Lets the chat save a slot's KV cache to a file in this folder and
+        # load it back (/resume). The server only takes bare file names here,
+        # so no client can make it write anywhere else.
+        args += ["--slot-save-path", d["kv_dir"]]
     args += model_options(cfg)
     args += s["extra_args"]
     return args

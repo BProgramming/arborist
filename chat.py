@@ -42,8 +42,10 @@ import compaction
 import changes as changes_mod
 import config as model_config
 import runners
+import sessions
 from checkpoints import CheckpointError, Checkpoints, prune_store
-from tools import (IGNORED_DIRS, Decision, Limits, MemoryChoice, ToolResult, Toolbox, Workspace)
+from tools import (IGNORED_DIRS, Decision, Limits, MemoryChoice, ToolError, ToolResult, Toolbox,
+                   Workspace)
 
 # ---------------------------------------------------------------- terminal ---
 
@@ -177,6 +179,9 @@ Commands:
   /system TEXT          replace the system prompt (clears the conversation)
   /retry                regenerate the last reply (file changes are not undone)
   /save [PATH]          write the conversation to a Markdown file
+  /resume               carry on with the conversation parked when you last
+                        left a chat in this folder (its KV cache too, so the
+                        model doesn't read it all again)
   /stats                context usage and last-reply speed
   /recall [-n] TERM     search the memories this folder can see (outdated ones
                         too) and attach the hits to your next message as a
@@ -214,6 +219,18 @@ class Interrupted(BaseException):
 
 # ------------------------------------------------------------------ client ---
 
+class SlotError(RuntimeError):
+    def __init__(self, status: int, detail: str):
+        self.status = status
+        if status == 501:
+            # llama-server says this when --slot-save-path wasn't given (or
+            # the build can't save this model's state).
+            detail = (f"{detail} (the server wasn't started with cache saving: it was "
+                      "probably already running before this version, or isn't arborist's; "
+                      "`agent stop` and start again)")
+        super().__init__(f"HTTP {status}: {detail}")
+
+
 class Client:
     def __init__(self, base_url: str):
         u = urlparse(base_url)
@@ -234,6 +251,29 @@ class Client:
             return r.status == 200
         except OSError:
             return False
+
+    def slot_action(self, slot: int, action: str, filename: str) -> dict:
+        """Save or restore a slot's KV cache (llama-server's /slots endpoint).
+        `filename` is a bare name inside the server's --slot-save-path."""
+        conn = self._conn(None)  # a big cache can take a while to write or read
+        try:
+            conn.request("POST", f"/slots/{slot}?action={action}",
+                         body=json.dumps({"filename": filename}),
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            raw = resp.read().decode(errors="replace")
+        finally:
+            conn.close()
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = {}
+        if resp.status != 200:
+            detail = raw.strip()[:200]
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                detail = data["error"].get("message") or detail
+            raise SlotError(resp.status, detail)
+        return data if isinstance(data, dict) else {}
 
     def stream_chat(self, body: dict):
         """Yield parsed SSE chunks from /v1/chat/completions."""
@@ -1137,6 +1177,10 @@ def environment_facts(workspace: Path, env_vars: list[str]) -> list[str]:
 # -------------------------------------------------------------------- chat ---
 
 class Chat:
+    # Whether this kind of session parks on exit and can /resume (delegated
+    # tasks don't).
+    resumable = True
+
     def __init__(self, cfg: dict, workspace: Path | None, tools_enabled: bool,
                  memory_scope: Path | None = None):
         self.cfg = cfg
@@ -1213,6 +1257,15 @@ class Chat:
             notice=self.ui.notice,
             forget_file=self.toolbox.ws.unsee if self.toolbox else (lambda p: None),
         )
+
+        # Parking (see sessions.py): one parked conversation per folder and mode.
+        self.resume_on = bool(ch["resume"]) and self.resumable
+        self.store = sessions.Store.from_config(cfg)
+        scope = workspace if workspace is not None else memory_scope
+        self.session_key = sessions.key_for(scope, tools=self.toolbox is not None)
+        # The messages as last parked or resumed: exiting with nothing new
+        # doesn't write the cache again.
+        self._parked: list[dict] | None = None
 
     def _memory_block(self) -> str:
         try:
@@ -1304,6 +1357,10 @@ class Chat:
             # The tool definitions and system prompt sit in that prefix too.
             "cache_prompt": True,
         }
+        if self.resume_on:
+            # Keep the conversation in one known slot, so its cache can be
+            # saved on exit and put back by /resume.
+            body["id_slot"] = sessions.SLOT
         if self.effort:
             body["reasoning_effort"] = self.effort
         tools = self.agent_tools
@@ -1324,7 +1381,9 @@ class Chat:
         if t.get("predicted_per_second"):
             parts.append(f"{t['predicted_per_second']:.1f} tok/s")
         if t.get("prompt_n") and t.get("prompt_per_second"):
-            parts.append(f"prompt {t['prompt_n']} @ {t['prompt_per_second']:.0f} tok/s")
+            cached = t.get("cache_n")
+            hit = f", {cached:,} cached" if isinstance(cached, int) and cached > 0 else ""
+            parts.append(f"prompt {t['prompt_n']} @ {t['prompt_per_second']:.0f} tok/s{hit}")
         if self.last and self.last.steps:
             parts.append(f"{self.last.steps} tool step{'s' * (self.last.steps != 1)}")
         if self.last:
@@ -1463,6 +1522,159 @@ class Chat:
             print(dim(f"saved {path}"))
         except OSError as e:
             print(red(f"save failed: {e}"))
+
+    # -- parking (/resume) ------------------------------------------------------
+
+    def _parked_data(self) -> dict | None:
+        try:
+            return self.store.load(self.session_key)
+        except ValueError as e:
+            print(red(str(e)))
+            return None
+
+    def _show_parked(self) -> None:
+        if not self.resume_on:
+            return
+        data = self._parked_data()
+        if data:
+            turns = sum(1 for m in data["messages"] if m.get("role") == "user")
+            print(dim(f"    Parked: {turns} message{'s' * (turns != 1)} from "
+                      f"{data.get('saved_at', '?')}; /resume continues it"))
+
+    def _snapshot(self) -> dict:
+        """Everything that shapes the next request, so a resumed chat sends the
+        same prefix (and the cache matches) as if it had never stopped."""
+        tb = self.toolbox
+        return {
+            "saved_at": f"{datetime.now():%Y-%m-%d %H:%M}",
+            "model": sessions.model_identity(self.cfg),
+            "system": self._system(),
+            "system_prompt": self.system_prompt,
+            "date_line": self.date_line,
+            "memory_block": self.memory_block,
+            "env_facts": self._env_facts,
+            "effort": self.effort,
+            "tools_enabled": self.tools_enabled,
+            # Kept so a resumed chat is no less careful: web text in the
+            # conversation keeps every edit asking, and runs still say which
+            # files the model wrote and whether they changed since the diff.
+            "web_tainted": bool(tb and tb.web_tainted),
+            "model_writes": {tb.ws.rel(p): h for p, h in tb.model_writes.items()} if tb else {},
+            "files_changed": list(self.compactor.files_changed),
+            "chars_per_token": self.compactor.chars_per_token,
+            "ctx_used": self.ctx_used,
+            "messages": self.messages,
+        }
+
+    def park(self) -> None:
+        """On exit: save the conversation, then ask the server to save its cache."""
+        if not self.resume_on or not self.messages or self.messages == self._parked:
+            return
+        data = self._snapshot()
+        kv, why = None, ""
+        if self.client.healthy():
+            print(dim("parking the conversation and the model's cache…"))
+            try:
+                res = self.client.slot_action(sessions.SLOT, "save", sessions.kv_file(self.session_key))
+                kv = {"tokens": res.get("n_saved"), "bytes": res.get("n_written")}
+                self.store.secure_kv(self.session_key)
+            except (RuntimeError, OSError) as e:
+                why = f" (cache not saved: {e})"
+            except KeyboardInterrupt:
+                why = " (cache not saved: stopped)"
+        else:
+            why = " (cache not saved: the server isn't responding)"
+        if kv is None:
+            self.store.drop_kv(self.session_key)  # a stale one would only waste a load
+        data["kv"] = kv
+        try:
+            self.store.save(self.session_key, data)
+        except OSError as e:
+            print(red(f"couldn't park the conversation: {e}"))
+            return
+        detail = ""
+        if kv and isinstance(kv.get("tokens"), int):
+            size = f", {sessions.describe_size(kv['bytes'])}" if isinstance(kv.get("bytes"), int) else ""
+            detail = f", {kv['tokens']:,} tokens cached{size}"
+        print(dim(f"parked {len(self.messages)} messages{detail}{why}; /resume here continues it"))
+
+    def resume(self) -> None:
+        if not self.resume_on:
+            why = "delegated tasks don't park" if not self.resumable else "chat.resume is off"
+            print(red(f"/resume is unavailable ({why})"))
+            return
+        if self.messages:
+            print(red("/resume replaces the conversation: /clear first, or leave and come back"))
+            return
+        data = self._parked_data()
+        if data is None:
+            print(dim("nothing parked for this folder (a chat parks when you leave it)"))
+            return
+        self._clear()
+        tb = self.toolbox
+        self.messages[:] = data["messages"]
+        self.system_prompt = data.get("system_prompt", self.system_prompt)
+        self.date_line = data.get("date_line") or self.date_line
+        self.memory_block = data.get("memory_block", self.memory_block)
+        if tb is not None and isinstance(data.get("env_facts"), list):
+            self._env_facts = data["env_facts"]
+        if data.get("effort") in self.efforts:
+            self.effort = data["effort"]
+        if tb is not None:
+            self.tools_enabled = bool(data.get("tools_enabled", self.tools_enabled))
+            tb.web_tainted = bool(data.get("web_tainted"))
+            for rel, h in (data.get("model_writes") or {}).items():
+                try:
+                    tb.model_writes[tb.ws.resolve(rel)] = h
+                except ToolError:  # no longer a valid path in the workspace: skip it
+                    pass
+        self.compactor.files_changed.update(dict.fromkeys(data.get("files_changed") or []))
+        if isinstance(data.get("chars_per_token"), (int, float)):
+            self.compactor.chars_per_token = float(data["chars_per_token"])
+        self.ctx_used = int(data.get("ctx_used") or 0)
+        self._parked = list(self.messages)
+        # Rides along with the next message, after the cached prefix.
+        self.pending_notes.append(
+            f"This conversation was paused on {data.get('saved_at', 'an earlier date')} and "
+            f"resumed now ({date_line()}). Files may have changed since: read a file again "
+            "before relying on what you saw earlier, or editing it.")
+
+        turns = sum(1 for m in self.messages if m.get("role") == "user")
+        print(dim(f"resumed {turns} message{'s' * (turns != 1)} from {data.get('saved_at', '?')}"))
+        last = next((m for m in reversed(self.messages) if m.get("role") == "user"), None)
+        if last:
+            first = ((last.get("content") or "").strip().splitlines() or [""])[-1]
+            print(dim(f"  your last message: {_short(first, 100)}"))
+        self._restore_cache(data)
+
+    def _restore_cache(self, data: dict) -> None:
+        kv = data.get("kv")
+        skip = ""
+        if not kv:
+            skip = "no cache was saved with it"
+        elif data.get("model") != sessions.model_identity(self.cfg):
+            skip = "it was parked with another model or cache setting"
+        elif data.get("system") != self._system():
+            skip = "the system prompt has changed since (a settings or arborist update)"
+        elif not self.store.kv_path(self.session_key).is_file():
+            skip = "its cache file is gone"
+        if skip:
+            print(dim(f"  {skip}, so the model will read the conversation again on your next message"))
+            return
+        print(dim("  loading the model's cache…"))
+        started = time.monotonic()
+        try:
+            res = self.client.slot_action(sessions.SLOT, "restore", sessions.kv_file(self.session_key))
+        except (RuntimeError, OSError) as e:
+            print(yellow(f"  couldn't load the cache ({e}); the model will read the conversation "
+                         "again on your next message"))
+            return
+        except KeyboardInterrupt:
+            print(dim("  stopped; the model will read the conversation again on your next message"))
+            return
+        n = res.get("n_restored")
+        count = f"{n:,} tokens" if isinstance(n, int) else "cache"
+        print(dim(f"  loaded {count} in {time.monotonic() - started:.1f}s"))
 
     def _clear(self) -> None:
         self.messages.clear()
@@ -1633,6 +1845,7 @@ class Chat:
             "system": (self._cmd_system, None),
             "retry": (self._cmd_retry, 0),
             "save": (lambda a, r: self.save_transcript(a), 1),
+            "resume": (lambda a, r: self.resume(), 0),
             "stats": (lambda a, r: self._print_stats(), 0),
             "recall": (lambda a, r: self._recall(a), None),
             "undo": (lambda a, r: self._undo(a), 1),
@@ -1861,6 +2074,7 @@ class Chat:
             print(dim(f"    Memory: {current} note{'s' * (current != 1)}{extra}"))
         except ValueError:
             print(dim("    Memory: not loaded"))
+        self._show_parked()
 
         try:
             while True:
@@ -1891,6 +2105,7 @@ class Chat:
                     readline.write_history_file(hist)
                 except OSError:
                     pass
+            self.park()
 
 
 def _memories(n: int) -> str:
@@ -1947,6 +2162,17 @@ def prune_old_checkpoints(cfg: dict) -> None:
 
 
 HERE = Path(__file__).resolve().parent
+
+
+def prune_parked(cfg: dict) -> None:
+    """Startup: delete parked conversations (and their caches) past chat.resume_days."""
+    try:
+        gone = sessions.Store.from_config(cfg).prune(cfg["chat"]["resume_days"])
+    except OSError:
+        return
+    if gone:
+        print(dim(f"deleted {gone} parked conversation{'s' * (gone != 1)} older than "
+                  f"{cfg['chat']['resume_days']} days"))
 
 
 def arborist_paths(cfg: dict) -> list[Path]:
@@ -2015,6 +2241,7 @@ def main(argv: list[str] | None = None) -> int:
         scope = start.resolve() if start.is_dir() and start.resolve() != Path(start.resolve().anchor) else None
     chat = Chat(cfg, workspace, tools_enabled=cfg["tools"]["enabled"], memory_scope=scope)
     prune_old_checkpoints(cfg)
+    prune_parked(cfg)
 
     # Ctrl-C while a turn is in progress (streaming, a tool, an approval
     # prompt or a run) cancels the turn; at the prompt it just clears the line.

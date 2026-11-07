@@ -100,7 +100,8 @@ defaults are stock llama.cpp `master`.
 
 Everything arborist keeps lives under `paths.root` (default
 `~/.local/share/arborist`): the llama.cpp source and build, model weights,
-server logs, saved chats, memory (`memory/memory.toml`), and workspace checkpoints. Output from runs
+server logs, saved chats, memory (`memory/memory.toml`), workspace checkpoints, and parked
+chats with their KV caches (`sessions/`, `kv/`). Output from runs
 the model makes is logged in `.arborist-logs/` inside the workspace.
 
 ## Memory
@@ -137,6 +138,37 @@ you've laid a block out in a way it can't edit safely, it reports that and
 leaves the file alone. An old `memory.md` is imported into `[general]` the
 first time, and renamed `memory.md.migrated`.
 
+## Resuming
+
+When you leave a chat (`/exit`, Ctrl-D), arborist parks it: the conversation
+goes to `sessions/` under `paths.root`, and llama-server saves its KV cache
+for it to `kv/`. That cache is the model's processed reading of the whole
+conversation, the expensive part of every request. Start arborist in the same
+folder later and the banner shows `Parked: …`; `/resume` puts the conversation
+back and loads the cache into the server, so your next message is the only
+new text the model has to read. `/stats` shows how much came from the cache
+(`prompt 85 @ 900 tok/s, 41,203 cached`).
+
+- **One parked chat per folder** (a `--no-tools` chat parks separately). The
+  next chat you leave there replaces it. A chat you leave empty doesn't.
+- **The resumed chat is the same conversation.** Same system prompt, memories
+  and date as when it was parked (that's what lets the cache match), with a
+  note to the model saying when it was resumed and that files may have
+  changed. The model has to read files again before editing them. If web
+  content was in the conversation, edits still ask in `auto` mode.
+- **The cache is skipped, not wrong, when it can't match:** another model or
+  KV cache type, a changed system prompt (settings or an arborist update), or
+  a server that was already running before you turned this on (`agent stop`,
+  then start again). The conversation still comes back; the model just reads
+  it all once.
+- **It costs disk**: about 64 KiB per token at f16 (a 30k-token chat is ~2 GB,
+  and saving or loading it takes a few seconds). Parked chats are deleted after
+  `chat.resume_days` (default 7). `chat.resume = false` turns it all off.
+- The cache is saved for the chat's slot (slot 0, the only one with
+  `server.parallel = 1`). If you run a delegated task on the same server while
+  the chat is open, the slot then holds the task, and the saved cache won't
+  match; nothing breaks, it just isn't reused.
+
 ## Chat commands
 
 | Command | What it does |
@@ -151,6 +183,7 @@ first time, and renamed `memory.md.migrated`.
 | `/system [TEXT]` | show the system prompt, or replace it (clears the conversation) |
 | `/retry` | regenerate the last reply (file changes are not undone) |
 | `/save [PATH]` | write the conversation to Markdown |
+| `/resume` | carry on with the chat parked when you last left one in this folder, KV cache included (see [Resuming](#resuming)) |
 | `/stats` | context usage and last-reply speed |
 | `/recall [-n] TERM` | search the memories this folder can see, outdated ones too, and attach the hits to your next message (`-n` only shows them) |
 | `/undo [ID]` | restore the workspace's files from before the model's last change (or checkpoint `ID`); previews and asks first |
@@ -263,10 +296,15 @@ prompts are the main safety mechanism, so read them. Specifically:
   reference, not instructions. Once web content is in the conversation,
   edits and new memories ask again even in `auto` mode. Runs always ask.
 - **The server has no auth.** It listens on `127.0.0.1`, so any program
-  running as any user on your machine can use it. Don't change `server.host`
+  running as any user on your machine can use it. With `chat.resume` on, that
+  includes loading a parked chat's cache into a slot and prompting the model
+  with it, which would let another local user read that conversation through
+  the server. The server only takes bare file names, so it can't be made to
+  read or write outside `kv/`. Don't change `server.host`
   to `0.0.0.0` on a network you don't trust.
 - **Local data is plain text.** Saved chats include file contents the model
-  read; memory notes are in `memory/memory.toml`; checkpoints are copies of
+  read; memory notes are in `memory/memory.toml`; parked chats are in `sessions/`
+  (readable only by you), with their KV caches in `kv/`; checkpoints are copies of
   workspace files (anything covered by `.gitignore` is skipped, but an
   un-ignored `.env` gets copied). All of it is under `paths.root`.
 - **Supply chain.** The build uses whatever is at `build.ref`; pin a commit
