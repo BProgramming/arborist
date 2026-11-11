@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover
     readline = None
 
 import agent
+import chat_input
 import compaction
 import changes as changes_mod
 import config as model_config
@@ -106,6 +107,14 @@ class SafeStdout:
     """sys.stdout replacement: everything written goes through clean()."""
     def __init__(self, stream):
         self._stream = stream
+
+    @property
+    def raw(self):
+        """The stream underneath, unfiltered. Only for the prompt_toolkit
+        prompt, which draws its own menu and toolbar with escape sequences;
+        what it shows is your own typing, command names, checkpoint IDs
+        (labels neutralized first) and the toolbar, never model output."""
+        return self._stream
 
     def write(self, text: str) -> int:
         if text in (PROMPT, CONT_PROMPT):  # constants, written by input() without readline
@@ -197,6 +206,9 @@ Commands:
                         right away, the rest after a restart
 
 Input:
+  Alt+Enter             new line in your message; Enter sends it (with
+                        prompt_toolkit, which ./arborist.sh installs)
+  Tab, ↑/↓              pick from the menu that appears as you type a command
   \"\"\"                   on its own line starts/ends a multi-line block
   Ctrl-C                stops the current reply, tool or run (that turn is discarded)
   A line starting with / is a command only if its first word has no other /,
@@ -1224,6 +1236,9 @@ class Chat:
         # Set when a turn ends with failing tests: the user is asked whether
         # the model may fix them.
         self.fix_offer = False
+        # The prompt_toolkit prompt, set up when the chat loop starts (None:
+        # plain input()).
+        self.prompt: chat_input.RichPrompt | None = None
 
         self.toolbox: Toolbox | None = None
         self.tools_enabled = False
@@ -2039,8 +2054,15 @@ class Chat:
         except (OSError, ValueError):
             return False
 
+    def _read_input(self) -> str | None:
+        if self.prompt is not None:
+            return self.prompt.read()
+        return self._read_plain()
+
     @staticmethod
-    def _read_input() -> str | None:
+    def _read_plain() -> str | None:
+        """The fallback prompt: input() with readline, when prompt_toolkit is
+        missing or this isn't a terminal."""
         line = input(PROMPT)
         if line.strip() != '"""':
             lines = [line]
@@ -2054,9 +2076,43 @@ class Chat:
                 return "\n".join(block)
             block.append(nxt)
 
+    def _checkpoint_choices(self) -> list[tuple[str, str]]:
+        """(short ID, when + label) for the /undo menu, newest first; quiet on errors."""
+        if self.checkpoints is None or not self.checkpoints.available:
+            return []
+        try:
+            cps = self.checkpoints.recent(limit=15)
+        except CheckpointError:
+            return []
+        return [(cp.short, neutralize(f"{cp.when:%m-%d %H:%M}  {cp.label}"
+                                      + ("" if cp.kind == "turn" else f" [{cp.kind}]")))
+                for cp in cps]
+
+    def _toolbar(self) -> str:
+        pct = 100 * self.ctx_used / self.context_tokens if self.context_tokens else 0.0
+        return chat_input.toolbar_text(neutralize(self.model_name), self.effort,
+                                       self.tools_enabled, pct)
+
+    def _make_prompt(self) -> chat_input.RichPrompt | None:
+        """The prompt_toolkit prompt, or None to use input()."""
+        raw_out = getattr(sys.stdout, "raw", sys.stdout)
+        if not chat_input.available(sys.stdin, raw_out):
+            return None
+        names = set(self._commands()) | {"exit", "quit"}
+        commands = {n: v for n, v in chat_input.command_help(HELP).items() if n in names}
+        completer = chat_input.ChatCompleter(commands, self._checkpoint_choices)
+        try:
+            return chat_input.RichPrompt(self.history_dir / "prompt_history", completer,
+                                         self._toolbar, color=USE_COLOR,
+                                         output=chat_input.terminal_output(raw_out))
+        except Exception as e:  # odd terminals: fall back rather than not start
+            print(dim(f"falling back to the plain prompt ({e})"))
+            return None
+
     def run(self) -> None:
         hist = self.history_dir / "input_history"
-        if readline:
+        self.prompt = self._make_prompt()
+        if self.prompt is None and readline:
             try:
                 readline.read_history_file(hist)
             except OSError:
@@ -2100,7 +2156,7 @@ class Chat:
                 self.messages.append({"role": "user", "content": self._compose(line)})
                 self._reply(label=line)
         finally:
-            if readline:
+            if self.prompt is None and readline:
                 try:
                     readline.write_history_file(hist)
                 except OSError:

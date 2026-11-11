@@ -49,6 +49,9 @@ load_config() {
   mapfile -t SERVER_ARGS < <("$PY" "$HERE/config.py" --server-args)
   mkdir -p "$CFG_ROOT" "$CFG_MODEL_DIR" "$CFG_LOG_DIR" "$CFG_HISTORY_DIR" "$CFG_KV_DIR"
   PID_FILE="$CFG_ROOT/server.pid"
+  # Python packages the chat uses (pyproject.toml), installed here rather than
+  # into the system Python, which Debian/Ubuntu mark as externally managed.
+  PY_DEPS_DIR="$CFG_ROOT/python-packages"
   SERVER_LOG="$CFG_LOG_DIR/server.log"
 }
 
@@ -85,6 +88,40 @@ check_deps() {
       warn "Vulkan doesn't report a discrete GPU. RDNA4 needs Mesa 25.0+; check 'vulkaninfo --summary'."
     fi
   fi
+}
+
+# ------------------------------------------------------- python packages ---
+py_path() { printf '%s' "$PY_DEPS_DIR${PYTHONPATH:+:$PYTHONPATH}"; }
+
+python_deps() {
+  # The [project] dependencies from pyproject.toml, one per line.
+  "$PY" -c 'import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    print("\n".join(tomllib.load(f)["project"]["dependencies"]))' "$HERE/pyproject.toml" 2>/dev/null \
+    || true  # the caller reports an empty list
+}
+
+ensure_python_deps() {
+  # Optional: without these the chat falls back to a plain prompt.
+  if PYTHONPATH="$(py_path)" "$PY" -c 'import prompt_toolkit' 2>/dev/null; then
+    return 0
+  fi
+  local deps=()
+  mapfile -t deps < <(python_deps)
+  ((${#deps[@]})) || { warn "Couldn't read the dependencies from pyproject.toml."; return 0; }
+  if ! "$PY" -m pip --version >/dev/null 2>&1; then
+    warn "pip isn't installed, so the chat will use the plain prompt (no command menu or toolbar)."
+    info "Install pip (sudo apt install python3-pip) and run ./arborist.sh again."
+    return 0
+  fi
+  step "Installing Python packages (${deps[*]}) into $PY_DEPS_DIR..."
+  if ! "$PY" -m pip install --quiet --disable-pip-version-check --upgrade \
+      --target "$PY_DEPS_DIR" "${deps[@]}" >"$CFG_LOG_DIR/pip-install.log" 2>&1; then
+    tail -5 "$CFG_LOG_DIR/pip-install.log" >&2
+    warn "Installing them failed (log: $CFG_LOG_DIR/pip-install.log); the chat will use the plain prompt."
+    return 0
+  fi
+  info "Installed."
 }
 
 # ---------------------------------------------------------------- build ---
@@ -292,6 +329,7 @@ stop_server() {
 # ------------------------------------------------------------- commands ---
 setup() {
   check_deps
+  ensure_python_deps
   fetch_source 0
   build 0
   fetch_models
@@ -307,7 +345,9 @@ cmd_chat() {
   # Ctrl-C belongs to the chat client (it stops a reply); keep it from
   # killing this script while chat.py runs.
   trap '' INT
-  "$PY" "$HERE/chat.py" "$@" || true
+  # PYTHONPATH reaches chat.py only: runs of the model's code get a minimal
+  # environment without it (runners.SAFE_ENV).
+  PYTHONPATH="$(py_path)" "$PY" "$HERE/chat.py" "$@" || true
   trap 'exit 130' INT
 }
 
