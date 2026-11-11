@@ -14,7 +14,12 @@ to fiddle with your own version, see [License](#license).
 ## Requirements
 
 - Linux (the launcher is bash and the install hints are for Debian/Ubuntu/Mint)
-- Python 3.11+ (standard library only; `pytest` for the tests)
+- Python 3.11+, plus [`prompt_toolkit`](https://github.com/prompt-toolkit/python-prompt-toolkit)
+  for the chat prompt (listed in `pyproject.toml`). The launcher installs it with
+  `pip install --target` into arborist's data folder (`~/.local/share/arborist/python-packages`)
+  if it isn't already importable, so the system Python is left alone; that needs `pip`
+  (`sudo apt install python3-pip`). Without it the chat still works, with a plain
+  `input()` prompt. `pytest` for the tests.
 - `bubblewrap` (`bwrap`) to run code the model writes
 - `git`, `cmake`, `curl`, a C++ compiler; `ninja` optional but faster
 - A GPU backend: **Vulkan** (default; `libvulkan-dev glslc spirv-headers
@@ -192,7 +197,32 @@ new text the model has to read. `/stats` shows how much came from the cache
 | `/diff [-f] [PATH…]` | files changed since this session started, in the workspace or under `PATH` (`-f`/`--full`: the whole diff) |
 | `/config` | open `.config/config` in nano; `[tools]` changes apply right away, the rest after a restart |
 
-`"""` on its own line starts and ends a multi-line message. Ctrl-C stops the
+### The prompt
+
+With `prompt_toolkit` (see [Requirements](#requirements)) the prompt helps as
+you type:
+
+- **Command menu.** Typing `/` opens a menu of commands with their help text,
+  narrowing as you type. ↑/↓ or Tab pick one; Enter runs it. A name you've
+  typed partway that only one command matches is finished for you when you
+  press Enter (`/che` runs `/checkpoints`).
+- **`/undo `** lists recent checkpoint IDs with when they were taken and what
+  they were for. **`/save `** suggests `arborist_conversation_YYYYMMDDHHMMSS.md`
+  (the current time) in the folder you started in. Pressing Enter without
+  picking one keeps the usual meaning: newest checkpoint, or the history folder.
+- **Multi-line messages.** Alt+Enter starts a new line, Enter sends. You can
+  move up into earlier lines to edit them. Pasted text arrives in one piece,
+  newlines included (bracketed paste), and is sent only when you press Enter.
+- **History.** ↑/↓ step through earlier messages (kept in
+  `~/.local/share/arborist/history/prompt_history`). Matching history shows as
+  grey text after the cursor; → accepts it.
+- **Toolbar** along the bottom: `Model: …, Effort: …, Tools: ON/OFF, Context: N%`.
+
+When prompt_toolkit is missing, or input isn't a terminal, you get the plain
+readline prompt instead: Enter sends, and a multi-line paste is joined into one
+message.
+
+`"""` on its own line starts and ends a multi-line message (in either prompt). Ctrl-C stops the
 current reply, tool or run. A pasted path like `/etc/hosts` is sent as text,
 not treated as a command; `//help me` sends the literal `/help me`. Commands
 are handled by arborist and never reach the model. Arguments split like a
@@ -365,9 +395,12 @@ into `~/.claude/skills/` to use it.
 ## Tests
 
 ```sh
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt   # pytest and prompt_toolkit
 python -m pytest
 ```
+
+The prompt tests drive prompt_toolkit through a pipe instead of a terminal;
+they skip if it isn't installed.
 
 Tests for missing toolchains (Rust, Dart, Node) skip themselves. Sandbox tests
 skip if bwrap can't run, unless `ARBORIST_REQUIRE_SANDBOX=1` is set; CI sets it,

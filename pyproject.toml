@@ -1,3 +1,12 @@
+[project]
+name = "arborist"
+version = "0.1.0"
+description = "A terminal coding assistant that runs a local model on your own GPU."
+requires-python = ">=3.11"
+# Optional at runtime: without it the chat falls back to plain input().
+# ./arborist.sh installs these into its data folder when they're missing.
+dependencies = ["prompt_toolkit>=3.0.36,<4"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

@@ -835,7 +835,7 @@ def test_read_input_joins_a_multi_line_paste(monkeypatch):
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(lines))
     pending = iter([True, True, False])
     monkeypatch.setattr(chat.Chat, "_stdin_pending", staticmethod(lambda timeout=0.03: next(pending)))
-    assert chat.Chat._read_input() == "first\nsecond\nthird"
+    assert chat.Chat._read_plain() == "first\nsecond\nthird"
 
 
 def test_read_input_triple_quotes_open_a_block(monkeypatch):
@@ -843,4 +843,149 @@ def test_read_input_triple_quotes_open_a_block(monkeypatch):
     import chat
     lines = iter(['"""', "a", "  b", '"""'])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(lines))
-    assert chat.Chat._read_input() == "a\n  b"
+    assert chat.Chat._read_plain() == "a\n  b"
+
+
+# ------------------------------------------------------------- chat prompt ---
+
+def test_every_command_has_a_menu_entry(load_toml, ws_root):
+    import chat
+    import chat_input
+    c = chat.Chat(load_toml(""), ws_root, tools_enabled=False)
+    described = chat_input.command_help(chat.HELP)
+    assert set(c._commands()) | {"exit", "quit"} <= set(described)
+
+
+def test_read_input_uses_the_rich_prompt_when_there_is_one(load_toml, ws_root, monkeypatch):
+    import chat
+
+    class FakePrompt:
+        def read(self):
+            return "from the rich prompt"
+    c = chat.Chat(load_toml(""), ws_root, tools_enabled=False)
+    monkeypatch.setattr(chat.Chat, "_read_plain", staticmethod(lambda: "from input()"))
+    assert c._read_input() == "from input()"
+    c.prompt = FakePrompt()
+    assert c._read_input() == "from the rich prompt"
+
+
+def test_plain_prompt_without_a_terminal(load_toml, ws_root):
+    import chat
+    c = chat.Chat(load_toml(""), ws_root, tools_enabled=False)
+    assert c._make_prompt() is None  # pytest's stdin isn't a terminal
+
+
+def test_plain_prompt_without_prompt_toolkit(load_toml, ws_root, monkeypatch):
+    import chat
+    import chat_input
+    monkeypatch.setattr(chat_input, "HAVE_PROMPT_TOOLKIT", False)
+    monkeypatch.setattr(chat.sys.stdin, "isatty", lambda: True, raising=False)
+    c = chat.Chat(load_toml(""), ws_root, tools_enabled=False)
+    assert c._make_prompt() is None
+
+
+def test_run_falls_back_to_input_and_keeps_the_readline_history(load_toml, ws_root, monkeypatch):
+    import builtins
+    import chat
+    import chat_input
+    monkeypatch.setattr(chat_input, "HAVE_PROMPT_TOOLKIT", False)
+    lines = iter(["/stats"])
+
+    def fake_input(_prompt=""):
+        try:
+            return next(lines)
+        except StopIteration:
+            raise EOFError from None
+    monkeypatch.setattr(builtins, "input", fake_input)
+    c = chat.Chat(load_toml(""), ws_root, tools_enabled=False)
+    seen = []
+    monkeypatch.setattr(c, "command", lambda line: seen.append(line) or True)
+    monkeypatch.setattr(c, "park", lambda: None)
+    c.run()
+    assert seen == ["/stats"] and c.prompt is None
+
+
+def test_a_prompt_that_fails_to_start_falls_back(load_toml, ws_root, monkeypatch, capsys):
+    import chat
+    import chat_input
+    monkeypatch.setattr(chat_input, "available", lambda *_: True)
+
+    def broken(*_a, **_k):
+        raise OSError("not a real terminal")
+    monkeypatch.setattr(chat_input, "terminal_output", broken)
+    c = chat.Chat(load_toml(""), ws_root, tools_enabled=False)
+    assert c._make_prompt() is None
+    assert "falling back to the plain prompt" in capsys.readouterr().out
+
+
+def test_rich_prompt_gets_the_real_terminal_and_the_command_list(load_toml, ws_root, monkeypatch):
+    import io
+    import chat
+    import chat_input
+    made = {}
+
+    class FakeRich:
+        def __init__(self, history_file, completer, toolbar, color, output):
+            made.update(history_file=history_file, completer=completer, toolbar=toolbar,
+                        output=output)
+    raw = io.StringIO()
+    monkeypatch.setattr(chat.sys, "stdout", chat.SafeStdout(raw))
+    monkeypatch.setattr(chat_input, "available", lambda *_: True)
+    monkeypatch.setattr(chat_input, "terminal_output", lambda stream: ("output for", stream))
+    monkeypatch.setattr(chat_input, "RichPrompt", FakeRich)
+    c = chat.Chat(load_toml(""), ws_root, tools_enabled=False)
+    assert isinstance(c._make_prompt(), FakeRich)
+    assert made["output"] == ("output for", raw)  # not the SafeStdout wrapper
+    assert made["history_file"] == c.history_dir / "prompt_history"
+    assert set(made["completer"].commands) == set(c._commands()) | {"exit", "quit"}
+    assert made["toolbar"]() == c._toolbar()
+
+
+def test_safe_stdout_raw_is_unfiltered_but_writes_still_are():
+    import io
+    import chat
+    raw = io.StringIO()
+    out = chat.SafeStdout(raw)
+    assert out.raw is raw
+    out.write("\x1b]52;c;evil\x07")
+    assert "\x1b" not in raw.getvalue()
+
+
+def test_toolbar_shows_model_effort_tools_and_context(load_toml, ws_root):
+    import chat
+    cfg = load_toml(EFFORTS + '[chat]\nreasoning_effort = "high"\n')
+    c = chat.Chat(cfg, ws_root, tools_enabled=True)
+    c.ctx_used = c.context_tokens // 4
+    assert c._toolbar() == f"Model: {c.model_name}, Effort: high, Tools: ON, Context: 25%"
+    c.tools_enabled, c.effort, c.ctx_used = False, "low", 0
+    assert c._toolbar().endswith("Effort: low, Tools: OFF, Context: 0%")
+
+
+def test_toolbar_model_name_is_neutralized(load_toml, ws_root):
+    import chat
+    c = chat.Chat(load_toml(""), ws_root, tools_enabled=False)
+    c.model_name = "Evil\x1b[2J"
+    assert "\x1b" not in c._toolbar() and "Evil␛[2J" in c._toolbar()
+
+
+def test_checkpoint_choices_for_the_undo_menu(load_toml, ws_root):
+    import shutil
+    import chat
+    if not shutil.which("git"):
+        pytest.skip("git is needed for checkpoints")
+    c = chat.Chat(load_toml(""), ws_root, tools_enabled=True)
+    assert c.checkpoints is not None
+    assert c._checkpoint_choices() == []  # none yet
+    (ws_root / "a.txt").write_text("one")
+    first = c.checkpoints.snapshot("fix the \x1b[31mparser")
+    (ws_root / "a.txt").write_text("two")
+    second = c.checkpoints.snapshot("before restore", kind="safety")
+    choices = c._checkpoint_choices()
+    assert [short for short, _ in choices] == [second[:7], first[:7]]
+    assert choices[0][1].endswith("before restore [safety]")
+    assert "\x1b" not in choices[1][1] and choices[1][1].endswith("fix the ␛[31mparser")
+
+
+def test_no_checkpoint_choices_without_a_store(load_toml, ws_root):
+    import chat
+    assert chat.Chat(load_toml(""), None, tools_enabled=False)._checkpoint_choices() == []
