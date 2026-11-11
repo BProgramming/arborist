@@ -23,6 +23,7 @@ try:
     from prompt_toolkit.formatted_text import ANSI
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.output import create_output
     HAVE_PROMPT_TOOLKIT = True
 except ImportError:  # the fallback in chat.py takes over
     HAVE_PROMPT_TOOLKIT = False
@@ -225,7 +226,6 @@ def terminal_output(stream):
     """prompt_toolkit output that writes to `stream` directly. Give it the real
     terminal, not chat.SafeStdout: SafeStdout would show the menu's and
     toolbar's escape sequences as ␛[… text."""
-    from prompt_toolkit.output import create_output
     return create_output(stdout=stream)
 
 
