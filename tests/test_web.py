@@ -40,6 +40,23 @@ PAGES = {
     "/docs/long.html": ("text/plain", LONG),
     "/docs/data.bin": ("application/octet-stream", "\x00\x01"),
     "/other/x.html": ("text/html", "<title>Other</title><p>out of scope</p>"),
+    # A docs site laid out the usual way: the table of contents is a sidebar,
+    # and the index page's own content links nowhere.
+    "/manual/index.html": ("text/html", """<html><head><title>Manual</title></head><body>
+        <header><a href="/manual/index.html">Home</a> <a href="/other/x.html">Blog</a></header>
+        <aside><nav>TOC_TEXT <ul><li><a href="intro.html">Intro</a></li>
+        <li><a href="api.html">API</a></li></ul></nav></aside>
+        <div aria-hidden="true"><a href="trap.html">hidden</a></div>
+        <form><a href="formlink.html">in a form</a></form>
+        <main><h1>The manual</h1><p>""" + "Read the chapters in order. " * 10 + """</p></main>
+        <footer><a href="legal.html">Legal</a></footer></body></html>"""),
+    "/manual/intro.html": ("text/html", "<title>Intro</title><main><p>" + "Intro text. " * 30
+                           + '</p></main><div role="navigation"><a href="deep/more.html">More</a></div>'),
+    "/manual/api.html": ("text/html", "<title>API</title><p>" + "The widget API. " * 20 + "</p>"),
+    "/manual/legal.html": ("text/html", "<title>Legal</title><p>terms</p>"),
+    "/manual/deep/more.html": ("text/html", "<title>More</title><p>more</p>"),
+    "/manual/trap.html": ("text/html", "<title>Trap</title><p>never fetched</p>"),
+    "/manual/formlink.html": ("text/html", "<title>Form</title><p>never fetched</p>"),
 }
 REDIRECTS = {"/docs/b.html": "/docs/b2.html"}
 
@@ -403,3 +420,52 @@ def test_a_connection_dropped_mid_read_is_a_web_error(failure, monkeypatch):
     monkeypatch.setattr(f, "robots_allows", lambda url: True)
     with pytest.raises(web.WebError):  # ...unless it's the start page itself
         f.crawl("http://h/docs/a.html", 5, 1)
+
+
+# ---- links in a page's navigation --------------------------------------------------
+
+def test_navigation_links_are_kept_apart_from_content_links():
+    _, html = PAGES["/manual/index.html"]
+    page = web.html_to_page(html, "http://h/manual/index.html")
+    assert page.links == []  # the content links nowhere
+    assert page.nav_links == ["http://h/manual/index.html", "http://h/other/x.html",
+                              "http://h/manual/intro.html", "http://h/manual/api.html",
+                              "http://h/manual/legal.html"]
+    assert "TOC_TEXT" not in page.text and "Legal" not in page.text  # their text is still dropped
+    # Hidden parts of a page give neither text nor links.
+    assert not any("trap" in link or "formlink" in link for link in page.links + page.nav_links)
+
+
+def test_a_link_in_both_places_counts_as_content():
+    _, html = PAGES["/docs/index.html"]
+    page = web.html_to_page(html, "http://h/docs/index.html")
+    assert "http://h/docs/a.html" in page.links and page.nav_links == []
+
+
+def test_aria_hidden_navigation_gives_no_links():
+    page = web.html_to_page('<nav aria-hidden="true"><a href="/x.html">x</a></nav>'
+                            '<nav><div aria-hidden="true"><a href="/y.html">y</a></div>'
+                            '<a href="/z.html">z</a></nav><p>text</p>', "http://h/")
+    assert page.links == [] and page.nav_links == ["http://h/z.html"]
+
+
+def test_crawl_follows_a_sidebar_table_of_contents(site, web_toolbox):
+    base, hits = site
+    tb = web_toolbox()
+    out = tb.call("crawl_docs", {"url": f"{base}/manual/index.html", "query": "widget"}).content
+    for title in ("Manual", "Intro", "API", "Legal", "More"):  # More: via intro's own sidebar
+        assert f". {title} — " in out, out
+    assert "Crawled 5 page(s)" in out and "The widget API." in out
+    assert "/manual/trap.html" not in hits and "/manual/formlink.html" not in hits
+    assert "/other/x.html" not in hits  # a nav link out of scope is still out of scope
+
+
+def test_fetch_url_lists_navigation_links_when_the_content_has_none(site, web_toolbox):
+    base, _hits = site
+    tb = web_toolbox()
+    out = tb.call("fetch_url", {"url": f"{base}/manual/index.html"}).content
+    assert "Links in this page's navigation" in out and "/manual/intro.html" in out
+    assert "TOC_TEXT" not in out
+    # A page with links in its content lists those, as before.
+    out = tb.call("fetch_url", {"url": f"{base}/docs/index.html"}).content
+    assert "Links on this page" in out and "navigation" not in out

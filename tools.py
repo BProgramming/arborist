@@ -1014,15 +1014,23 @@ class Toolbox:
     @staticmethod
     def _link_list(page: web.Page, limit: int = 40) -> str:
         base = urlsplit(page.url)
-        same = [link for link in page.links
-                if urlsplit(link).netloc == base.netloc and link != page.url
-                and not urlsplit(link).path.lower().endswith(web.SKIP_EXTENSIONS)]
+
+        def on_site(links: list[str]) -> list[str]:
+            return [link for link in links
+                    if urlsplit(link).netloc == base.netloc and link != page.url
+                    and not urlsplit(link).path.lower().endswith(web.SKIP_EXTENSIONS)]
+
+        # The content's own links; failing that (an index page whose links are
+        # all in its sidebar), the navigation's.
+        same, where = on_site(page.links), "on this page"
+        if not same:
+            same, where = on_site(page.nav_links), "in this page's navigation"
         if not same:
             return ""
         # Paths rather than full URLs: same information, fewer tokens.
         shown = [_path_of(link) for link in same[:limit]]
         extra = f"\n  … and {len(same) - limit} more" if len(same) > limit else ""
-        return (f"\nLinks on this page (on {base.scheme}://{base.netloc}; pass full URLs to fetch_url):\n  "
+        return (f"\nLinks {where} (on {base.scheme}://{base.netloc}; pass full URLs to fetch_url):\n  "
                 + "\n  ".join(shown) + extra)
 
     def tool_crawl_docs(self, url: str, query: str | None = None, max_pages: int | None = None,
@@ -1171,8 +1179,8 @@ TOOL_SCHEMAS = [
          "offset": {"type": "integer", "description": "Character offset to continue from (default 0)"}},
         ["url"]),
     _fn("crawl_docs",
-        "Fetch a documentation page and the pages it links to under the same directory of the same "
-        "site, then list them (and, with query, the lines that best match). Use it to find the right "
+        "Fetch a documentation page and the pages it links to (its sidebar and menus included) "
+        "under the same directory of the same site, then list them (and, with query, the lines that best match). Use it to find the right "
         "page; then read it with fetch_url. The user approves each crawl.",
         {"url": {"type": "string", "description": "Starting page, e.g. a docs index"},
          "reason": {"type": "string", "description": "Why you need this, in a few words; shown to "

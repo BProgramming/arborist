@@ -305,7 +305,7 @@ shell's, so quote ones with spaces: `/file "my notes.md"`.
 | `run_file` | run a `.py`, `.rs`, `.dart`, `.js` or `.ts` file | **always** |
 | `run_tests` | run the project's tests (pytest/unittest, cargo, dart/flutter, npm, node) | **always** |
 | `fetch_url` | read a web page as text | **every new page**, showing the URL and the model's reason |
-| `crawl_docs` | follow links under one docs directory and search them | **once per crawl**, showing the start URL and how far it may go |
+| `crawl_docs` | follow links (a page's sidebar and menus included) under one docs directory and search them | **once per crawl**, showing the start URL and how far it may go |
 | `remember` | save a one-line note for future sessions, for this folder or everywhere | when it looks like a saved note (replace/keep/skip), or after web content is in the conversation |
 
 `view_tree`, `list_files` and `grep` skip `.gitignore`d files. There are
