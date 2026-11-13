@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Terminal chat client for a local llama-server (model set in .config/config).
+"""Terminal chat client for a local llama-server (model set in the config file).
 
 The heavy lifting (inference) happens in the C++ server; this is just I/O
 plus the tools the model can call on files in your workspace (the directory
@@ -204,8 +204,9 @@ Commands:
                         summary of older turns)
   /diff [-f] [PATH…]    files changed since this session started, in the
                         workspace or under PATH (-f, --full: the whole diff)
-  /config               open .config/config in nano; [tools] settings apply
-                        right away, the rest after a restart
+  /config               open your config in $VISUAL or $EDITOR (else nano or
+                        vi); [tools] settings apply right away, the rest
+                        after a restart
   /private              keep nothing from this session once it ends: takes
                         back what it has written so far (input history,
                         logs, checkpoints; asks about memories), then no
@@ -249,7 +250,7 @@ class SlotError(RuntimeError):
             # the build can't save this model's state).
             detail = (f"{detail} (the server wasn't started with cache saving: it was "
                       "probably already running before this version, or isn't arborist's; "
-                      "`agent stop` and start again)")
+                      "run `./arborist.sh stop` and start again)")
         super().__init__(f"HTTP {status}: {detail}")
 
 
@@ -2085,16 +2086,17 @@ class Chat:
     # -- config ---------------------------------------------------------------
 
     def _cmd_config(self, _args, _raw) -> None:
-        """Open the config file in nano, then apply what can change live."""
+        """Open the config file in your editor, then apply what can change live."""
         path = Path(self.cfg["derived"]["config_path"])
-        nano = shutil.which("nano")
-        if nano is None:
-            print(red(f"nano isn't installed; edit {path} with any editor, then restart"))
+        editor = editor_command()
+        if editor is None:
+            print(red(f"no editor found (set $EDITOR, or install nano); edit {path} with "
+                      "any editor, then restart"))
             return
         try:
-            subprocess.run([nano, str(path)])
+            subprocess.run([*editor, str(path)])
         except OSError as e:
-            print(red(f"couldn't start nano: {e}"))
+            print(red(f"couldn't start {editor[0]}: {e}"))
             return
         try:
             new = model_config.load(path)
@@ -2511,6 +2513,21 @@ class Chat:
             self.park()
             self.end_private()
             self.leave_server()
+
+
+def editor_command() -> list[str] | None:
+    """The editor /config opens: $VISUAL, then $EDITOR (either may carry
+    arguments, like "code -w"), then nano, then vi. None if none is installed."""
+    for value in (os.environ.get("VISUAL"), os.environ.get("EDITOR"), "nano", "vi"):
+        if not value:
+            continue
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            continue
+        if words and shutil.which(words[0]):
+            return words
+    return None
 
 
 def _memories(n: int) -> str:

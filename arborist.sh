@@ -16,9 +16,10 @@
 #                          (starts the server if needed and leaves it running)
 #   ./arborist.sh task status [ID] | list | clean ID… | clean --all
 #
-# Settings, including which model, live in .config/config (or point
+# Settings, including which model, live in ~/.config/arborist/config, created
+# from the example in .config/config on the first run (or point
 # ARBORIST_CONFIG at another file). Inference runs in C++ (llama.cpp, or the
-# fork named in the toml); config + chat are Python.
+# fork named in the config); config + chat are Python.
 
 set -Eeuo pipefail
 
@@ -43,7 +44,15 @@ load_config() {
   command -v "$PY" >/dev/null || die "python3 not found"
   "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 11))' \
     || die "Python 3.11+ is needed (for tomllib); found $("$PY" --version 2>&1)"
-  local out
+  local out made
+  made="$("$PY" "$HERE/config.py" --init)" || die "could not set up the config"
+  if [[ -n "$made" ]]; then
+    {
+      step "Created your config: $made"
+      info "It's a copy of the example in $HERE/.config/config. Edit it to change the model,"
+      info "GPU backend or anything else (/config in the chat opens it)."
+    } >&2
+  fi
   out="$("$PY" "$HERE/config.py" --shell)" || die "could not load config"
   eval "$out"
   mapfile -t SERVER_ARGS < <("$PY" "$HERE/config.py" --server-args)
@@ -56,36 +65,90 @@ load_config() {
 }
 
 # ------------------------------------------------------------ dependencies ---
+pkg_manager() {
+  # The package manager whose names the install hints use; empty if unknown.
+  local m
+  for m in apt-get dnf pacman; do
+    if command -v "$m" >/dev/null; then printf '%s' "$m"; return 0; fi
+  done
+}
+
+packages_for() {
+  # packages_for MANAGER GROUP: what GROUP is called on that distro family.
+  case "$1:$2" in
+    apt-get:base)   echo "build-essential cmake ninja-build git curl" ;;
+    apt-get:vulkan) echo "libvulkan-dev glslc spirv-headers mesa-vulkan-drivers" ;;
+    apt-get:cuda)   echo "nvidia-cuda-toolkit" ;;
+    apt-get:bwrap)  echo "bubblewrap" ;;
+    apt-get:pip)    echo "python3-pip" ;;
+    dnf:base)       echo "gcc-c++ make cmake ninja-build git curl" ;;
+    dnf:vulkan)     echo "vulkan-headers vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers" ;;
+    dnf:bwrap)      echo "bubblewrap" ;;
+    dnf:pip)        echo "python3-pip" ;;
+    pacman:base)    echo "base-devel cmake ninja git curl" ;;
+    pacman:vulkan)  echo "vulkan-headers vulkan-icd-loader shaderc spirv-headers" ;;
+    pacman:cuda)    echo "cuda" ;;
+    pacman:bwrap)   echo "bubblewrap" ;;
+    pacman:pip)     echo "python-pip" ;;
+  esac
+}
+
+install_hint() {
+  # install_hint GROUP...: the command that installs those groups here, or
+  # the Debian/Ubuntu package names to look for when the distro isn't known.
+  local m group pkgs="" found
+  m="$(pkg_manager)"
+  for group in "$@"; do
+    found="$(packages_for "${m:-apt-get}" "$group")"
+    pkgs+="${found:+ $found}"
+  done
+  [[ -z "$pkgs" ]] && return 0
+  case "$m" in
+    apt-get) echo "sudo apt install$pkgs" ;;
+    dnf)     echo "sudo dnf install$pkgs" ;;
+    pacman)  echo "sudo pacman -S$pkgs" ;;
+    *)       echo "install with your package manager (Debian/Ubuntu names):$pkgs" ;;
+  esac
+}
+
 check_deps() {
-  local missing=() hints=()
+  local missing=() groups=(base) notes=()
   for c in git cmake curl; do command -v "$c" >/dev/null || missing+=("$c"); done
   command -v c++ >/dev/null || command -v g++ >/dev/null || missing+=("c++ compiler")
   command -v ninja >/dev/null || info "Ninja not found; using make (slower builds, same binary)."
   command -v bwrap >/dev/null \
-    || info "bubblewrap (bwrap) not found: the model can't run code until it's installed (sudo apt install bubblewrap)."
-  hints+=("build-essential cmake ninja-build git curl")
+    || info "bubblewrap (bwrap) not found: the model can't run code until it's installed ($(install_hint bwrap))."
 
   case "$CFG_BACKEND" in
     vulkan)
       command -v glslc >/dev/null || missing+=("glslc")
       [[ -f /usr/include/vulkan/vulkan.h ]] || missing+=("Vulkan headers")
-      hints+=("libvulkan-dev glslc spirv-headers mesa-vulkan-drivers")
+      groups+=(vulkan)
+      [[ "$(pkg_manager)" == pacman ]] \
+        && notes+=("plus your GPU's Vulkan driver: vulkan-radeon, nvidia-utils or vulkan-intel")
+      ;;
+    cuda)
+      command -v nvcc >/dev/null || missing+=("CUDA toolkit (nvcc)")
+      groups+=(cuda)
+      [[ -z "$(packages_for "$(pkg_manager)" cuda)" ]] \
+        && notes+=("the CUDA toolkit comes from NVIDIA's repository: developer.nvidia.com/cuda-downloads")
       ;;
     hip)
       command -v hipconfig >/dev/null || missing+=("ROCm (hipconfig)")
-      hints+=("(ROCm 7.x from AMD's repo — see rocm.docs.amd.com)")
+      notes+=("ROCm comes from AMD's repository: rocm.docs.amd.com")
       ;;
   esac
 
   if ((${#missing[@]})); then
     printf '%smissing:%s %s\n' "$R$B" "$X" "${missing[*]}" >&2
-    printf 'On Linux Mint / Ubuntu:\n  sudo apt install %s.\n' "${hints[*]}" >&2
+    printf '  %s\n' "$(install_hint "${groups[@]}")" >&2
+    ((${#notes[@]})) && printf '  (%s)\n' "${notes[@]}" >&2
     exit 1
   fi
 
   if [[ "$CFG_BACKEND" == vulkan ]] && command -v vulkaninfo >/dev/null; then
     if ! vulkaninfo --summary 2>/dev/null | grep -qiE 'deviceType *= *PHYSICAL_DEVICE_TYPE_DISCRETE_GPU'; then
-      warn "Vulkan doesn't report a discrete GPU. RDNA4 needs Mesa 25.0+; check 'vulkaninfo --summary'."
+      warn "Vulkan doesn't report a discrete GPU, so the model may run on an integrated GPU or the CPU. Check 'vulkaninfo --summary' and your GPU driver (an older Mesa may not know a new card)."
     fi
   fi
 }
@@ -111,7 +174,7 @@ ensure_python_deps() {
   ((${#deps[@]})) || { warn "Couldn't read the dependencies from pyproject.toml."; return 0; }
   if ! "$PY" -m pip --version >/dev/null 2>&1; then
     warn "pip isn't installed, so the chat will use the plain prompt (no command menu or toolbar)."
-    info "Install pip (sudo apt install python3-pip) and run ./arborist.sh again."
+    info "Install pip ($(install_hint pip)) and run ./arborist.sh again."
     return 0
   fi
   step "Installing Python packages (${deps[*]}) into $PY_DEPS_DIR..."
@@ -186,6 +249,11 @@ build() {
   case "$CFG_BACKEND" in
     vulkan)
       args+=(-DGGML_VULKAN=ON)
+      ;;
+    cuda)
+      # FA_ALL_QUANTS: needed for a quantized KV cache with flash attention
+      # (see hip below); costs build time only.
+      args+=(-DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON)
       ;;
     hip)
       # PERF: compile kernels only for your GPU's architecture. A mismatch
@@ -336,7 +404,7 @@ report_offload() {
     info "Couldn't find the layer-offload line in the server log. If replies run at only a few tokens/sec, the GPU isn't being used (see log)."
   elif [[ "$offload" =~ offloaded\ ([0-9]+)/([0-9]+) ]] && ((BASH_REMATCH[1] < BASH_REMATCH[2])); then
     warn "Only ${BASH_REMATCH[1]} of ${BASH_REMATCH[2]} layers are on the GPU — expect a large slowdown."
-    warn "Lower server.ctx_size or use the PTQ1_0 packing."
+    warn "Lower server.ctx_size, or use a smaller packing or quantization of the model (model.file)."
   else
     local clean_text="offloaded${offload#*offloaded}"
     info "O${clean_text:1}."

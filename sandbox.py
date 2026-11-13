@@ -37,7 +37,7 @@ PROBE_TIMEOUT = 20
 
 INSTALL_HINT = ("Install bubblewrap (Debian/Ubuntu: sudo apt install bubblewrap; Fedora: "
                 "sudo dnf install bubblewrap; Arch: sudo pacman -S bubblewrap)")
-OFF_HINT = ("or set run_sandbox = false in .config/config to run unsandboxed (with network "
+OFF_HINT = ("or set run_sandbox = false in your config (/config opens it) to run unsandboxed (with network "
             "access and write access to your home directory)")
 
 # Folders in a project that hold things you'll run yourself, outside arborist.

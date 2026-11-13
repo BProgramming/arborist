@@ -59,6 +59,7 @@ def test_model_name_comes_from_the_toml(load_toml):
     ('[tools]\nrun_timeout = 0\n', "run_timeout"),
     ('[server]\ncache_type_v = "q8_0"\nflash_attn = "off"\n', "flash_attn"),
     ('[build]\nbackend = "metal"\n', "backend"),
+    ('[build]\nbackend = "CUDA"\n', "backend"),
     ('[nonsense]\nx = 1\n', "unknown section"),
     ('[tools]\nmax_output_chars = 500\n', "at least 2000"),
     ('[tools]\nweb_allowed_hosts = ["https://docs.python.org/3/"]\n', "host names"),
@@ -1132,3 +1133,65 @@ def test_ctrl_d_at_the_memory_prompt_is_a_no(load_toml, ws_root):
     assert tools is not None
     res = tools.call("remember", {"memory": "Prefers spaces over tabs", "scope": "general"})
     assert res.content.startswith("error: there was no answer at the approval prompt")
+
+
+# ------------------------------------------------- where the config lives ---
+
+@pytest.fixture
+def no_config_env(tmp_path, monkeypatch):
+    """No $ARBORIST_CONFIG, and a config home of our own."""
+    monkeypatch.delenv("ARBORIST_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    return tmp_path / "xdg" / "arborist" / "config"
+
+
+def test_config_is_looked_for_in_three_places(no_config_env, tmp_path, monkeypatch):
+    user = no_config_env
+    assert config.user_path() == user
+    assert config.default_path() == config.EXAMPLE  # nothing of yours yet: the shipped example
+    user.parent.mkdir(parents=True)
+    user.write_text(MODEL)
+    assert config.default_path() == user
+    other = tmp_path / "other.toml"
+    monkeypatch.setenv("ARBORIST_CONFIG", str(other))
+    assert config.default_path() == other  # the variable wins, even if the file is missing
+
+
+def test_config_home_defaults_to_dot_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert config.user_path() == tmp_path / ".config" / "arborist" / "config"
+
+
+def test_first_run_copies_the_example_once(no_config_env, monkeypatch):
+    user = no_config_env
+    assert config.ensure_user_config() == user
+    assert user.read_text() == config.EXAMPLE.read_text()
+    user.write_text(user.read_text() + "\n# my edit\n")
+    assert config.ensure_user_config() is None  # yours is left alone from then on
+    assert user.read_text().endswith("# my edit\n")
+    assert config.load()["derived"]["config_path"] == str(user.resolve())
+    monkeypatch.setenv("ARBORIST_CONFIG", "/somewhere/else.toml")
+    user.unlink()
+    assert config.ensure_user_config() is None and not user.exists()  # you chose your own file
+
+
+def test_cuda_is_a_backend(load_toml):
+    cfg = load_toml('[build]\nbackend = "cuda"\n')
+    assert cfg["derived"]["build_dir"].endswith("build-cuda")
+
+
+@pytest.mark.parametrize("visual, editor, installed, expected", [
+    ("", "", {"nano", "vi"}, ["nano"]),
+    ("", "", {"vi"}, ["vi"]),
+    ("", "vim", {"vim", "nano"}, ["vim"]),
+    ("code -w", "vim", {"code", "vim"}, ["code", "-w"]),   # $VISUAL first, arguments kept
+    ("missing-editor", "vim", {"vim"}, ["vim"]),          # set but not installed: the next one
+    ("", "", set(), None),
+])
+def test_editor_for_the_config_command(visual, editor, installed, expected, monkeypatch):
+    import chat
+    monkeypatch.setenv("VISUAL", visual)
+    monkeypatch.setenv("EDITOR", editor)
+    monkeypatch.setattr(chat.shutil, "which", lambda name: f"/usr/bin/{name}" if name in installed else None)
+    assert chat.editor_command() == expected

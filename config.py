@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Load and validate .config/config, and hand values to the shell launcher.
+"""Load and validate the config file, and hand values to the shell launcher.
+
+Which file (default_path): $ARBORIST_CONFIG if set; else your own copy,
+~/.config/arborist/config; else the example shipped in the repo,
+.config/config. The launcher makes your copy from the example the first time
+it runs (--init), so settings never live in the git checkout.
 
 Usage (called by arborist.sh):
+    config.py --init         create your config from the example if you have none
     config.py --shell        print `KEY=value` lines (shell-quoted) to eval
     config.py --server-args  print llama-server arguments, one per line
 
@@ -11,6 +17,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import sys
 import tomllib
 from pathlib import Path
@@ -23,8 +30,8 @@ DEFAULTS: dict = {
         "backend": "vulkan",
         "repo": "https://github.com/ggml-org/llama.cpp.git",
         "ref": "master",
-        # AMD GPU architecture for the HIP backend (e.g. "gfx1201"); required
-        # only when backend = "hip".
+        # AMD GPU architecture for the HIP backend (e.g. "gfx1201" for an
+        # RX 9070; rocminfo shows yours); required only when backend = "hip".
         "hip_target": "",
         "native": True,
         "jobs": 0,
@@ -118,7 +125,7 @@ DEFAULTS: dict = {
     },
 }
 
-BACKENDS = {"vulkan", "hip", "cpu"}
+BACKENDS = {"vulkan", "cuda", "hip", "cpu"}
 KV_TYPES = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
 FA_MODES = {"on", "off", "auto"}
 EDIT_APPROVALS = {"ask", "auto"}
@@ -271,9 +278,35 @@ def _validate(c: dict) -> None:
                f"compaction.summary_effort must be \"\" or one of model.efforts {efforts}")
 
 
+EXAMPLE = HERE / ".config" / "config"  # the commented example shipped with arborist
+
+
+def user_path() -> Path:
+    """Your own config: $XDG_CONFIG_HOME/arborist/config, usually ~/.config/arborist/config."""
+    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(base) / "arborist" / "config"
+
+
 def default_path() -> Path:
-    """$ARBORIST_CONFIG, else .config/config next to this file. The file is TOML."""
-    return Path(os.environ.get("ARBORIST_CONFIG") or HERE / ".config" / "config")
+    """$ARBORIST_CONFIG, else your own config, else the shipped example. The file is TOML."""
+    if os.environ.get("ARBORIST_CONFIG"):
+        return Path(os.environ["ARBORIST_CONFIG"])
+    user = user_path()
+    return user if user.exists() else EXAMPLE
+
+
+def ensure_user_config() -> Path | None:
+    """First run: copy the shipped example to user_path(), so your settings
+    aren't edits to a file git tracks. Returns the new file, or None when
+    there was nothing to do ($ARBORIST_CONFIG is set, or you have one)."""
+    if os.environ.get("ARBORIST_CONFIG"):
+        return None
+    user = user_path()
+    if user.exists():
+        return None
+    user.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(EXAMPLE, user)
+    return user
 
 
 def load(path: str | os.PathLike | None = None) -> dict:
@@ -406,9 +439,19 @@ def shell_lines(cfg: dict) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[1] not in ("--shell", "--server-args"):
+    if len(argv) != 2 or argv[1] not in ("--init", "--shell", "--server-args"):
         print(__doc__, file=sys.stderr)
         return 2
+    if argv[1] == "--init":
+        try:
+            made = ensure_user_config()
+        except OSError as e:
+            # Not fatal: the shipped example is used as it is.
+            print(f"couldn't create {user_path()} ({e}); using {EXAMPLE}", file=sys.stderr)
+            return 0
+        if made:
+            print(made)
+        return 0
     try:
         cfg = load()
     except ConfigError as e:
