@@ -42,12 +42,13 @@ import chat_input
 import compaction
 import changes as changes_mod
 import config as model_config
+import presence as presence_mod
 import runners
 import sessions
 import trail as trail_mod
 from checkpoints import CheckpointError, Checkpoints, prune_store
-from tools import (IGNORED_DIRS, Decision, Limits, MemoryChoice, ToolError, ToolResult, Toolbox,
-                   Workspace)
+from tools import (IGNORED_DIRS, NO_ANSWER, Decision, Limits, MemoryChoice, ToolError, ToolResult,
+                   Toolbox, Workspace)
 
 # ---------------------------------------------------------------- terminal ---
 
@@ -208,7 +209,8 @@ Commands:
   /private              keep nothing from this session once it ends: takes
                         back what it has written so far (input history,
                         logs, checkpoints; asks about memories), then no
-                        parking, memory saves or history; lasts until you leave
+                        parking, memory saves or history; lasts until you leave.
+                        Warns if other sessions share the server
 
 Input:
   Alt+Enter             new line in your message; Enter sends it (with
@@ -318,9 +320,16 @@ class Client:
                 if data == "[DONE]":
                     return
                 try:
-                    yield json.loads(data)
+                    chunk = json.loads(data)
                 except json.JSONDecodeError:
                     raise RuntimeError(f"malformed data from the server: {data[:200]!r}") from None
+                # A failure after the stream has started (the prompt didn't
+                # fit, the template threw) arrives as an error object.
+                if isinstance(chunk, dict) and chunk.get("error") and not chunk.get("choices"):
+                    err = chunk["error"]
+                    detail = err.get("message") if isinstance(err, dict) else err
+                    raise RuntimeError(f"the server stopped the reply: {detail or err}")
+                yield chunk
         finally:
             # Closing mid-stream tells llama-server to stop generating.
             conn.close()
@@ -822,7 +831,7 @@ def _block_name(folder: Path) -> str:
 class Memory:
     """memory.toml: notes the model keeps across sessions, in a [general]
     block and one block per folder. A session sees [general] plus the blocks
-    for its own folder and the folders below it."""
+    for its own folder, the folders above it and the folders below it."""
 
     def __init__(self, path: str | os.PathLike, scope: Path | None = None):
         self.path = Path(path)
@@ -1122,6 +1131,12 @@ class AgentTools:
     def call(self, name: str, raw_args: str | dict) -> ToolResult:
         if name != "remember":
             return self.toolbox.call(name, raw_args)
+        try:
+            return self._remember(raw_args)
+        except EOFError:  # Ctrl-D at the prompt about a similar note
+            return ToolResult(NO_ANSWER)
+
+    def _remember(self, raw_args: str | dict) -> ToolResult:
         if not self.can_remember:
             return ToolResult("error: this is a private session; nothing can be saved to memory")
         try:
@@ -1289,6 +1304,10 @@ class Chat:
         # One-off notes for the model that ride along with the next message
         # (e.g. "the user restored files with /undo").
         self.pending_notes: list[str] = []
+        # What the message now being answered took from the pending notes,
+        # /recall reminders and /file attachments, so they can be queued again
+        # if the turn doesn't finish.
+        self._sent_pending: tuple[list[str], dict[str, None], list[tuple[str, str]]] | None = None
         # Set when a turn ends with failing tests: the user is asked whether
         # the model may fix them.
         self.fix_offer = False
@@ -1337,6 +1356,11 @@ class Chat:
         # The messages as last parked or resumed: exiting with nothing new
         # doesn't write the cache again.
         self._parked: list[dict] | None = None
+        # This session's entry among those attached to the server (see
+        # presence.py); set when the chat loop starts. _seen_sessions: the
+        # ones a private session has already been warned about.
+        self.presence: presence_mod.Presence | None = None
+        self._seen_sessions: set[str] = set()
 
     def _memory_block(self) -> str:
         try:
@@ -1494,12 +1518,14 @@ class Chat:
             self.ui.end_message()
             print(red("[stopped]"))
             self._restore(before)
+            self._requeue()
         except (RuntimeError, OSError) as e:
             self.ui.end_message()
             print(red(f"error: {e}"))
             if not self.client.healthy():
                 print(red("the server isn't responding — check the server log"))
             self._restore(before)
+            self._requeue()
         except Exception as e:
             # Anything else is a bug here, not in the model. Keep the session.
             self.ui.end_message()
@@ -1507,6 +1533,7 @@ class Chat:
             print(red(f"internal error: {type(e).__name__}: {e}"))
             print(dim(f"traceback written to {log}; the conversation is intact, minus this turn"))
             self._restore(before)
+            self._requeue()
         else:
             self.last = result
             self.last_wall = time.monotonic() - started
@@ -1522,10 +1549,14 @@ class Chat:
                 print(dim("(paused; tell the model how to proceed)"))
             if self.cfg["chat"]["show_stats"]:
                 self._print_stats(compact=True)
-            if not result.text.strip():
+            if result.cut_off:
+                print(dim("(the reply stopped at the output limit — raise chat.max_tokens, or lower "
+                          "/effort if thinking used it up)"))
+            elif not result.text.strip():
                 print(dim("(empty reply — if thinking ran long, raise chat.max_tokens or lower /effort)"))
         finally:
             self.busy = False
+            self._sent_pending = None
         print()
 
     def _log_error(self) -> Path | str:
@@ -1536,6 +1567,20 @@ class Chat:
             return path
         except OSError:
             return "(couldn't write the log)"
+
+    def _requeue(self) -> None:
+        """After a turn that was stopped or failed: its message is gone from
+        the history, so what rode along with it (an /undo note, /recall
+        reminders, /file attachments) goes back in the queue for the next one."""
+        if self._sent_pending is None:
+            return
+        notes, memories, files = self._sent_pending
+        self._sent_pending = None
+        self.pending_notes[:0] = notes
+        self.pending_memories = {**memories, **self.pending_memories}
+        self.pending_files[:0] = files
+        if memories or files:
+            print(dim("note: the files and reminders attached to that message will go with your next one"))
 
     def _rollback(self, snapshot: int) -> None:
         """Drop the interrupted turn so the history stays well-formed."""
@@ -1647,7 +1692,11 @@ class Chat:
             return
         data = self._snapshot()
         kv, why = None, ""
-        if self.client.healthy():
+        if any(s.get("private") for s in self.other_sessions()):
+            # Every session uses the same slot, so what the server would save
+            # could be the private session's conversation.
+            why = " (cache not saved: a private session is using this server)"
+        elif self.client.healthy():
             print(dim("parking the conversation and the model's cache…"))
             try:
                 res = self.client.slot_action(sessions.SLOT, "save", sessions.kv_file(self.session_key))
@@ -1871,6 +1920,10 @@ class Chat:
         # The model still remembers its edits; tell it, and make it re-read.
         if self.toolbox:
             self.toolbox.ws.forget()
+            # You put these files back yourself: the next run prompt shouldn't
+            # report them as changed behind your back.
+            for c in reverted:
+                self.toolbox.model_writes.pop(self.toolbox.ws.root / c.path, None)
         names = ", ".join(c.path for c in reverted[:20]) + (" …" if len(reverted) > 20 else "")
         self.pending_notes.append(
             f"The user restored the workspace files to how they were before \"{cp.label}\" "
@@ -1879,6 +1932,8 @@ class Chat:
 
     def _compose(self, line: str) -> str:
         """The user's message, with any /recall reminders and /file contents in front."""
+        self._sent_pending = (list(self.pending_notes), dict(self.pending_memories),
+                              list(self.pending_files))
         parts = [f"<note>\n{n}\n</note>" for n in self.pending_notes]
         self.pending_notes.clear()
         if self.pending_memories:
@@ -1952,6 +2007,12 @@ class Chat:
             print(red(bold(changes_mod.RUNS_LATER_WARNING)))
             for line in changes_mod.describe_runs_later(risky):
                 print(line)
+        if self.toolbox:
+            leaving = changes_mod.links_out(self.toolbox.ws.root, found)
+            if leaving:
+                print(red(bold(changes_mod.LINKS_OUT_WARNING)))
+                for line in changes_mod.describe_links_out(self.toolbox.ws.root, leaving):
+                    print(line)
 
     def _mark_session_start(self) -> None:
         if self.checkpoints is None or not self.checkpoints.available:
@@ -1965,6 +2026,17 @@ class Chat:
             self.session_base = self.checkpoints.snapshot("session start", kind="session")
         except CheckpointError as e:
             self.ui.notice(f"couldn't record the session's starting point ({e}); /diff won't work")
+            return
+        try:
+            nested = self.checkpoints.nested_repos()
+        except CheckpointError:
+            nested = []
+        if nested:
+            shown = ", ".join(nested[:5]) + (f" and {len(nested) - 5} more" if len(nested) > 5 else "")
+            self.ui.notice(f"note: {shown} {'is a git repository' if len(nested) == 1 else 'are git repositories'} "
+                           "inside this workspace. Checkpoints don't cover files in "
+                           f"{'it' if len(nested) == 1 else 'them'}: /undo and /diff won't see changes "
+                           "there. Start arborist inside the repository to get both.")
 
     def _diff(self, args: list[str]) -> None:
         """/diff [-f|--full] [PATH…]: what changed since the session started."""
@@ -2037,6 +2109,13 @@ class Chat:
         if "tools" in changed and self.toolbox is not None:
             self.toolbox.apply_limits(Limits.from_config(new["tools"]))
             print(dim("[tools] applied to this session"))
+            # Read once, when the session was set up.
+            startup = [f"tools.{k}" for k in ("enabled", "checkpoints", "checkpoint_days")
+                       if new["tools"][k] != self.cfg["tools"][k]]
+            if startup:
+                print(yellow(f"except {', '.join(startup)}: restart arborist for "
+                             f"{'that' if len(startup) == 1 else 'those'} (/tools toggles the "
+                             "tools for this session)"))
         self.cfg["tools"] = new["tools"]
         later = [k for k in changed if k != "tools"]
         if later:
@@ -2076,7 +2155,11 @@ class Chat:
             print(dim("system prompt replaced; conversation cleared"))
 
     def _cmd_retry(self, _args, _raw) -> None:
-        last_user = max((i for i, m in enumerate(self.messages) if m["role"] == "user"), default=-1)
+        # The user's own last message: the harness's notes to the model (a
+        # pause, the step limit) are user messages too, and retrying from one
+        # would keep the stuck calls and switch tools back on.
+        starts = compaction.turn_starts(self.messages)
+        last_user = starts[-1] if starts else -1
         if last_user < 0 or last_user == len(self.messages) - 1:
             print(red("nothing to retry"))
             return
@@ -2097,6 +2180,59 @@ class Chat:
             print(red("[stopped]"))
         finally:
             self.busy = False
+
+    # -- other sessions on this server -----------------------------------------
+
+    def join_server(self, kind: str = "chat") -> None:
+        """Record this session as attached to the server, and say so if a
+        private session is already there."""
+        try:
+            self.presence = presence_mod.Presence(presence_mod.folder(self.cfg), kind)
+            self.presence.start()
+        except OSError as e:
+            self.presence = None
+            print(dim(f"couldn't record this session in {presence_mod.folder(self.cfg)} ({e}); "
+                      "other sessions won't know it's here"))
+            return
+        private = [s for s in self.other_sessions() if s.get("private")]
+        if private:
+            print(yellow(bold("warning: ") + f"a private session is using this server: "
+                         f"{presence_mod.describe(private)}. Sessions share the model's one "
+                         "cache slot, so while it's open this session won't save the cache when "
+                         "it parks (only the messages), and each session re-reads its "
+                         "conversation after the other has had a turn."))
+
+    def leave_server(self) -> None:
+        if self.presence is not None:
+            self.presence.close()
+            self.presence = None
+
+    def other_sessions(self) -> list[dict]:
+        """The other live sessions attached to this server (none before the
+        chat loop has started)."""
+        if self.presence is None:
+            return []
+        try:
+            return self.presence.others()
+        except OSError:
+            return []
+
+    def _warn_shared(self, first: bool = False) -> None:
+        """In a private session: warn about sessions sharing the server that
+        it hasn't been told about yet (all of them when it goes private, then
+        any that arrive later)."""
+        new = [s for s in self.other_sessions() if s["id"] not in self._seen_sessions]
+        if not new:
+            return
+        self._seen_sessions.update(s["id"] for s in new)
+        n = len(new)
+        lead = (f"{n} other session{'s are' if n != 1 else ' is'} open on this server"
+                if first else
+                f"{n} more session{'s have' if n != 1 else ' has'} started on this server")
+        print(yellow(bold("warning: ") + f"{lead}: {presence_mod.describe(new)}. Sessions share "
+                     "the model's one cache slot. While this session is private none of them "
+                     "saves that cache to disk, but the server is shared: close them, or leave "
+                     "and start a private session on its own, if that matters here."))
 
     # -- private ---------------------------------------------------------------
 
@@ -2178,6 +2314,12 @@ class Chat:
             tb.log_dir = self.log_dir
             tb._checked.clear()  # cached plans point at the old build folder
         self.private = True
+        if self.presence is not None:
+            try:  # from here on, no other session saves the shared cache slot
+                self.presence.set_private()
+            except OSError as e:
+                problems.append(f"couldn't mark this session private for other sessions ({e}); "
+                                "one that parks while this is open may save the shared cache")
 
         print(yellow(bold("Private session.")) + dim(
             " Nothing from it is kept once you leave: it won't be parked, the model can't "
@@ -2193,6 +2335,7 @@ class Chat:
                       "it's replaced the next time you leave a normal chat here."))
         for problem in problems:
             print(red(problem))
+        self._warn_shared(first=True)
 
     def _ask_saved_notes(self) -> list[SavedNote]:
         """For each memory the model saved this session: keep it, or take it back?"""
@@ -2332,6 +2475,7 @@ class Chat:
         except ValueError:
             print(dim("    Memory: not loaded"))
         self._show_parked()
+        self.join_server()
 
         try:
             while True:
@@ -2354,6 +2498,8 @@ class Chat:
                     continue
                 if line.startswith("//"):
                     line = line[1:]
+                if self.private:
+                    self._warn_shared()  # a session that started since
                 self.messages.append({"role": "user", "content": self._compose(line)})
                 self._reply(label=line)
         finally:
@@ -2364,6 +2510,7 @@ class Chat:
                     pass
             self.park()
             self.end_private()
+            self.leave_server()
 
 
 def _memories(n: int) -> str:

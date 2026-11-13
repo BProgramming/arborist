@@ -177,18 +177,27 @@ def wrap(argv: list[str], spec: Spec, env: dict[str, str]) -> list[str]:
     return args
 
 
-def wrap_system_readonly(argv: list[str]) -> list[str]:
-    """For the one probe that has to run before a sandbox can be described
-    (asking an interpreter where it loads code from): the whole filesystem
-    read-only, no network, no environment beyond PATH. It can read, but not
-    write or send anything; its answer is checked before it's used."""
-    args: list[str] = [bwrap_path() or "bwrap", "--die-with-parent", "--new-session",
-                       "--unshare-all", "--unshare-user"]
-    if supports_disable_userns():
-        args.append("--disable-userns")
-    return args + ["--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-                   "--clearenv", "--setenv", "PATH", os.environ.get("PATH", "/usr/bin:/bin"),
-                   "--"] + argv
+def wrap_interpreter_probe(argv: list[str], reads: Sequence[Path]) -> list[str]:
+    """For the one probe that has to run before a run's sandbox can be
+    described (asking an interpreter where it loads code from).
+
+    The interpreter may be the project's own (.venv/bin/python), which is
+    code nobody has approved, so it sees no more than it needs to answer:
+    /usr and /etc, plus `reads` (its own install folders, from tool_root),
+    all read-only, and an empty home. No workspace, none of your files, no
+    /run (so no D-Bus, Docker or desktop sockets: a read-only bind wouldn't
+    stop a connect()), no network, no environment beyond PATH and HOME. Its
+    answer is checked before it's used."""
+    home = Path.home()
+    args: list[str] = [bwrap_path() or "bwrap"] + _base_args() + ["--tmpfs", str(home)]
+    shown = [Path(r) for r in dedupe(reads)
+             if os.path.exists(r) and not any(_within(Path(r), d) for d in (Path("/usr"), Path("/etc")))]
+    for r in shown:
+        args += ["--ro-bind", str(r), str(r)]
+    for f in _credential_files([r for r in shown if os.path.isdir(r)]):
+        args += ["--ro-bind", "/dev/null", str(f)]
+    return args + ["--clearenv", "--setenv", "PATH", os.environ.get("PATH", "/usr/bin:/bin"),
+                   "--setenv", "HOME", str(home), "--chdir", "/", "--"] + argv
 
 
 def display_args(env: dict[str, str]) -> list[str]:
@@ -314,7 +323,8 @@ def tool_root(exe: str | os.PathLike | None) -> list[Path]:
 
     /opt/node22/bin/node -> /opt/node22; ~/.cargo/bin/cargo -> ~/.cargo. When
     the parent of bin/ would be too broad (/, home, ~/.local), just the
-    executable's own folder. Symlink chains (rustup, pipx and npm shims) are
+    executable's own folder; when that folder is itself too broad (a program
+    sitting directly in your home directory), just the executable. Symlink chains (rustup, pipx and npm shims) are
     followed hop by hop, keeping every folder on the way. Anything inside a
     node_modules folder brings that whole node_modules (the package's
     dependencies sit next to it).
@@ -337,7 +347,12 @@ def tool_root(exe: str | os.PathLike | None) -> list[Path]:
             out.append(Path(*h.parts[:h.parts.index("node_modules") + 1]))
             continue
         d = h.parent
-        out.append(d.parent if d.name == "bin" and d.parent not in broad else d)
+        if d.name == "bin" and d.parent not in broad:
+            out.append(d.parent)
+        elif d in broad:
+            out.append(h)  # never the whole of / or home: the one file
+        else:
+            out.append(d)
     return dedupe(out)
 
 

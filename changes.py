@@ -101,6 +101,31 @@ def describe_runs_later(risky: list[Change]) -> list[str]:
     return lines
 
 
+def links_out(root: Path, found) -> list[Change]:
+    """Added or changed symlinks that point outside the workspace. Inside the
+    sandbox such a link leads nowhere; outside it, it leads to a real file of
+    yours. The file tools won't follow it, but other programs will."""
+    root = Path(root).resolve()
+    out = []
+    for c in found:
+        p = root / c.path
+        if c.status == "D" or not os.path.islink(p):
+            continue
+        target = Path(os.path.realpath(p))
+        if target != root and root not in target.parents:
+            out.append(c)
+    return out
+
+
+LINKS_OUT_WARNING = ("WARNING: the run created links that point outside the workspace. "
+                     "Arborist's file tools don't follow them, but anything else that reads "
+                     "the workspace (a backup, a commit, another program) would:")
+
+
+def describe_links_out(root: Path, leaving: list[Change]) -> list[str]:
+    return [f"  {c.path} -> {os.readlink(Path(root) / c.path)}" for c in leaving]
+
+
 LABELS = {"A": "added", "M": "changed", "D": "deleted"}
 
 

@@ -67,6 +67,16 @@ def test_model_name_comes_from_the_toml(load_toml):
     ('[model]\nrepo = "a/b"\n', "model.file"),
     ('[model]\nfile = "c.gguf"\n', "model.repo"),
     ('[model]\nrepo = "a/b"\nfile = "c.gguf"\nvision = true\n', "mmproj_file"),
+    # Wrong types are config errors too, not tracebacks.
+    ('[server]\nport = "8091"\n', "server.port must be a whole number"),
+    ('[server]\nctx_size = 4096.5\n', "server.ctx_size"),
+    ('[server]\nparallel = true\n', "server.parallel"),
+    ('[server]\nhost = ""\n', "server.host"),
+    ('[chat]\nmax_tokens = "lots"\n', "chat.max_tokens"),
+    ('[chat]\ntemperature = "hot"\n', "chat.temperature"),
+    ('[chat]\nshow_stats = 1\n', "chat.show_stats"),
+    ('[build]\njobs = "all"\n', "build.jobs"),
+    ('[tools]\nenabled = "yes"\n', "tools.enabled"),
 ])
 def test_invalid_settings_are_rejected(load_toml, snippet, message):
     with pytest.raises(config.ConfigError, match=message):
@@ -989,3 +999,136 @@ def test_checkpoint_choices_for_the_undo_menu(load_toml, ws_root):
 def test_no_checkpoint_choices_without_a_store(load_toml, ws_root):
     import chat
     assert chat.Chat(load_toml(""), None, tools_enabled=False)._checkpoint_choices() == []
+
+
+# ----------------------------------------------------- review fixes: turns ---
+
+def test_server_error_inside_the_stream_is_raised():
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import chat
+
+    class Handler(BaseHTTPRequestHandler):
+        # noinspection PyShadowingBuiltins
+        def log_message(self, format, *args):
+            pass
+
+        # noinspection PyPep8Naming
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'data: {"choices": [{"delta": {"content": "par"}}]}\n\n'
+                             b'data: {"error": {"code": 500, "message": "context size exceeded"}}\n\n')
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+    try:
+        client = chat.Client(f"http://127.0.0.1:{server.server_port}")
+        with pytest.raises(RuntimeError, match="the server stopped the reply: context size exceeded"):
+            list(client.stream_chat({"messages": []}))
+    finally:
+        server.shutdown()
+
+
+def test_retry_goes_back_to_the_users_message_not_a_harness_note(load_toml, ws_root):
+    import agent
+    import chat
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    c.messages = [
+        {"role": "user", "content": "fix the bug"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "grep", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "error: pattern is required"},
+        {"role": "user", "content": agent.PAUSE_NOTE.format(why="4 tool calls in a row failed")},
+        {"role": "assistant", "content": "I'm stuck."},
+    ]
+    seen = []
+    c._reply = lambda label="": seen.append(list(c.messages))
+    c.command("/retry")
+    assert seen == [[{"role": "user", "content": "fix the bug"}]]
+
+
+def test_failed_turn_keeps_its_attachments_and_notes_for_the_next_message(load_toml, ws_root, capsys):
+    import chat
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    c.memory.add("Son is learning PyGame")
+    c.command("/recall pygame")
+    c._attach([__file__])
+    c.pending_notes.append("The user restored the workspace files.")
+
+    def down(_body):
+        yield from ()
+        raise RuntimeError("server went away")
+
+    c.client.stream_chat = down
+    c.client.healthy = lambda: True
+    c.messages.append({"role": "user", "content": c._compose("what changed?")})
+    assert not c.pending_notes and not c.pending_files and not c.pending_memories
+    c._reply(label="what changed?")
+    assert c.messages == []
+    assert "will go with your next one" in capsys.readouterr().out
+    again = c._compose("what changed?")
+    assert again.startswith("<note>\nThe user restored") and "<memory_reminder>" in again
+    assert "<file path=" in again
+
+    # A turn that succeeds uses them up.
+    c.client.stream_chat = lambda _body: iter([{"choices": [{"delta": {"content": "ok"}}]}])
+    c.messages.append({"role": "user", "content": again})
+    c._reply(label="what changed?")
+    assert c._compose("next") == "next" and c._sent_pending is not None
+
+
+def test_config_says_which_tools_settings_need_a_restart(load_toml, ws_root, monkeypatch, capsys):
+    import chat
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    path = c.cfg["derived"]["config_path"]
+
+    def edit(_cmd):
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("[tools]\nmax_steps = 7\ncheckpoints = false\n")
+
+    monkeypatch.setattr(chat.shutil, "which", lambda name: "/usr/bin/nano")
+    monkeypatch.setattr(chat.subprocess, "run", edit)
+    c.command("/config")
+    out = capsys.readouterr().out
+    assert "[tools] applied to this session" in out
+    assert "except tools.checkpoints: restart arborist for that" in out
+    assert c.cfg["tools"]["max_steps"] == 7
+
+
+def test_undo_doesnt_leave_restored_files_flagged_as_changed(load_toml, ws_root, monkeypatch):
+    import shutil
+    import chat
+    if shutil.which("git") is None:
+        pytest.skip("git not installed")
+    (ws_root / "a.py").write_text("v1\n")
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    tb = c.toolbox
+    assert tb is not None
+    tb.approver = __import__("conftest").FakeApprover()
+    tb.begin_turn("bump")
+    tb.call("read_file", {"path": "a.py"})
+    tb.call("edit_file", {"path": "a.py", "old_string": "v1", "new_string": "v2"})
+    tb.call("write_file", {"path": "other.py", "content": "x = 1\n"})
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    c.command("/undo")
+    assert tb.model_writes == {}
+    assert not any(n.startswith("CHANGED") for n in tb._provenance(None))
+
+
+def test_ctrl_d_at_the_memory_prompt_is_a_no(load_toml, ws_root):
+    import chat
+
+    class Gone(__import__("conftest").FakeApprover):
+        def approve_memory(self, fact, block, similar, web_tainted):
+            raise EOFError
+
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    assert c.toolbox is not None
+    c.memory.add("Prefers tabs over spaces", chat.GENERAL)
+    c.toolbox.approver = Gone()
+    tools = c.agent_tools
+    assert tools is not None
+    res = tools.call("remember", {"memory": "Prefers spaces over tabs", "scope": "general"})
+    assert res.content.startswith("error: there was no answer at the approval prompt")

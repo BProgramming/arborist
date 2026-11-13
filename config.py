@@ -149,8 +149,41 @@ def _check(cond: bool, msg: str) -> None:
         raise ConfigError(msg)
 
 
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _check_types(c: dict) -> None:
+    """Types first, so the range checks below never meet a string where a
+    number belongs (TOML's "8091" and 8091 are different things)."""
+    b, s, ch = c["build"], c["server"], c["chat"]
+    for key in ("repo", "ref"):
+        _check(isinstance(b[key], str) and b[key].strip() != "", f"build.{key} must be a non-empty string")
+    _check(isinstance(b["native"], bool), "build.native must be true or false")
+    _check(_is_int(b["jobs"]) and b["jobs"] >= 0, "build.jobs must be a whole number (0 = all cores)")
+    _check(isinstance(s["host"], str) and s["host"] != "" and not any(ch_.isspace() for ch_ in s["host"]),
+           'server.host must be a host name or address, e.g. "127.0.0.1"')
+    for key in ("port", "gpu_layers", "ctx_size", "parallel", "batch_size", "ubatch_size", "threads",
+                "startup_timeout"):
+        _check(_is_int(s[key]), f"server.{key} must be a whole number, not {s[key]!r}")
+    _check(isinstance(ch["system_prompt"], str), "chat.system_prompt must be a string")
+    _check(isinstance(ch["reasoning_effort"], str), "chat.reasoning_effort must be a string")
+    for key in ("show_thinking", "show_stats"):
+        _check(isinstance(ch[key], bool), f"chat.{key} must be true or false")
+    for key in ("max_tokens", "top_k"):
+        _check(_is_int(ch[key]), f"chat.{key} must be a whole number, not {ch[key]!r}")
+    for key in ("temperature", "top_p", "min_p", "presence_penalty"):
+        _check(_is_number(ch[key]), f"chat.{key} must be a number, not {ch[key]!r}")
+    _check(isinstance(c["tools"]["enabled"], bool), "tools.enabled must be true or false")
+
+
 def _validate(c: dict) -> None:
     b, m, s, ch = c["build"], c["model"], c["server"], c["chat"]
+    _check_types(c)
     _check(b["backend"] in BACKENDS, f"build.backend must be one of {sorted(BACKENDS)}")
     if b["backend"] == "hip":
         _check(isinstance(b["hip_target"], str) and b["hip_target"].startswith("gfx"),

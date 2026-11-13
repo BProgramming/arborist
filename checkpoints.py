@@ -126,6 +126,17 @@ class Checkpoints:
         self._git("commit", "--quiet", "--no-verify", "--allow-empty", *message)
         return self._git("rev-parse", "HEAD").stdout.decode().strip()
 
+    def nested_repos(self) -> list[str]:
+        """Folders in the workspace that are git repositories of their own
+        (as of the last snapshot). Git records each as a single pointer to
+        its commit, not its files, so checkpoints, /undo and /diff don't
+        cover changes inside them."""
+        if not self.available or not (self.git_dir / "HEAD").exists():
+            return []
+        out = self._git("ls-files", "--stage", "-z").stdout.decode("utf-8", "surrogateescape")
+        return [entry.split("\t", 1)[1] for entry in out.split("\0")
+                if entry.startswith("160000 ") and "\t" in entry]
+
     def recent(self, limit: int = 20) -> list[Checkpoint]:
         """Newest first."""
         if not self.available or not (self.git_dir / "HEAD").exists() or not self._has_commits():
@@ -198,7 +209,10 @@ class Checkpoints:
         # Files created since the checkpoint go away...
         for c in changes:
             if c.status == "A":
-                p = (self.root / c.path).resolve()
+                # Resolve the folder, not the entry: an added symlink is
+                # removed itself, never the file it points at.
+                p = self.root / c.path
+                p = p.parent.resolve() / p.name
                 if p.is_relative_to(self.root) and (p.is_file() or p.is_symlink()):
                     p.unlink()
                     _prune_empty_dirs(p.parent, self.root)

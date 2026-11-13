@@ -110,6 +110,7 @@ class TurnResult:
     timings: dict
     usage: dict
     paused: str = ""  # why the harness paused tool use, if it did
+    cut_off: bool = False  # the last reply stopped at the output limit (max_tokens)
 
 
 class Compactor(Protocol):
@@ -121,6 +122,20 @@ class Compactor(Protocol):
 PAUSE_NOTE = ("(Tool use is paused: {why}. Don't call any tools. Tell the user in a few lines "
               "what you were trying to do and what's blocking you, then ask how they want to "
               "proceed. Offer concrete options if you can.)")
+
+
+CUT_OFF = ("error: your reply reached the output limit before this call's arguments were "
+           "complete, so it was not run. Make the call again with less in it: for a long file, "
+           "write the first part with write_file, then add the rest with edit_file.")
+
+
+def _complete(raw: str) -> bool:
+    """Whether a tool call's arguments are whole JSON."""
+    try:
+        json.loads(raw or "{}")
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 def _call_key(call: dict, result: str) -> str:
@@ -203,10 +218,19 @@ def run_turn(messages: list[dict],
         if compactor is not None and res.usage:
             compactor.observe(res.usage)
 
+        cut = res.finish_reason == "length"
         if not (tools_on and res.tool_calls):
             messages.append({"role": "assistant", "content": res.text})
-            return TurnResult(res.text, steps, hard_stopped, res.timings, res.usage, paused)
+            return TurnResult(res.text, steps, hard_stopped, res.timings, res.usage, paused, cut)
         assert toolbox is not None  # tools_on
+        # A reply that ran out of tokens inside a tool call leaves that call's
+        # JSON unfinished. It isn't run, and the history gets empty arguments
+        # in its place: half a JSON object would be sent back to the server
+        # with every later request.
+        truncated = {id(c) for c in res.tool_calls if cut and not _complete(c["arguments"])}
+        for c in res.tool_calls:
+            if id(c) in truncated:
+                c["arguments"] = "{}"
 
         messages.append({
             "role": "assistant",
@@ -222,6 +246,11 @@ def run_turn(messages: list[dict],
                                     "run until the user replies. Explain the run's output instead.")
             elif paused:
                 result = ToolResult(f"skipped: tool use is paused ({paused}).")
+            elif id(call) in truncated:
+                ui.notice(f"the reply hit the output limit partway through a {call['name']} call; "
+                          "it wasn't run (raise chat.max_tokens if this keeps happening)")
+                result = ToolResult(CUT_OFF)
+                errors_in_a_row += 1
             else:
                 ui.tool_call(call["name"], call["arguments"])
                 result = toolbox.call(call["name"], call["arguments"])

@@ -254,3 +254,49 @@ def test_cargo_run_log_is_named_after_the_file(ws_root, make_toolbox):
     check_and_run(tb, "src/main.rs")
     logs = [p.name for p in (tb.log_dir / "runs").glob("*.log")]
     assert len(logs) == 1 and logs[0].endswith("-main.log")
+
+
+def test_links_out_finds_only_symlinks_leaving_the_workspace(tmp_path):
+    import changes
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (tmp_path / "secret").write_text("x")
+    (ws / "real").write_text("x")
+    before = changes.snapshot(ws)
+    (ws / "out").symlink_to(tmp_path / "secret")
+    (ws / "in").symlink_to("real")
+    (ws / "plain").write_text("y")
+    found = changes.compare(before, changes.snapshot(ws))
+    assert [c.path for c in changes.links_out(ws, found)] == ["out"]
+    assert changes.describe_links_out(ws, changes.links_out(ws, found)) == [f"  out -> {tmp_path / 'secret'}"]
+
+
+def test_typing_only_and_function_level_imports_are_optional():
+    src = ("from typing import TYPE_CHECKING\n"
+           "import typing\n"
+           "import requests\n"
+           "if TYPE_CHECKING:\n    import pandas\n"
+           "if typing.TYPE_CHECKING:\n    from polars import DataFrame\n"
+           "def plot():\n    import matplotlib.pyplot as plt\n"
+           "async def fetch():\n    import aiohttp\n")
+    required, optional = runners.python_imports(src)
+    assert required == {"typing", "requests"}
+    assert optional == {"pandas", "polars", "matplotlib", "aiohttp"}
+
+
+@pytest.mark.parametrize("version, flags", [
+    ((22, 5), None), ((22, 6), ["--experimental-strip-types"]), ((22, 17), ["--experimental-strip-types"]),
+    ((22, 18), []), ((23, 0), ["--experimental-strip-types"]), ((23, 5), ["--experimental-strip-types"]),
+    ((23, 6), []), ((24, 0), []), ((20, 11), None),
+])
+def test_node_ts_flags_by_version(version, flags):
+    assert runners.node_ts_flags(*version) == flags
+
+
+def test_ts_tests_use_the_same_node_rule_as_ts_runs(ws_root, tmp_path, monkeypatch):
+    write(ws_root, "a.test.ts", "")
+    monkeypatch.setattr(runners, "node_version", lambda: ("/usr/bin/node", (23, 2)))
+    monkeypatch.setattr(runners, "_find_up", lambda *a: None)
+    monkeypatch.setattr(runners.shutil, "which", lambda name: None)
+    plan = runners.plan_tests(ws_root / "a.test.ts", ws_root, tmp_path / "build")
+    assert plan.steps == [["/usr/bin/node", "--experimental-strip-types", "--test", "a.test.ts"]]

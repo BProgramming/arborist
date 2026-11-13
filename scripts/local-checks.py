@@ -34,7 +34,7 @@ import sandbox  # noqa: E402
 from tools import Decision, Limits, MemoryChoice, Toolbox, Workspace  # noqa: E402
 
 GREEN, RED, BLUE, DIM, BOLD, RESET = ("\033[32m", "\033[31m", "\033[34m", "\033[2m", "\033[1m", "\033[0m") \
-    if sys.stdout.isatty() else ("",) * 5
+    if sys.stdout.isatty() else ("",) * 6
 results: list[tuple[str, str]] = []
 
 

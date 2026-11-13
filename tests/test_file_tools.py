@@ -291,3 +291,76 @@ def test_truncate_never_exceeds_the_limit(size, limit):
     out = _truncate(text, limit)
     assert len(out) <= limit and "characters omitted" in out
     assert out.endswith(text[-10:])
+
+
+# ---- symlinks out of the workspace ----------------------------------------------
+
+def test_grep_and_listings_skip_symlinks_that_leave_the_workspace(ws_root, tmp_path, make_toolbox):
+    secret = tmp_path / "outside.txt"
+    secret.write_text("TOPSECRET=1\n")
+    (ws_root / "notes.txt").symlink_to(secret)
+    write(ws_root, "real.txt", "TOPSECRET is mentioned here\n")
+    (ws_root / "inside.txt").symlink_to("real.txt")  # a link that stays inside is fine
+    tb = make_toolbox()
+    hits = tb.call("grep", {"pattern": "TOPSECRET"}).content
+    assert "real.txt:1" in hits and "inside.txt:1" in hits
+    assert "notes.txt" not in hits and "TOPSECRET=1" not in hits
+    assert "notes.txt" not in tb.call("list_files", {}).content
+    assert "notes.txt" not in tb.call("view_tree", {}).content
+    assert tb.call("read_file", {"path": "notes.txt"}).content.startswith("error:")
+
+
+def test_walk_skips_symlinks_into_hidden_data(ws_root, tmp_path):
+    data = ws_root / "arborist-data"
+    data.mkdir()
+    (data / "memory.toml").write_text("SECRETNOTE\n")
+    (ws_root / "peek.toml").symlink_to(data / "memory.toml")
+    ws = Workspace(ws_root, hidden=[data])
+    assert [f.name for f in ws.walk_files(ws.root)] == []
+
+
+# ---- CRLF files ---------------------------------------------------------------------
+
+def test_edit_matches_and_keeps_crlf_line_endings(ws_root, make_toolbox):
+    (ws_root / "a.txt").write_bytes(b"line one\r\nline two\r\nline three\r\n")
+    tb = make_toolbox()
+    assert "\r" not in tb.call("read_file", {"path": "a.txt"}).content  # what the model sees
+    res = tb.call("edit_file", {"path": "a.txt", "old_string": "line one\nline two",
+                                "new_string": "first\nsecond\nextra"}).content
+    assert res.startswith("updated a.txt"), res
+    assert (ws_root / "a.txt").read_bytes() == b"first\r\nsecond\r\nextra\r\nline three\r\n"
+
+
+def test_edit_leaves_lf_files_and_explicit_crlf_alone(ws_root, make_toolbox):
+    (ws_root / "lf.txt").write_bytes(b"a\nb\n")
+    (ws_root / "crlf.txt").write_bytes(b"a\r\nb\r\n")
+    tb = make_toolbox()
+    tb.call("read_file", {"path": "lf.txt"}), tb.call("read_file", {"path": "crlf.txt"})
+    tb.call("edit_file", {"path": "lf.txt", "old_string": "a\nb", "new_string": "x\ny"})
+    assert (ws_root / "lf.txt").read_bytes() == b"x\ny\n"
+    # The model spelled the \r\n out itself: nothing is converted twice.
+    tb.call("edit_file", {"path": "crlf.txt", "old_string": "a\r\nb", "new_string": "x\r\ny"})
+    assert (ws_root / "crlf.txt").read_bytes() == b"x\r\ny\r\n"
+
+
+# ---- no answer at a prompt ----------------------------------------------------------
+
+def test_ctrl_d_at_an_approval_prompt_is_a_no_not_a_tool_bug(ws_root, make_toolbox, tmp_path):
+    class Gone(FakeApprover):
+        def approve_change(self, rel_path, diff, is_new):
+            raise EOFError
+
+    tb = make_toolbox(Gone())
+    res = tb.call("write_file", {"path": "new.py", "content": "x = 1\n"}).content
+    assert res.startswith("error: there was no answer at the approval prompt")
+    assert "internal error" not in res and not (ws_root / "new.py").exists()
+    assert not (tmp_path / "logs" / "tool-errors.log").exists()
+
+
+def test_run_prompt_flags_files_deleted_since_they_were_shown(ws_root, make_toolbox):
+    tb = make_toolbox()
+    tb.call("write_file", {"path": "a.py", "content": "print(1)\n"})
+    tb.call("write_file", {"path": "b.py", "content": "print(2)\n"})
+    (ws_root / "b.py").unlink()
+    notes = tb._provenance(ws_root / "a.py")
+    assert any(n.startswith("CHANGED since you were shown them: b.py") for n in notes)

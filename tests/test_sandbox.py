@@ -220,3 +220,76 @@ def test_flutter_sdk_dart_works_in_checks_and_runs(ws_root, make_toolbox, fake_f
     tb.call("run_file", {"path": "hi.dart"})
     cache = str((fake_flutter_sdk / "bin" / "cache").resolve())
     assert any(cache in n for n in approver.run_notes[-1])  # named on the prompt
+
+
+# ---- the interpreter path probe --------------------------------------------------
+
+def test_interpreter_probe_never_binds_the_whole_filesystem(tmp_path):
+    cmd = sandbox.wrap_interpreter_probe(["/x/venv/bin/python", "-I"], [tmp_path])
+    binds = [(cmd[i + 1], cmd[i + 2]) for i, a in enumerate(cmd) if a in ("--ro-bind", "--bind")]
+    assert ("/", "/") not in binds
+    assert (str(tmp_path), str(tmp_path)) in binds
+    assert "--tmpfs" in cmd and cmd[cmd.index("--") + 1:] == ["/x/venv/bin/python", "-I"]
+
+
+@sandboxed
+def test_project_interpreter_cant_read_or_reach_outside_during_planning(ws_root, tmp_path,
+                                                                        make_toolbox, fake_home):
+    """A workspace .venv/bin/python is run by the planning probes, before any
+    approval. None of them may see your files or local sockets."""
+    import socket
+    import threading
+    sock_path = tmp_path / "bus.sock"
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(str(sock_path))
+    srv.listen(5)
+    srv.settimeout(0.2)
+    got: list[bytes] = []
+    stop = threading.Event()
+
+    def serve():
+        while not stop.is_set():
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                continue
+            got.append(c.recv(4096))
+            c.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    key = fake_home / ".ssh" / "id_ed25519"
+    fake = ws_root / ".venv" / "bin" / "python"
+    fake.parent.mkdir(parents=True)
+    fake.write_text(f"""#!/usr/bin/python3
+import socket, sys
+if "--version" in sys.argv:
+    print("Python 3.12.0"); sys.exit(0)
+for attempt in ("sock", "read"):
+    try:
+        if attempt == "sock":
+            s = socket.socket(socket.AF_UNIX); s.connect({str(sock_path)!r}); s.send(b"reached"); s.close()
+        else:
+            data = open({str(key)!r}).read()
+            s = socket.socket(socket.AF_UNIX); s.connect({str(sock_path)!r}); s.send(data.encode()); s.close()
+    except Exception:
+        pass
+print("[]")
+""")
+    fake.chmod(0o755)
+    write(ws_root, "main.py", "print('hi')\n")
+    runners._py_paths_cache.clear()
+    report = make_toolbox(run_sandbox=True).call("check_dependencies", {"path": "main.py"}).content
+    stop.set()
+    t.join(timeout=2)
+    srv.close()
+    assert "Python 3.12.0" in report  # the fake interpreter really was the one probed
+    assert got == []
+
+
+def test_tool_root_never_returns_home_itself(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "mytool").write_text("#!/bin/sh\n")
+    monkeypatch.setenv("HOME", str(home))
+    assert sandbox.tool_root(home / "mytool") == [home / "mytool"]

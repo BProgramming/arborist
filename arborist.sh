@@ -133,17 +133,34 @@ build_stamp() {
 }
 
 fetch_source() {
-  local update="${1:-0}"
+  # The ref last checked out is kept beside the clone, so a build.ref (or
+  # build.repo) edited in the config takes effect on the next start instead
+  # of silently building the old source.
+  local update="${1:-0}" ref_file="$CFG_SRC_DIR/.git/arborist-ref" origin
   if [[ ! -d "$CFG_SRC_DIR/.git" ]]; then
     step "Cloning $CFG_REPO ($CFG_REF)..."
     git clone --filter=blob:none "$CFG_REPO" "$CFG_SRC_DIR"
     update=1
+  else
+    origin="$(git -C "$CFG_SRC_DIR" remote get-url origin 2>/dev/null || true)"
+    if [[ "$origin" != "$CFG_REPO" ]]; then
+      step "build.repo changed: switching the source from $origin to $CFG_REPO..."
+      git -C "$CFG_SRC_DIR" remote set-url origin "$CFG_REPO"
+      update=1
+    elif [[ -f "$ref_file" && "$(cat "$ref_file")" != "$CFG_REF" ]]; then
+      step "build.ref changed from $(cat "$ref_file") to $CFG_REF..."
+      update=1
+    fi
   fi
   if ((update)); then
     step "Checking out $CFG_REF..."
     git -C "$CFG_SRC_DIR" fetch --quiet origin "$CFG_REF"
     git -C "$CFG_SRC_DIR" checkout --quiet --detach FETCH_HEAD
     info "at $(git -C "$CFG_SRC_DIR" log -1 --format='%h %cs %s')"
+  fi
+  # (A clone from before this file existed is taken to be at the current ref.)
+  if ((update)) || [[ ! -f "$ref_file" ]]; then
+    printf '%s\n' "$CFG_REF" >"$ref_file"
   fi
 }
 
@@ -198,16 +215,17 @@ build() {
 }
 
 # ------------------------------------------------------------- download ---
-expected_sha256() {
-  # LFS hash from the Hugging Face tree API; empty if unavailable.
+remote_info() {
+  # "SHA256 BYTES" for a file, from the Hugging Face tree API; empty if unavailable.
   local file="$1"
-  curl -fsSL "https://huggingface.co/api/models/$CFG_MODEL_REPO/tree/main" 2>/dev/null | "$PY" -c '
+  curl -fsSL --connect-timeout 5 --max-time 20 \
+      "https://huggingface.co/api/models/$CFG_MODEL_REPO/tree/main" 2>/dev/null | "$PY" -c '
 import json, sys
 name = sys.argv[1]
 try:
     for f in json.load(sys.stdin):
         if f.get("path") == name and f.get("lfs"):
-            print(f["lfs"]["oid"]); break
+            print(f["lfs"]["oid"], int(f["lfs"].get("size") or f.get("size") or 0)); break
 except Exception:
     pass
 ' "$file" || true
@@ -219,10 +237,21 @@ download() {
   ok_marker="$dest.verified"
   [[ -f "$dest" && -f "$ok_marker" ]] && { info "$name present"; return; }
 
+  local want="" size=0 remote
+  remote="$(remote_info "$name")"
+  [[ -n "$remote" ]] && read -r want size <<<"$remote"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
   if [[ ! -f "$dest" ]]; then
-    local avail_gb
-    avail_gb="$(df -Pk "$(dirname "$dest")" | awk 'NR==2 { print int($4 / 1048576) }')"
-    ((avail_gb >= 10)) || die "Only ${avail_gb} GB free in $(dirname "$dest"); need ~10 GB."
+    if ((size > 0)); then
+      # Room for what's left to fetch, plus 100 MB to spare.
+      local avail_kb have=0 need_kb
+      [[ -f "$dest.part" ]] && have="$(stat -c %s "$dest.part" 2>/dev/null || echo 0)"
+      avail_kb="$(df -Pk "$(dirname "$dest")" | awk 'NR==2 { print $4 }')"
+      need_kb=$(( (size > have ? size - have : 0) / 1024 + 102400 ))
+      ((avail_kb >= need_kb)) \
+        || die "Only $((avail_kb / 1048576)) GB free in $(dirname "$dest"); $name needs $((need_kb / 1048576 + 1)) GB."
+    fi
     step "Downloading $name..."
     # -C - resumes a partial .part file if a previous download was interrupted.
     curl -fL --retry 5 --retry-delay 3 -C - --progress-bar -o "$dest.part" "$url" \
@@ -230,8 +259,7 @@ download() {
     mv "$dest.part" "$dest"
   fi
 
-  local want got
-  want="$(expected_sha256 "$name")"
+  local got
   if [[ -n "$want" ]]; then
     step "Verifying $name..."
     got="$(sha256sum "$dest" | cut -d' ' -f1)"
@@ -240,10 +268,11 @@ download() {
       die "Checksum mismatch for $name (moved to $dest.bad); rerun to download again."
     fi
     info "SHA256 ok."
+    touch "$ok_marker"
   else
-    warn "Couldn't fetch a checksum for $name; skipping verification."
+    # No marker: it's checked on a later start, once the checksum can be fetched.
+    warn "Couldn't fetch a checksum for $name; using it unverified for now."
   fi
-  touch "$ok_marker"
 }
 
 fetch_models() {
@@ -314,16 +343,38 @@ report_offload() {
   fi
 }
 
+is_server() {
+  # Whether PID is a llama-server. server.pid outlives a reboot or a crash,
+  # and by then the number can belong to something else of yours.
+  local cmdline
+  cmdline="$(tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null || true)"
+  [[ "$cmdline" == *llama-server* ]]
+}
+
 stop_server() {
   local pid="${SERVER_PID:-}"
   [[ -z "$pid" && -f "$PID_FILE" ]] && pid="$(cat "$PID_FILE")"
   [[ -z "$pid" ]] && return 0
-  if kill -0 "$pid" 2>/dev/null; then
+  if kill -0 "$pid" 2>/dev/null && ! is_server "$pid"; then
+    warn "server.pid names process $pid, which isn't llama-server; leaving it alone."
+  elif kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
     for _ in {1..20}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
     kill -9 "$pid" 2>/dev/null || true
   fi
   rm -f "$PID_FILE"
+}
+
+stop_server_unless_shared() {
+  # On leaving a chat: other sessions (a second chat, a delegated task) may
+  # still be attached to the server this launcher started.
+  local n
+  n="$("$PY" "$HERE/presence.py" --count 2>/dev/null || echo 0)"
+  if [[ "$n" =~ ^[0-9]+$ ]] && ((n > 0)); then
+    info "Leaving the server running: $n other session(s) still use it. Stop it later with ./arborist.sh stop."
+    return 0
+  fi
+  stop_server
 }
 
 # ------------------------------------------------------------- commands ---
@@ -339,7 +390,7 @@ cmd_chat() {
   setup
   start_server
   if ((STARTED_SERVER)); then
-    trap 'stop_server' EXIT
+    trap 'stop_server_unless_shared' EXIT
     trap 'exit 130' INT TERM
   fi
   # Ctrl-C belongs to the chat client (it stops a reply); keep it from
@@ -410,7 +461,7 @@ main() {
     task)    cmd_task "$@" ;;
     stop)    stop_server; info "Stopped" ;;
     -h|--help|help) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
-    *) die "Unknown command: $1 (try --help)." ;;
+    *) die "Unknown command: $cmd (try --help)." ;;
   esac
 }
 

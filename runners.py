@@ -161,8 +161,9 @@ _py_paths_cache: dict[tuple[str, int], list[Path]] = {}
 
 def _python_paths(interp: str) -> list[Path]:
     """Where an interpreter loads code from. Asked with -I -S, so no .pth
-    files or site customisation run: this one probe can't be sandboxed (its
-    answer is what the sandbox needs to show)."""
+    files or site customisation run. Its answer is what a run's sandbox needs
+    to show, so it can't use that sandbox; it gets a narrower one instead
+    (sandbox.wrap_interpreter_probe): the interpreter may be the project's own."""
     real = os.path.realpath(interp)
     try:
         key = (real, os.stat(real).st_mtime_ns)
@@ -171,7 +172,7 @@ def _python_paths(interp: str) -> list[Path]:
     if key not in _py_paths_cache:
         cmd = [interp, "-I", "-S", "-c", _PY_PATHS]
         if _probe_wrap is not None:  # sandboxing is on
-            cmd = sandbox.wrap_system_readonly(cmd)
+            cmd = sandbox.wrap_interpreter_probe(cmd, sandbox.tool_root(interp))
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=PROBE_TIMEOUT,
                                stdin=subprocess.DEVNULL,
@@ -288,15 +289,23 @@ def python_for_dir(d: Path, root: Path) -> str | None:
 def python_imports(source: str) -> tuple[set[str], set[str]]:
     """Top-level module names imported by `source`: (required, optional).
 
-    Imports inside a try block count as optional, since code usually guards
-    optional dependencies that way. Relative imports are skipped.
+    Optional: imports inside a try block (how code usually guards an optional
+    dependency), under `if TYPE_CHECKING:` (never executed), and inside a
+    function (not needed until it's called). A missing one is a note, not a
+    reason to refuse the run. Relative imports are skipped.
     """
     tree = ast.parse(source)
     guarded: set[int] = set()
     for node in ast.walk(tree):
+        body: list[ast.stmt] = []
         if isinstance(node, (ast.Try, ast.TryStar)):
-            for stmt in node.body:
-                guarded.update(id(n) for n in ast.walk(stmt))
+            body = node.body
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+        elif isinstance(node, ast.If) and "TYPE_CHECKING" in ast.unparse(node.test):
+            body = node.body
+        for stmt in body:
+            guarded.update(id(n) for n in ast.walk(stmt))
     required, optional = set(), set()
     for node in ast.walk(tree):
         names = []
@@ -349,7 +358,8 @@ def _plan_python(path: Path, root: Path, build_dir: Path) -> RunPlan:
         for n in sorted(required & missing):
             plan.problems.append(f"Python package providing '{n}' is not installed (pip install …)")
         for n in sorted(optional & missing):
-            plan.warnings.append(f"optional import '{n}' is not installed (the code guards it with try)")
+            plan.warnings.append(f"optional import '{n}' is not installed (it's guarded with try or "
+                                 "TYPE_CHECKING, or imported inside a function)")
         found = sorted((required | optional) - missing)
         if found:
             plan.checked.append("imports available: " + ", ".join(found))
@@ -404,6 +414,17 @@ def _plan_js(path: Path, root: Path, _build_dir: Path) -> RunPlan:
     return plan
 
 
+def node_ts_flags(major: int, minor: int) -> list[str] | None:
+    """The flags Node needs to run a .ts file itself: none from 22.18 and
+    23.6 (type stripping is on by default), the experimental flag from 22.6,
+    None when this Node can't."""
+    if (major, minor) >= (23, 6) or (major == 22 and minor >= 18):
+        return []
+    if (major, minor) >= (22, 6):
+        return ["--experimental-strip-types"]
+    return None
+
+
 def _plan_ts(path: Path, root: Path, _build_dir: Path) -> RunPlan:
     plan = RunPlan()
     nv = node_version()
@@ -419,16 +440,13 @@ def _plan_ts(path: Path, root: Path, _build_dir: Path) -> RunPlan:
     if tsx:
         plan.checked.append(f"tsx ({tsx})")
         plan.steps = [[tsx, str(path)]]
-    elif (major, minor) >= (23, 6) or (major == 22 and minor >= 18):
+    elif (flags := node_ts_flags(major, minor)) is not None:
         # PERF/behaviour: Node strips the types and runs the JS. Fast, but it
         # doesn't type-check, and it can't handle enums/namespaces.
-        plan.checked.append("Node runs TypeScript natively (type stripping)")
+        plan.checked.append("Node type stripping (--experimental-strip-types)" if flags
+                            else "Node runs TypeScript natively (type stripping)")
         plan.warnings.append("types are stripped, not checked; run tsc separately for type errors")
-        plan.steps = [[node, str(path)]]
-    elif (major, minor) >= (22, 6):
-        plan.checked.append("Node type stripping (--experimental-strip-types)")
-        plan.warnings.append("types are stripped, not checked; run tsc separately for type errors")
-        plan.steps = [[node, "--experimental-strip-types", str(path)]]
+        plan.steps = [[node, *flags, str(path)]]
     else:
         plan.problems.append("TypeScript needs tsx (npm install -g tsx) or Node 22.6+")
     return plan
@@ -706,10 +724,8 @@ def _tests_node(target: Path, project: Path, rel: str, root: Path, _build_dir: P
         tsx = str(local_tsx) if local_tsx else shutil.which("tsx")
         if tsx:
             plan.steps = [[tsx, "--test", rel]]
-        elif (major, minor) >= (22, 18) or major >= 23:
-            plan.steps = [[node, "--test", rel]]
-        elif (major, minor) >= (22, 6):
-            plan.steps = [[node, "--experimental-strip-types", "--test", rel]]
+        elif (flags := node_ts_flags(major, minor)) is not None:
+            plan.steps = [[node, *flags, "--test", rel]]
         else:
             plan.problems.append("TypeScript tests need tsx (npm install -g tsx) or Node 22.6+")
     else:

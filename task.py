@@ -339,6 +339,7 @@ class TaskChat(chat.Chat):
             on_notice=self.ui.notice, checkpoints=None,
             on_changes=self._record_run_changes)
         self.compactor.forget_file = toolbox.ws.unsee
+        self.compactor.notice = self.ui.notice  # was bound to the UI Chat.__init__ made
         # The project's memories, as a chat started in the real folder sees them.
         self.memory = chat.Memory(cfg["derived"]["memory_path"], source)
         self.memory_block = self._memory_block()
@@ -371,6 +372,12 @@ class TaskChat(chat.Chat):
         if risky:
             self.warnings.append(chat.changes_mod.RUNS_LATER_WARNING)
             self.warnings += chat.changes_mod.describe_runs_later(risky)
+        if self.toolbox:
+            root = self.toolbox.ws.root
+            leaving = chat.changes_mod.links_out(root, found)
+            if leaving:
+                self.warnings.append(chat.changes_mod.LINKS_OUT_WARNING)
+                self.warnings += chat.changes_mod.describe_links_out(root, leaving)
 
 
 # ------------------------------------------------------------------- run ---
@@ -429,6 +436,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         report["notes"].append(f"runs use the project's virtualenv {venv}, read-only")
 
     session = TaskChat(cfg, c, source, mode, task_dir, progress)
+    session.join_server("task")  # so a private chat on this server knows it's here
     toolbox = session.toolbox
     assert toolbox is not None  # TaskChat always has one
     if client is not None:
@@ -496,6 +504,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_alarm)
         signal.signal(signal.SIGINT, old_int)
+        session.leave_server()
 
     progress.update(doing="collecting the changes")
     patch = task_dir / "changes.patch"
