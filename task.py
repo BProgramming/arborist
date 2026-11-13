@@ -371,6 +371,12 @@ class TaskChat(chat.Chat):
         if risky:
             self.warnings.append(chat.changes_mod.RUNS_LATER_WARNING)
             self.warnings += chat.changes_mod.describe_runs_later(risky)
+        if self.toolbox:
+            root = self.toolbox.ws.root
+            leaving = chat.changes_mod.links_out(root, found)
+            if leaving:
+                self.warnings.append(chat.changes_mod.LINKS_OUT_WARNING)
+                self.warnings += chat.changes_mod.describe_links_out(root, leaving)
 
 
 # ------------------------------------------------------------------- run ---

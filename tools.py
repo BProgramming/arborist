@@ -145,6 +145,21 @@ class Workspace:
             raise ToolError(f"{path} is arborist's own data (memory, logs, models); it's off limits")
         return resolved
 
+    def leaves(self, f: Path) -> bool:
+        """Whether `f` is a symlink to somewhere resolve() would refuse:
+        outside the workspace, or arborist's own data. The walk skips these,
+        so grep and the listings can't read through a link what read_file
+        won't open."""
+        if not f.is_symlink():
+            return False
+        try:
+            target = f.resolve()
+        except (OSError, RuntimeError):  # a loop
+            return True
+        if target != self.root and not target.is_relative_to(self.root):
+            return True
+        return any(target == h or target.is_relative_to(h) for h in self.hidden)
+
     def is_readonly(self, p: Path) -> bool:
         return any(p == r or p.is_relative_to(r) for r in self.readonly)
 
@@ -209,7 +224,8 @@ class Workspace:
         return found
 
     def walk_files(self, start: Path):
-        """Yield files under start, skipping ignored and hidden-tool directories.
+        """Yield files under start, skipping ignored and hidden-tool directories,
+        and symlinks that point out of the workspace.
 
         In a git repo, .gitignore'd files are skipped too, unless start itself
         is somewhere git ignores (then the model asked for it on purpose).
@@ -236,6 +252,8 @@ class Workspace:
             dirnames[:] = kept
             for name in sorted(filenames):
                 f = here / name
+                if self.leaves(f):
+                    continue
                 if visible is None or self.rel(f) in visible:
                     yield f
 
@@ -861,6 +879,11 @@ class Toolbox:
             text += (changes.RUNS_LATER_WARNING + "\n"
                      + "\n".join(changes.describe_runs_later(risky)) + "\n"
                      "Tell the user about these files.\n")
+        leaving = changes.links_out(self.ws.root, found)
+        if leaving:
+            text += (changes.LINKS_OUT_WARNING + "\n"
+                     + "\n".join(changes.describe_links_out(self.ws.root, leaving)) + "\n"
+                     "Tell the user about these links.\n")
         return outcome, text
 
     # run_tests ------------------------------------------------------------

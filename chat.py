@@ -1952,6 +1952,12 @@ class Chat:
             print(red(bold(changes_mod.RUNS_LATER_WARNING)))
             for line in changes_mod.describe_runs_later(risky):
                 print(line)
+        if self.toolbox:
+            leaving = changes_mod.links_out(self.toolbox.ws.root, found)
+            if leaving:
+                print(red(bold(changes_mod.LINKS_OUT_WARNING)))
+                for line in changes_mod.describe_links_out(self.toolbox.ws.root, leaving):
+                    print(line)
 
     def _mark_session_start(self) -> None:
         if self.checkpoints is None or not self.checkpoints.available:

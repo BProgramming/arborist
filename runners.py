@@ -161,8 +161,9 @@ _py_paths_cache: dict[tuple[str, int], list[Path]] = {}
 
 def _python_paths(interp: str) -> list[Path]:
     """Where an interpreter loads code from. Asked with -I -S, so no .pth
-    files or site customisation run: this one probe can't be sandboxed (its
-    answer is what the sandbox needs to show)."""
+    files or site customisation run. Its answer is what a run's sandbox needs
+    to show, so it can't use that sandbox; it gets a narrower one instead
+    (sandbox.wrap_interpreter_probe): the interpreter may be the project's own."""
     real = os.path.realpath(interp)
     try:
         key = (real, os.stat(real).st_mtime_ns)
@@ -171,7 +172,7 @@ def _python_paths(interp: str) -> list[Path]:
     if key not in _py_paths_cache:
         cmd = [interp, "-I", "-S", "-c", _PY_PATHS]
         if _probe_wrap is not None:  # sandboxing is on
-            cmd = sandbox.wrap_system_readonly(cmd)
+            cmd = sandbox.wrap_interpreter_probe(cmd, sandbox.tool_root(interp))
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=PROBE_TIMEOUT,
                                stdin=subprocess.DEVNULL,

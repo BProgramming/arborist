@@ -254,3 +254,18 @@ def test_cargo_run_log_is_named_after_the_file(ws_root, make_toolbox):
     check_and_run(tb, "src/main.rs")
     logs = [p.name for p in (tb.log_dir / "runs").glob("*.log")]
     assert len(logs) == 1 and logs[0].endswith("-main.log")
+
+
+def test_links_out_finds_only_symlinks_leaving_the_workspace(tmp_path):
+    import changes
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (tmp_path / "secret").write_text("x")
+    (ws / "real").write_text("x")
+    before = changes.snapshot(ws)
+    (ws / "out").symlink_to(tmp_path / "secret")
+    (ws / "in").symlink_to("real")
+    (ws / "plain").write_text("y")
+    found = changes.compare(before, changes.snapshot(ws))
+    assert [c.path for c in changes.links_out(ws, found)] == ["out"]
+    assert changes.describe_links_out(ws, changes.links_out(ws, found)) == [f"  out -> {tmp_path / 'secret'}"]

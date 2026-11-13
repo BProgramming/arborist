@@ -291,3 +291,29 @@ def test_truncate_never_exceeds_the_limit(size, limit):
     out = _truncate(text, limit)
     assert len(out) <= limit and "characters omitted" in out
     assert out.endswith(text[-10:])
+
+
+# ---- symlinks out of the workspace ----------------------------------------------
+
+def test_grep_and_listings_skip_symlinks_that_leave_the_workspace(ws_root, tmp_path, make_toolbox):
+    secret = tmp_path / "outside.txt"
+    secret.write_text("TOPSECRET=1\n")
+    (ws_root / "notes.txt").symlink_to(secret)
+    write(ws_root, "real.txt", "TOPSECRET is mentioned here\n")
+    (ws_root / "inside.txt").symlink_to("real.txt")  # a link that stays inside is fine
+    tb = make_toolbox()
+    hits = tb.call("grep", {"pattern": "TOPSECRET"}).content
+    assert "real.txt:1" in hits and "inside.txt:1" in hits
+    assert "notes.txt" not in hits and "TOPSECRET=1" not in hits
+    assert "notes.txt" not in tb.call("list_files", {}).content
+    assert "notes.txt" not in tb.call("view_tree", {}).content
+    assert tb.call("read_file", {"path": "notes.txt"}).content.startswith("error:")
+
+
+def test_walk_skips_symlinks_into_hidden_data(ws_root, tmp_path):
+    data = ws_root / "arborist-data"
+    data.mkdir()
+    (data / "memory.toml").write_text("SECRETNOTE\n")
+    (ws_root / "peek.toml").symlink_to(data / "memory.toml")
+    ws = Workspace(ws_root, hidden=[data])
+    assert [f.name for f in ws.walk_files(ws.root)] == []
