@@ -435,6 +435,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         report["notes"].append(f"runs use the project's virtualenv {venv}, read-only")
 
     session = TaskChat(cfg, c, source, mode, task_dir, progress)
+    session.join_server("task")  # so a private chat on this server knows it's here
     toolbox = session.toolbox
     assert toolbox is not None  # TaskChat always has one
     if client is not None:
@@ -502,6 +503,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_alarm)
         signal.signal(signal.SIGINT, old_int)
+        session.leave_server()
 
     progress.update(doing="collecting the changes")
     patch = task_dir / "changes.patch"

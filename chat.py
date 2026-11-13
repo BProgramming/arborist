@@ -42,6 +42,7 @@ import chat_input
 import compaction
 import changes as changes_mod
 import config as model_config
+import presence as presence_mod
 import runners
 import sessions
 import trail as trail_mod
@@ -208,7 +209,8 @@ Commands:
   /private              keep nothing from this session once it ends: takes
                         back what it has written so far (input history,
                         logs, checkpoints; asks about memories), then no
-                        parking, memory saves or history; lasts until you leave
+                        parking, memory saves or history; lasts until you leave.
+                        Warns if other sessions share the server
 
 Input:
   Alt+Enter             new line in your message; Enter sends it (with
@@ -1337,6 +1339,11 @@ class Chat:
         # The messages as last parked or resumed: exiting with nothing new
         # doesn't write the cache again.
         self._parked: list[dict] | None = None
+        # This session's entry among those attached to the server (see
+        # presence.py); set when the chat loop starts. _seen_sessions: the
+        # ones a private session has already been warned about.
+        self.presence: presence_mod.Presence | None = None
+        self._seen_sessions: set[str] = set()
 
     def _memory_block(self) -> str:
         try:
@@ -1647,7 +1654,11 @@ class Chat:
             return
         data = self._snapshot()
         kv, why = None, ""
-        if self.client.healthy():
+        if any(s.get("private") for s in self.other_sessions()):
+            # Every session uses the same slot, so what the server would save
+            # could be the private session's conversation.
+            why = " (cache not saved: a private session is using this server)"
+        elif self.client.healthy():
             print(dim("parking the conversation and the model's cache…"))
             try:
                 res = self.client.slot_action(sessions.SLOT, "save", sessions.kv_file(self.session_key))
@@ -2104,6 +2115,59 @@ class Chat:
         finally:
             self.busy = False
 
+    # -- other sessions on this server -----------------------------------------
+
+    def join_server(self, kind: str = "chat") -> None:
+        """Record this session as attached to the server, and say so if a
+        private session is already there."""
+        try:
+            self.presence = presence_mod.Presence(presence_mod.folder(self.cfg), kind)
+            self.presence.start()
+        except OSError as e:
+            self.presence = None
+            print(dim(f"couldn't record this session in {presence_mod.folder(self.cfg)} ({e}); "
+                      "other sessions won't know it's here"))
+            return
+        private = [s for s in self.other_sessions() if s.get("private")]
+        if private:
+            print(yellow(bold("warning: ") + f"a private session is using this server: "
+                         f"{presence_mod.describe(private)}. Sessions share the model's one "
+                         "cache slot, so while it's open this session won't save the cache when "
+                         "it parks (only the messages), and each session re-reads its "
+                         "conversation after the other has had a turn."))
+
+    def leave_server(self) -> None:
+        if self.presence is not None:
+            self.presence.close()
+            self.presence = None
+
+    def other_sessions(self) -> list[dict]:
+        """The other live sessions attached to this server (none before the
+        chat loop has started)."""
+        if self.presence is None:
+            return []
+        try:
+            return self.presence.others()
+        except OSError:
+            return []
+
+    def _warn_shared(self, first: bool = False) -> None:
+        """In a private session: warn about sessions sharing the server that
+        it hasn't been told about yet (all of them when it goes private, then
+        any that arrive later)."""
+        new = [s for s in self.other_sessions() if s["id"] not in self._seen_sessions]
+        if not new:
+            return
+        self._seen_sessions.update(s["id"] for s in new)
+        n = len(new)
+        lead = (f"{n} other session{'s are' if n != 1 else ' is'} open on this server"
+                if first else
+                f"{n} more session{'s have' if n != 1 else ' has'} started on this server")
+        print(yellow(bold("warning: ") + f"{lead}: {presence_mod.describe(new)}. Sessions share "
+                     "the model's one cache slot. While this session is private none of them "
+                     "saves that cache to disk, but the server is shared: close them, or leave "
+                     "and start a private session on its own, if that matters here."))
+
     # -- private ---------------------------------------------------------------
 
     def _cmd_private(self) -> None:
@@ -2184,6 +2248,12 @@ class Chat:
             tb.log_dir = self.log_dir
             tb._checked.clear()  # cached plans point at the old build folder
         self.private = True
+        if self.presence is not None:
+            try:  # from here on, no other session saves the shared cache slot
+                self.presence.set_private()
+            except OSError as e:
+                problems.append(f"couldn't mark this session private for other sessions ({e}); "
+                                "one that parks while this is open may save the shared cache")
 
         print(yellow(bold("Private session.")) + dim(
             " Nothing from it is kept once you leave: it won't be parked, the model can't "
@@ -2199,6 +2269,7 @@ class Chat:
                       "it's replaced the next time you leave a normal chat here."))
         for problem in problems:
             print(red(problem))
+        self._warn_shared(first=True)
 
     def _ask_saved_notes(self) -> list[SavedNote]:
         """For each memory the model saved this session: keep it, or take it back?"""
@@ -2338,6 +2409,7 @@ class Chat:
         except ValueError:
             print(dim("    Memory: not loaded"))
         self._show_parked()
+        self.join_server()
 
         try:
             while True:
@@ -2360,6 +2432,8 @@ class Chat:
                     continue
                 if line.startswith("//"):
                     line = line[1:]
+                if self.private:
+                    self._warn_shared()  # a session that started since
                 self.messages.append({"role": "user", "content": self._compose(line)})
                 self._reply(label=line)
         finally:
@@ -2370,6 +2444,7 @@ class Chat:
                     pass
             self.park()
             self.end_private()
+            self.leave_server()
 
 
 def _memories(n: int) -> str:

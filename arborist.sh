@@ -326,6 +326,18 @@ stop_server() {
   rm -f "$PID_FILE"
 }
 
+stop_server_unless_shared() {
+  # On leaving a chat: other sessions (a second chat, a delegated task) may
+  # still be attached to the server this launcher started.
+  local n
+  n="$("$PY" "$HERE/presence.py" --count 2>/dev/null || echo 0)"
+  if [[ "$n" =~ ^[0-9]+$ ]] && ((n > 0)); then
+    info "Leaving the server running: $n other session(s) still use it. Stop it later with ./arborist.sh stop."
+    return 0
+  fi
+  stop_server
+}
+
 # ------------------------------------------------------------- commands ---
 setup() {
   check_deps
@@ -339,7 +351,7 @@ cmd_chat() {
   setup
   start_server
   if ((STARTED_SERVER)); then
-    trap 'stop_server' EXIT
+    trap 'stop_server_unless_shared' EXIT
     trap 'exit 130' INT TERM
   fi
   # Ctrl-C belongs to the chat client (it stops a reply); keep it from
