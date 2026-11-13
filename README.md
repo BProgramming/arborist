@@ -174,6 +174,46 @@ new text the model has to read. `/stats` shows how much came from the cache
   the chat is open, the slot then holds the task, and the saved cache won't
   match; nothing breaks, it just isn't reused.
 
+## Private sessions
+
+Type `/private` and nothing from the session is kept once you leave. You can
+do it partway through a chat: the conversation carries on, and what the
+session has already written is taken back first:
+
+- **Memories the model saved this session**: you're asked about each one
+  (Enter removes it, `n` keeps it). A removed note's replaced notes become
+  current again. Ctrl-C at the question calls `/private` off, with nothing
+  changed.
+- **Input history**: this session's entries come out of the history file;
+  lines from other arborist windows stay.
+- **Checkpoints**: this session's move to a store in the scratch folder below
+  (with the older ones, so `/undo` and `/diff` still reach as far back), and
+  the normal store is rewound to how it was when the session started and
+  garbage-collected, so their labels (which quote your messages) are gone
+  from disk. A store the session created is deleted.
+- **Logs and build output**: run logs and compiled programs are deleted, and
+  this session's entries come out of the error logs.
+
+From then on:
+
+- **Not parked.** No `sessions/` file, no saved KV cache; `/resume` is off. On
+  exit arborist asks llama-server to erase the chat's slot, so the server
+  doesn't hold the conversation either. (That needs the server's cache saving,
+  which `chat.resume = true` turns on; without it you're told the cache stays
+  in the server's memory, never on disk, until the server stops.)
+- **No memory saves.** The model gets no `remember` tool and is told why.
+  Existing memories are still read, and `/recall` still works.
+- **No input history.** Lines you type stay in memory for ↑ and are gone on exit.
+- **Logs and checkpoints go to a scratch folder**, `private/<pid>/` under
+  `paths.root`, deleted on exit. If arborist is killed before it can clean
+  up, the next start deletes the folder.
+
+It lasts until you leave; `/clear` doesn't end it. What it can't take back:
+files the model changed in your workspace stay changed, `/save` writes the
+file you asked for, and a parked chat you `/resume`d is still parked (until
+the next normal chat you leave in that folder replaces it). If anything can't
+be taken back, it says what. The toolbar shows `PRIVATE` while it's on.
+
 ## Chat commands
 
 | Command | What it does |
@@ -196,6 +236,7 @@ new text the model has to read. `/stats` shows how much came from the cache
 | `/compact` | shrink the conversation now: stub old tool output, then summarise older turns |
 | `/diff [-f] [PATH…]` | files changed since this session started, in the workspace or under `PATH` (`-f`/`--full`: the whole diff) |
 | `/config` | open `.config/config` in nano; `[tools]` changes apply right away, the rest after a restart |
+| `/private` | keep nothing from this session once you leave, taking back what it has written so far (see [Private sessions](#private-sessions)) |
 
 ### The prompt
 

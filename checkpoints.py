@@ -211,6 +211,41 @@ class Checkpoints:
         return changes, safety
 
 
+    # -- /private -------------------------------------------------------------
+
+    def head(self) -> str | None:
+        """The newest checkpoint's sha, or None when there are none yet."""
+        if not self.available or not (self.git_dir / "HEAD").exists() or not self._has_commits():
+            return None
+        return self._git("rev-parse", "HEAD").stdout.decode().strip()
+
+    def count_since(self, sha: str | None) -> int:
+        """How many checkpoints were made after `sha` (all of them for None)."""
+        if self.head() is None:
+            return 0
+        spec = f"{sha}..HEAD" if sha else "HEAD"
+        return int(self._git("rev-list", "--count", spec).stdout.decode().strip() or 0)
+
+    def copy_into(self, other: "Checkpoints") -> None:
+        """Give `other` (a store for the same workspace) this store's history,
+        so its checkpoints keep working there."""
+        if self.head() is None:
+            return
+        other._ensure()
+        other._git("fetch", "--quiet", "--no-tags", str(self.git_dir), "HEAD")
+        other._git("update-ref", "HEAD", "FETCH_HEAD")
+
+    def rewind(self, sha: str | None) -> None:
+        """Forget every checkpoint after `sha`, and purge them from disk (their
+        labels and snapshots). None: there were none, so the store goes."""
+        if sha is None:
+            if self.git_dir.is_dir() and (self.git_dir / MARKER).is_file():
+                shutil.rmtree(self.git_dir)
+            return
+        self._git("update-ref", "HEAD", sha)
+        self._git("reflog", "expire", "--expire=now", "--all")
+        self._git("gc", "--prune=now", "--quiet")
+
     # -- pruning ------------------------------------------------------------
 
     def prune(self, cutoff: datetime) -> int:

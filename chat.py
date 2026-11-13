@@ -44,6 +44,7 @@ import changes as changes_mod
 import config as model_config
 import runners
 import sessions
+import trail as trail_mod
 from checkpoints import CheckpointError, Checkpoints, prune_store
 from tools import (IGNORED_DIRS, Decision, Limits, MemoryChoice, ToolError, ToolResult, Toolbox,
                    Workspace)
@@ -204,6 +205,10 @@ Commands:
                         workspace or under PATH (-f, --full: the whole diff)
   /config               open .config/config in nano; [tools] settings apply
                         right away, the rest after a restart
+  /private              keep nothing from this session once it ends: takes
+                        back what it has written so far (input history,
+                        logs, checkpoints; asks about memories), then no
+                        parking, memory saves or history; lasts until you leave
 
 Input:
   Alt+Enter             new line in your message; Enter sends it (with
@@ -222,6 +227,9 @@ Input:
 # Sent as the user's message when they agree to let the model fix failing tests.
 FIX_GO_AHEAD = ("Yes, fix them as you proposed. Then run the tests again to check, and tell me "
                 "the result.")
+
+
+_UNSET = object()  # Chat._start_head before it's known
 
 
 class Interrupted(BaseException):
@@ -575,6 +583,11 @@ self-contained fact per call, written so it makes sense without this conversatio
 Save facts about this project with scope "workspace" and facts about the user that \
 hold everywhere with scope "general". When a fact changes, save the new version: \
 the user is shown similar saved notes and can mark the old one outdated.\
+"""
+
+PRIVATE_GUIDE = """\
+This is a private session: nothing from it is kept after it ends, and you can't \
+save memories. If the user asks you to remember something, tell them that.\
 """
 
 REMEMBER_SCHEMA = {
@@ -1023,6 +1036,23 @@ class Memory:
                              f"Check how [{block}] is laid out") from None
         return entry
 
+    def take_back(self, note: SavedNote) -> None:
+        """Undo add(): remove the note and make the ones it replaced current
+        again. Raises ValueError (file untouched) if that can't be done."""
+        body = self._read().get(note.block, {})
+        if note.entry not in body.get("memories", []):
+            raise ValueError("it isn't in the file any more")
+        ops = [("remove", note.block, "memories", note.entry)]
+        for old in note.replaced:
+            if old in body.get("outdated", []):
+                ops += [("remove", note.block, "outdated", old),
+                        ("append", note.block, "memories", old)]
+        try:
+            self._edit(ops)
+        except EditError as e:
+            raise ValueError(f"couldn't edit {self.path} safely ({e}); the file is unchanged") \
+                from None
+
     def search(self, term: str) -> list[Note]:
         """Visible notes, current and outdated, that mention the term."""
         t = term.casefold()
@@ -1066,20 +1096,34 @@ class Memory:
                 + "\n".join(lines) + f"\n</memory>{note}")
 
 
+@dataclass
+class SavedNote:
+    """A note the model saved this session, and the notes it marked outdated."""
+    block: str
+    entry: str
+    replaced: list[str]
+
+
 class AgentTools:
     """The workspace toolbox plus `remember`, as agent.run_turn sees them."""
 
-    def __init__(self, toolbox: Toolbox, memory: Memory):
+    def __init__(self, toolbox: Toolbox, memory: Memory, can_remember: bool = True,
+                 saved: list[SavedNote] | None = None):
         self.toolbox = toolbox
         self.memory = memory
+        self.can_remember = can_remember  # False in a /private session
+        # Notes saved this session, so /private can offer to take them back.
+        self.saved = saved if saved is not None else []
 
     @property
     def schemas(self) -> list[dict]:
-        return self.toolbox.schemas + [REMEMBER_SCHEMA]
+        return self.toolbox.schemas + ([REMEMBER_SCHEMA] if self.can_remember else [])
 
     def call(self, name: str, raw_args: str | dict) -> ToolResult:
         if name != "remember":
             return self.toolbox.call(name, raw_args)
+        if not self.can_remember:
+            return ToolResult("error: this is a private session; nothing can be saved to memory")
         try:
             args = json.loads(raw_args or "{}") if isinstance(raw_args, str) else dict(raw_args)
             fact = args["memory"]
@@ -1122,6 +1166,7 @@ class AgentTools:
             return ToolResult(f"error: not saved: {e}")
         except OSError as e:
             return ToolResult(f"error: couldn't write memory: {e.strerror or e}")
+        self.saved.append(SavedNote(block, entry, replaces))
         msg = f"saved to memory [{block}]: {entry}"
         if replaces:
             msg += "\nMarked outdated (no longer shown to you): " + "; ".join(replaces)
@@ -1213,6 +1258,17 @@ class Chat:
         self.busy = False
         self.history_dir = Path(cfg["derived"]["history_dir"])
         self.history_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir = Path(cfg["derived"]["log_dir"])
+        # /private: nothing outlives the session. Logs and checkpoints go to
+        # private_dir, which is deleted when the chat ends.
+        self.private = False
+        self.private_dir: Path | None = None
+        # What this session has written, so /private can take it back: error
+        # logs (the toolbox keeps its own), memories the model saved, and the
+        # newest checkpoint when it started (_UNSET until the chat loop starts).
+        self.trail = trail_mod.Trail()
+        self.saved_notes: list[SavedNote] = []
+        self._start_head: str | None | object = _UNSET
         self.model_name = cfg["derived"]["model_name"]
         # Memories are scoped to the folder the session starts in (the
         # workspace, or where a --no-tools chat was started).
@@ -1292,7 +1348,8 @@ class Chat:
     @property
     def agent_tools(self) -> AgentTools | None:
         if self.tools_enabled and self.toolbox:
-            return AgentTools(self.toolbox, self.memory)
+            return AgentTools(self.toolbox, self.memory, can_remember=not self.private,
+                              saved=self.saved_notes)
         return None
 
     # -- request -------------------------------------------------------------
@@ -1303,7 +1360,7 @@ class Chat:
         if self.tools_enabled and self.toolbox:
             parts.append(agent.TOOL_GUIDE.format(root=self.toolbox.ws.root,
                                                  sandbox=agent.sandbox_rule(self.toolbox.limits)))
-            parts.append(MEMORY_GUIDE)
+            parts.append(PRIVATE_GUIDE if self.private else MEMORY_GUIDE)
             facts = self._env_facts
             if facts is None:
                 with self.toolbox.probing():  # version probes run the project's interpreter
@@ -1473,10 +1530,9 @@ class Chat:
 
     def _log_error(self) -> Path | str:
         try:
-            path = Path(self.cfg["derived"]["log_dir"]) / "chat-errors.log"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S}\n{traceback.format_exc()}\n")
+            path = self.log_dir / "chat-errors.log"
+            self.trail.append(path, f"--- {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+                                    f"{traceback.format_exc()}\n")
             return path
         except OSError:
             return "(couldn't write the log)"
@@ -1535,6 +1591,9 @@ class Chat:
         try:
             path.write_text("\n".join(lines), encoding="utf-8")
             print(dim(f"saved {path}"))
+            if self.private:
+                print(yellow("this is a private session, but that file stays: delete it "
+                             "yourself if you don't want to keep it"))
         except OSError as e:
             print(red(f"save failed: {e}"))
 
@@ -1583,7 +1642,8 @@ class Chat:
 
     def park(self) -> None:
         """On exit: save the conversation, then ask the server to save its cache."""
-        if not self.resume_on or not self.messages or self.messages == self._parked:
+        if self.private or not self.resume_on or not self.messages \
+                or self.messages == self._parked:
             return
         data = self._snapshot()
         kv, why = None, ""
@@ -1614,6 +1674,10 @@ class Chat:
         print(dim(f"parked {len(self.messages)} messages{detail}{why}; /resume here continues it"))
 
     def resume(self) -> None:
+        if self.private:
+            print(red("/resume is unavailable in a private session (leave and start a normal "
+                      "chat to continue a parked one)"))
+            return
         if not self.resume_on:
             why = "delegated tasks don't park" if not self.resumable else "chat.resume is off"
             print(red(f"/resume is unavailable ({why})"))
@@ -1868,6 +1932,7 @@ class Chat:
             "compact": (self._cmd_compact, 0),
             "diff": (lambda a, r: self._diff(a), None),
             "config": (self._cmd_config, 0),
+            "private": (lambda a, r: self._cmd_private(), 0),
         }
 
     # -- changes ------------------------------------------------------------
@@ -1891,6 +1956,11 @@ class Chat:
     def _mark_session_start(self) -> None:
         if self.checkpoints is None or not self.checkpoints.available:
             return
+        if self._start_head is _UNSET and not self.private:
+            try:  # where /private rewinds the store to
+                self._start_head = self.checkpoints.head()
+            except CheckpointError:
+                pass
         try:
             self.session_base = self.checkpoints.snapshot("session start", kind="session")
         except CheckpointError as e:
@@ -2028,6 +2098,137 @@ class Chat:
         finally:
             self.busy = False
 
+    # -- private ---------------------------------------------------------------
+
+    def _cmd_private(self) -> None:
+        if self.private:
+            print(dim(f"already private; it lasts until you leave ({self.private_dir} goes then)"))
+            return
+        # Memories first: it's the one step that asks, so Ctrl-C there can
+        # still call the whole thing off.
+        try:
+            keep = self._ask_saved_notes()
+        except (KeyboardInterrupt, EOFError):
+            print(dim("\nnot private; nothing changed"))
+            return
+        try:
+            self.private_dir = make_private_dir(self.cfg)
+        except OSError as e:
+            print(red(f"can't go private: couldn't create a scratch folder ({e})"))
+            return
+        problems: list[str] = []
+        taken: list[str] = []
+        tb = self.toolbox
+        # Checkpoints: this session's move to a store in the scratch folder
+        # (with the older ones, so /undo and /diff reach as far back as
+        # before), then the normal store is rewound to how it was at startup.
+        if tb is not None and self.checkpoints is not None and self.checkpoints.available:
+            normal = self.checkpoints
+            private = Checkpoints(tb.ws.root, self.private_dir / "checkpoints", exclude=IGNORED_DIRS)
+            try:
+                n = normal.count_since(self._start_head) if self._start_head is not _UNSET else 0
+                normal.copy_into(private)
+            except CheckpointError as e:
+                shutil.rmtree(self.private_dir, ignore_errors=True)
+                self.private_dir = None
+                print(red(f"can't go private: couldn't move this session's checkpoints ({e}); "
+                          "nothing changed"))
+                return
+            self.checkpoints = tb.checkpoints = private
+            if self._start_head is not _UNSET:
+                try:
+                    normal.rewind(self._start_head)  # type: ignore[arg-type]
+                    if n:
+                        taken.append(f"{n} checkpoint{'s' * (n != 1)}")
+                except (CheckpointError, OSError) as e:
+                    problems.append(f"couldn't take this session's checkpoints out of "
+                                    f"{normal.git_dir} ({e}); their labels quote your messages")
+        removed = 0
+        for note in self.saved_notes:
+            if note in keep:
+                continue
+            try:
+                self.memory.take_back(note)
+                removed += 1
+            except (ValueError, OSError) as e:
+                problems.append(f"couldn't remove the memory \"{note.entry}\": {e}")
+        self.saved_notes.clear()
+        if removed:
+            taken.append(f"{removed} memor{'y' if removed == 1 else 'ies'}")
+        # Input history: this session's lines come out of the file; from now
+        # on they're kept in memory only. (readline only writes on exit.)
+        if self.prompt is not None:
+            n = len(self.prompt.history.written)
+            problem = self.prompt.history.take_back()
+            self.prompt.history.private = True
+            if problem:
+                problems.append(problem)
+            elif n:
+                taken.append(f"{n} input history entr{'y' if n == 1 else 'ies'}")
+        # Logs and build output written so far go; new ones go to the scratch folder.
+        logs = len(self.trail.created) + len(self.trail.appended)
+        if tb is not None:
+            logs += len(tb.trail.created) + len(tb.trail.appended)
+            problems += tb.trail.take_back()[1]
+        problems += self.trail.take_back()[1]
+        if logs:
+            taken.append(f"{logs} log and build item{'s' * (logs != 1)}")
+        self.log_dir = self.private_dir / "logs"
+        if tb is not None:
+            tb.log_dir = self.log_dir
+            tb._checked.clear()  # cached plans point at the old build folder
+        self.private = True
+
+        print(yellow(bold("Private session.")) + dim(
+            " Nothing from it is kept once you leave: it won't be parked, the model can't "
+            "save memories, and your messages stay out of the input history. Logs and "
+            f"checkpoints go to {self.private_dir}, deleted on exit. Existing memories are "
+            "still read; /save still writes a file if you ask it to."))
+        if taken:
+            print(dim("Taken back from earlier in this session: " + ", ".join(taken) + "."))
+        if keep:
+            print(dim(f"Kept {len(keep)} memor{'y' if len(keep) == 1 else 'ies'} you chose to keep."))
+        if self._parked is not None:
+            print(dim(f"The parked copy you resumed from is still in {self.store.path(self.session_key)}; "
+                      "it's replaced the next time you leave a normal chat here."))
+        for problem in problems:
+            print(red(problem))
+
+    def _ask_saved_notes(self) -> list[SavedNote]:
+        """For each memory the model saved this session: keep it, or take it back?"""
+        if not self.saved_notes:
+            return []
+        n = len(self.saved_notes)
+        print(bold(f"The model saved {n} memor{'y' if n == 1 else 'ies'} this session:"))
+        keep = []
+        for note in self.saved_notes:
+            print(f"  [{note.block}] {note.entry}")
+            for old in note.replaced:
+                print(dim(f"    (replaced: {old})"))
+            ans = ask("  Remove it? [Y/n]: ").strip().lower()
+            if ans in ("n", "no"):
+                keep.append(note)
+        return keep
+
+    def end_private(self) -> None:
+        """On exit: drop the server's copy of the conversation and the scratch folder."""
+        if not self.private:
+            return
+        if self.client.healthy():
+            try:  # the slot's KV cache holds the whole conversation
+                self.client.slot_action(sessions.SLOT, "erase", "")
+            except (RuntimeError, OSError) as e:
+                print(yellow(f"couldn't clear the server's cache for this chat ({e}); "
+                             "it's in the server's memory until it's restarted, never on disk"))
+            except KeyboardInterrupt:
+                pass
+        if self.private_dir is not None:
+            shutil.rmtree(self.private_dir, ignore_errors=True)
+            if self.private_dir.exists():
+                print(red(f"couldn't delete {self.private_dir}; delete it yourself"))
+            else:
+                print(dim("private session over: nothing kept"))
+
     # -- loop ----------------------------------------------------------------
 
     def offer_fix(self) -> bool:
@@ -2091,7 +2292,7 @@ class Chat:
     def _toolbar(self) -> str:
         pct = 100 * self.ctx_used / self.context_tokens if self.context_tokens else 0.0
         return chat_input.toolbar_text(neutralize(self.model_name), self.effort,
-                                       self.tools_enabled, pct)
+                                       self.tools_enabled, pct, private=self.private)
 
     def _make_prompt(self) -> chat_input.RichPrompt | None:
         """The prompt_toolkit prompt, or None to use input()."""
@@ -2156,12 +2357,13 @@ class Chat:
                 self.messages.append({"role": "user", "content": self._compose(line)})
                 self._reply(label=line)
         finally:
-            if self.prompt is None and readline:
+            if self.prompt is None and readline and not self.private:
                 try:
                     readline.write_history_file(hist)
                 except OSError:
                     pass
             self.park()
+            self.end_private()
 
 
 def _memories(n: int) -> str:
@@ -2231,6 +2433,47 @@ def prune_parked(cfg: dict) -> None:
                   f"{cfg['chat']['resume_days']} days"))
 
 
+def private_root(cfg: dict) -> Path:
+    return Path(cfg["derived"]["root"]) / "private"
+
+
+def make_private_dir(cfg: dict) -> Path:
+    """A scratch folder for one /private session, named for this process so a
+    later start can tell when it was left behind (a crash, a kill -9)."""
+    top = private_root(cfg)
+    top.mkdir(parents=True, exist_ok=True)
+    os.chmod(top, 0o700)
+    path = top / str(os.getpid())
+    shutil.rmtree(path, ignore_errors=True)  # a dead session that had this PID
+    path.mkdir(mode=0o700)
+    return path
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def prune_private(cfg: dict) -> None:
+    """Startup: delete scratch folders left by private sessions that didn't exit cleanly."""
+    top = private_root(cfg)
+    if not top.is_dir():
+        return
+    gone = 0
+    for d in top.iterdir():
+        if d.is_dir() and not (d.name.isdigit() and _alive(int(d.name))):
+            shutil.rmtree(d, ignore_errors=True)
+            gone += not d.exists()
+    if gone:
+        print(dim(f"deleted {gone} folder{'s' * (gone != 1)} left by private sessions that "
+                  "didn't exit cleanly"))
+
+
 def arborist_paths(cfg: dict) -> list[Path]:
     """arborist's own code and config: readable by the model, never changed."""
     return [HERE, Path(cfg["derived"]["config_path"]).resolve()]
@@ -2298,6 +2541,7 @@ def main(argv: list[str] | None = None) -> int:
     chat = Chat(cfg, workspace, tools_enabled=cfg["tools"]["enabled"], memory_scope=scope)
     prune_old_checkpoints(cfg)
     prune_parked(cfg)
+    prune_private(cfg)
 
     # Ctrl-C while a turn is in progress (streaming, a tool, an approval
     # prompt or a run) cancels the turn; at the prompt it just clears the line.
