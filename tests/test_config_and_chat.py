@@ -989,3 +989,81 @@ def test_checkpoint_choices_for_the_undo_menu(load_toml, ws_root):
 def test_no_checkpoint_choices_without_a_store(load_toml, ws_root):
     import chat
     assert chat.Chat(load_toml(""), None, tools_enabled=False)._checkpoint_choices() == []
+
+
+# ----------------------------------------------------- review fixes: turns ---
+
+def test_server_error_inside_the_stream_is_raised():
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import chat
+
+    class Handler(BaseHTTPRequestHandler):
+        # noinspection PyShadowingBuiltins
+        def log_message(self, format, *args):
+            pass
+
+        # noinspection PyPep8Naming
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'data: {"choices": [{"delta": {"content": "par"}}]}\n\n'
+                             b'data: {"error": {"code": 500, "message": "context size exceeded"}}\n\n')
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+    try:
+        client = chat.Client(f"http://127.0.0.1:{server.server_port}")
+        with pytest.raises(RuntimeError, match="the server stopped the reply: context size exceeded"):
+            list(client.stream_chat({"messages": []}))
+    finally:
+        server.shutdown()
+
+
+def test_retry_goes_back_to_the_users_message_not_a_harness_note(load_toml, ws_root):
+    import agent
+    import chat
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    c.messages = [
+        {"role": "user", "content": "fix the bug"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "grep", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "error: pattern is required"},
+        {"role": "user", "content": agent.PAUSE_NOTE.format(why="4 tool calls in a row failed")},
+        {"role": "assistant", "content": "I'm stuck."},
+    ]
+    seen = []
+    c._reply = lambda label="": seen.append(list(c.messages))
+    c.command("/retry")
+    assert seen == [[{"role": "user", "content": "fix the bug"}]]
+
+
+def test_failed_turn_keeps_its_attachments_and_notes_for_the_next_message(load_toml, ws_root, capsys):
+    import chat
+    c = chat.Chat(load_toml(), ws_root, tools_enabled=True)
+    c.memory.add("Son is learning PyGame")
+    c.command("/recall pygame")
+    c._attach([__file__])
+    c.pending_notes.append("The user restored the workspace files.")
+
+    def down(_body):
+        yield from ()
+        raise RuntimeError("server went away")
+
+    c.client.stream_chat = down
+    c.client.healthy = lambda: True
+    c.messages.append({"role": "user", "content": c._compose("what changed?")})
+    assert not c.pending_notes and not c.pending_files and not c.pending_memories
+    c._reply(label="what changed?")
+    assert c.messages == []
+    assert "will go with your next one" in capsys.readouterr().out
+    again = c._compose("what changed?")
+    assert again.startswith("<note>\nThe user restored") and "<memory_reminder>" in again
+    assert "<file path=" in again
+
+    # A turn that succeeds uses them up.
+    c.client.stream_chat = lambda _body: iter([{"choices": [{"delta": {"content": "ok"}}]}])
+    c.messages.append({"role": "user", "content": again})
+    c._reply(label="what changed?")
+    assert c._compose("next") == "next" and c._sent_pending is not None

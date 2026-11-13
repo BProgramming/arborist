@@ -133,17 +133,34 @@ build_stamp() {
 }
 
 fetch_source() {
-  local update="${1:-0}"
+  # The ref last checked out is kept beside the clone, so a build.ref (or
+  # build.repo) edited in the config takes effect on the next start instead
+  # of silently building the old source.
+  local update="${1:-0}" ref_file="$CFG_SRC_DIR/.git/arborist-ref" origin
   if [[ ! -d "$CFG_SRC_DIR/.git" ]]; then
     step "Cloning $CFG_REPO ($CFG_REF)..."
     git clone --filter=blob:none "$CFG_REPO" "$CFG_SRC_DIR"
     update=1
+  else
+    origin="$(git -C "$CFG_SRC_DIR" remote get-url origin 2>/dev/null || true)"
+    if [[ "$origin" != "$CFG_REPO" ]]; then
+      step "build.repo changed: switching the source from $origin to $CFG_REPO..."
+      git -C "$CFG_SRC_DIR" remote set-url origin "$CFG_REPO"
+      update=1
+    elif [[ -f "$ref_file" && "$(cat "$ref_file")" != "$CFG_REF" ]]; then
+      step "build.ref changed from $(cat "$ref_file") to $CFG_REF..."
+      update=1
+    fi
   fi
   if ((update)); then
     step "Checking out $CFG_REF..."
     git -C "$CFG_SRC_DIR" fetch --quiet origin "$CFG_REF"
     git -C "$CFG_SRC_DIR" checkout --quiet --detach FETCH_HEAD
     info "at $(git -C "$CFG_SRC_DIR" log -1 --format='%h %cs %s')"
+  fi
+  # (A clone from before this file existed is taken to be at the current ref.)
+  if ((update)) || [[ ! -f "$ref_file" ]]; then
+    printf '%s\n' "$CFG_REF" >"$ref_file"
   fi
 }
 
@@ -314,11 +331,21 @@ report_offload() {
   fi
 }
 
+is_server() {
+  # Whether PID is a llama-server. server.pid outlives a reboot or a crash,
+  # and by then the number can belong to something else of yours.
+  local cmdline
+  cmdline="$(tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null || true)"
+  [[ "$cmdline" == *llama-server* ]]
+}
+
 stop_server() {
   local pid="${SERVER_PID:-}"
   [[ -z "$pid" && -f "$PID_FILE" ]] && pid="$(cat "$PID_FILE")"
   [[ -z "$pid" ]] && return 0
-  if kill -0 "$pid" 2>/dev/null; then
+  if kill -0 "$pid" 2>/dev/null && ! is_server "$pid"; then
+    warn "server.pid names process $pid, which isn't llama-server; leaving it alone."
+  elif kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
     for _ in {1..20}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
     kill -9 "$pid" 2>/dev/null || true
@@ -422,7 +449,7 @@ main() {
     task)    cmd_task "$@" ;;
     stop)    stop_server; info "Stopped" ;;
     -h|--help|help) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
-    *) die "Unknown command: $1 (try --help)." ;;
+    *) die "Unknown command: $cmd (try --help)." ;;
   esac
 }
 

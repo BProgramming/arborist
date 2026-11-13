@@ -274,3 +274,42 @@ def test_system_prompt_carries_the_rule_and_follows_config(tmp_path, monkeypatch
     from tools import Limits
     c.toolbox.apply_limits(Limits(run_display=True))  # what /config does
     assert "Wayland display" in c._system() and "no display" not in c._system()
+
+
+# ------------------------------------------------- replies cut at the limit ---
+
+def cut_tool_reply(name, partial_arguments):
+    return [{"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "id0", "type": "function",
+                 "function": {"name": name, "arguments": partial_arguments}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]}]
+
+
+def test_tool_call_cut_off_by_the_output_limit_isnt_run(ws_root, make_toolbox):
+    tb = make_toolbox(FakeApprover())
+    ui = NullUI()
+    model = FakeModel(cut_tool_reply("write_file", '{"path": "a.py", "content": "print(1'),
+                      text_reply("I'll write it in parts."))
+    result, messages = run(model, tb, ui)
+    assert not (ws_root / "a.py").exists() and ui.calls == []
+    assert messages[2]["content"] == agent.CUT_OFF
+    # The history never carries half a JSON object back to the server.
+    assert json.loads(messages[1]["tool_calls"][0]["function"]["arguments"]) == {}
+    assert any("output limit" in n for n in ui.notices)
+    assert result.text == "I'll write it in parts." and not result.cut_off
+
+
+def test_complete_tool_call_still_runs_when_the_reply_hit_the_limit(ws_root, make_toolbox):
+    write(ws_root, "a.py", "x = 1\n")
+    chunks = tool_reply(("read_file", {"path": "a.py"}))
+    chunks[-1]["choices"][0]["finish_reason"] = "length"
+    ui = NullUI()
+    run(FakeModel(chunks, text_reply("done")), make_toolbox(), ui)
+    assert ui.calls == ["read_file"]
+
+
+def test_text_reply_cut_at_the_limit_is_flagged(make_toolbox):
+    chunks = text_reply("and then")
+    chunks[-1]["choices"][0]["finish_reason"] = "length"
+    result, _ = run(FakeModel(chunks), make_toolbox())
+    assert result.cut_off and result.text == "and then"

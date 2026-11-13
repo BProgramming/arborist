@@ -653,6 +653,11 @@ class Toolbox:
             raise ToolError("old_string is empty; give the exact text to replace")
         self.ws.require_fresh(p)
         text = _read_text(p)
+        if "\r\n" in text and "\r" not in old_string + new_string:
+            # read_file shows lines without their \r, so that's how the model
+            # writes them. Match, and write, in the file's own line endings.
+            old_string = old_string.replace("\n", "\r\n")
+            new_string = new_string.replace("\n", "\r\n")
         count = text.count(old_string)
         if count == 0:
             raise ToolError(

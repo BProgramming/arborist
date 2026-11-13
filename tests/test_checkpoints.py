@@ -277,3 +277,44 @@ def test_zero_days_keeps_everything(ws_root, cps, tmp_path):
     aged_snapshot(cps, "ancient", 400)
     assert prune_store(tmp_path / "store", 0) == (0, 0)
     assert len(cps.recent()) == 1
+
+
+def test_restore_removes_an_added_symlink_not_its_target(ws_root, cps):
+    write(ws_root, "data/real.csv", "keep me\n")
+    sha = cps.snapshot("before")
+    (ws_root / "latest.csv").symlink_to("data/real.csv")
+    (ws_root / "datalink").symlink_to("data")
+    changes, _ = cps.restore(sha)
+    assert sorted((c.status, c.path) for c in changes) == [("A", "datalink"), ("A", "latest.csv")]
+    assert (ws_root / "data" / "real.csv").read_text() == "keep me\n"
+    assert not (ws_root / "latest.csv").is_symlink() and not (ws_root / "datalink").is_symlink()
+
+
+def test_nested_repositories_are_reported(ws_root, cps):
+    assert cps.nested_repos() == []  # no store yet
+    write(ws_root, "top.py", "v1\n")
+    write(ws_root, "sub/f.py", "v1\n")
+    git = ["git", "-C", str(ws_root / "sub"), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "init", "-q", str(ws_root / "sub")], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "c"], check=True)
+    cps.snapshot("start")
+    assert cps.nested_repos() == ["sub"]
+
+
+def test_session_start_says_when_a_nested_repository_isnt_covered(ws_root, tmp_path, monkeypatch, capsys):
+    import chat
+    import config
+    p = tmp_path / "test.toml"
+    p.write_text(f'[paths]\nroot = "{tmp_path / "root"}"\n'
+                 '[model]\nrepo = "someone/Some-Model-GGUF"\nfile = "Some-Model-Q4_K_M.gguf"\n')
+    monkeypatch.setenv("ARBORIST_CONFIG", str(p))
+    write(ws_root, "sub/f.py", "v1\n")
+    git = ["git", "-C", str(ws_root / "sub"), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "init", "-q", str(ws_root / "sub")], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "c"], check=True)
+    c = chat.Chat(config.load(), ws_root, tools_enabled=True)
+    c._mark_session_start()
+    out = capsys.readouterr().out
+    assert "sub is a git repository inside this workspace" in out and "/undo and /diff" in out

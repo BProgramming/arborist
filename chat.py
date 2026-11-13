@@ -320,9 +320,16 @@ class Client:
                 if data == "[DONE]":
                     return
                 try:
-                    yield json.loads(data)
+                    chunk = json.loads(data)
                 except json.JSONDecodeError:
                     raise RuntimeError(f"malformed data from the server: {data[:200]!r}") from None
+                # A failure after the stream has started (the prompt didn't
+                # fit, the template threw) arrives as an error object.
+                if isinstance(chunk, dict) and chunk.get("error") and not chunk.get("choices"):
+                    err = chunk["error"]
+                    detail = err.get("message") if isinstance(err, dict) else err
+                    raise RuntimeError(f"the server stopped the reply: {detail or err}")
+                yield chunk
         finally:
             # Closing mid-stream tells llama-server to stop generating.
             conn.close()
@@ -1291,6 +1298,10 @@ class Chat:
         # One-off notes for the model that ride along with the next message
         # (e.g. "the user restored files with /undo").
         self.pending_notes: list[str] = []
+        # What the message now being answered took from the pending notes,
+        # /recall reminders and /file attachments, so they can be queued again
+        # if the turn doesn't finish.
+        self._sent_pending: tuple[list[str], dict[str, None], list[tuple[str, str]]] | None = None
         # Set when a turn ends with failing tests: the user is asked whether
         # the model may fix them.
         self.fix_offer = False
@@ -1501,12 +1512,14 @@ class Chat:
             self.ui.end_message()
             print(red("[stopped]"))
             self._restore(before)
+            self._requeue()
         except (RuntimeError, OSError) as e:
             self.ui.end_message()
             print(red(f"error: {e}"))
             if not self.client.healthy():
                 print(red("the server isn't responding — check the server log"))
             self._restore(before)
+            self._requeue()
         except Exception as e:
             # Anything else is a bug here, not in the model. Keep the session.
             self.ui.end_message()
@@ -1514,6 +1527,7 @@ class Chat:
             print(red(f"internal error: {type(e).__name__}: {e}"))
             print(dim(f"traceback written to {log}; the conversation is intact, minus this turn"))
             self._restore(before)
+            self._requeue()
         else:
             self.last = result
             self.last_wall = time.monotonic() - started
@@ -1529,10 +1543,14 @@ class Chat:
                 print(dim("(paused; tell the model how to proceed)"))
             if self.cfg["chat"]["show_stats"]:
                 self._print_stats(compact=True)
-            if not result.text.strip():
+            if result.cut_off:
+                print(dim("(the reply stopped at the output limit — raise chat.max_tokens, or lower "
+                          "/effort if thinking used it up)"))
+            elif not result.text.strip():
                 print(dim("(empty reply — if thinking ran long, raise chat.max_tokens or lower /effort)"))
         finally:
             self.busy = False
+            self._sent_pending = None
         print()
 
     def _log_error(self) -> Path | str:
@@ -1543,6 +1561,20 @@ class Chat:
             return path
         except OSError:
             return "(couldn't write the log)"
+
+    def _requeue(self) -> None:
+        """After a turn that was stopped or failed: its message is gone from
+        the history, so what rode along with it (an /undo note, /recall
+        reminders, /file attachments) goes back in the queue for the next one."""
+        if self._sent_pending is None:
+            return
+        notes, memories, files = self._sent_pending
+        self._sent_pending = None
+        self.pending_notes[:0] = notes
+        self.pending_memories = {**memories, **self.pending_memories}
+        self.pending_files[:0] = files
+        if memories or files:
+            print(dim("note: the files and reminders attached to that message will go with your next one"))
 
     def _rollback(self, snapshot: int) -> None:
         """Drop the interrupted turn so the history stays well-formed."""
@@ -1890,6 +1922,8 @@ class Chat:
 
     def _compose(self, line: str) -> str:
         """The user's message, with any /recall reminders and /file contents in front."""
+        self._sent_pending = (list(self.pending_notes), dict(self.pending_memories),
+                              list(self.pending_files))
         parts = [f"<note>\n{n}\n</note>" for n in self.pending_notes]
         self.pending_notes.clear()
         if self.pending_memories:
@@ -1982,6 +2016,17 @@ class Chat:
             self.session_base = self.checkpoints.snapshot("session start", kind="session")
         except CheckpointError as e:
             self.ui.notice(f"couldn't record the session's starting point ({e}); /diff won't work")
+            return
+        try:
+            nested = self.checkpoints.nested_repos()
+        except CheckpointError:
+            nested = []
+        if nested:
+            shown = ", ".join(nested[:5]) + (f" and {len(nested) - 5} more" if len(nested) > 5 else "")
+            self.ui.notice(f"note: {shown} {'is a git repository' if len(nested) == 1 else 'are git repositories'} "
+                           "inside this workspace. Checkpoints don't cover files in "
+                           f"{'it' if len(nested) == 1 else 'them'}: /undo and /diff won't see changes "
+                           "there. Start arborist inside the repository to get both.")
 
     def _diff(self, args: list[str]) -> None:
         """/diff [-f|--full] [PATH…]: what changed since the session started."""
@@ -2093,7 +2138,11 @@ class Chat:
             print(dim("system prompt replaced; conversation cleared"))
 
     def _cmd_retry(self, _args, _raw) -> None:
-        last_user = max((i for i, m in enumerate(self.messages) if m["role"] == "user"), default=-1)
+        # The user's own last message: the harness's notes to the model (a
+        # pause, the step limit) are user messages too, and retrying from one
+        # would keep the stuck calls and switch tools back on.
+        starts = compaction.turn_starts(self.messages)
+        last_user = starts[-1] if starts else -1
         if last_user < 0 or last_user == len(self.messages) - 1:
             print(red("nothing to retry"))
             return

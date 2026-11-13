@@ -317,3 +317,27 @@ def test_walk_skips_symlinks_into_hidden_data(ws_root, tmp_path):
     (ws_root / "peek.toml").symlink_to(data / "memory.toml")
     ws = Workspace(ws_root, hidden=[data])
     assert [f.name for f in ws.walk_files(ws.root)] == []
+
+
+# ---- CRLF files ---------------------------------------------------------------------
+
+def test_edit_matches_and_keeps_crlf_line_endings(ws_root, make_toolbox):
+    (ws_root / "a.txt").write_bytes(b"line one\r\nline two\r\nline three\r\n")
+    tb = make_toolbox()
+    assert "\r" not in tb.call("read_file", {"path": "a.txt"}).content  # what the model sees
+    res = tb.call("edit_file", {"path": "a.txt", "old_string": "line one\nline two",
+                                "new_string": "first\nsecond\nextra"}).content
+    assert res.startswith("updated a.txt"), res
+    assert (ws_root / "a.txt").read_bytes() == b"first\r\nsecond\r\nextra\r\nline three\r\n"
+
+
+def test_edit_leaves_lf_files_and_explicit_crlf_alone(ws_root, make_toolbox):
+    (ws_root / "lf.txt").write_bytes(b"a\nb\n")
+    (ws_root / "crlf.txt").write_bytes(b"a\r\nb\r\n")
+    tb = make_toolbox()
+    tb.call("read_file", {"path": "lf.txt"}), tb.call("read_file", {"path": "crlf.txt"})
+    tb.call("edit_file", {"path": "lf.txt", "old_string": "a\nb", "new_string": "x\ny"})
+    assert (ws_root / "lf.txt").read_bytes() == b"x\ny\n"
+    # The model spelled the \r\n out itself: nothing is converted twice.
+    tb.call("edit_file", {"path": "crlf.txt", "old_string": "a\r\nb", "new_string": "x\r\ny"})
+    assert (ws_root / "crlf.txt").read_bytes() == b"x\r\ny\r\n"
