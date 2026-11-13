@@ -16,6 +16,8 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
+import trail
+
 try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -28,6 +30,34 @@ try:
 except ImportError:  # the fallback in chat.py takes over
     HAVE_PROMPT_TOOLKIT = False
     Completer = object  # type: ignore[assignment,misc]
+    FileHistory = object  # type: ignore[assignment,misc]
+
+
+class SessionHistory(FileHistory):  # type: ignore[misc,valid-type]
+    """The prompt's history file, until /private: then this session's entries
+    are cut back out of it (take_back), and new ones are kept in memory only
+    (↑ still finds them), gone when the chat ends."""
+
+    private = False
+
+    def __init__(self, filename) -> None:
+        super().__init__(filename)
+        self.written: list[str] = []  # this session's entries, as written
+
+    def store_string(self, string: str) -> None:
+        if self.private:
+            return
+        # FileHistory's format, written in one go so it can be found again.
+        block = f"\n# {datetime.now()}\n" + "".join(f"+{line}\n" for line in string.split("\n"))
+        with open(self.filename, "ab") as f:
+            f.write(block.encode("utf-8", errors="replace"))
+        self.written.append(block)
+
+    def take_back(self) -> str:
+        """Remove this session's entries from the file. Returns a problem or ""."""
+        _, problem = trail.cut(Path(self.filename), self.written)
+        self.written.clear()
+        return problem
 
 
 def available(stdin=None, stdout=None) -> bool:
@@ -85,9 +115,10 @@ def save_suggestion(now: datetime) -> str:
     return f"arborist_conversation_{now:%Y%m%d%H%M%S}.md"
 
 
-def toolbar_text(model: str, effort: str, tools_on: bool, context_pct: float) -> str:
+def toolbar_text(model: str, effort: str, tools_on: bool, context_pct: float,
+                 private: bool = False) -> str:
     return (f"Model: {model}, Effort: {effort or 'n/a'}, Tools: {'ON' if tools_on else 'OFF'}, "
-            f"Context: {context_pct:.0f}%")
+            f"Context: {context_pct:.0f}%" + (", PRIVATE" if private else ""))
 
 
 class ChatCompleter(Completer):
@@ -192,8 +223,9 @@ class RichPrompt:
         reset = "\x1b[0m" if color else ""
         self.message = ANSI(f"{green}› {reset}") if color else "> "
         self.cont_message = ANSI(f"{dim}… {reset}") if color else "... "
+        self.history = SessionHistory(str(history_file))
         self.session = PromptSession(
-            history=FileHistory(str(history_file)),
+            history=self.history,
             completer=completer,
             complete_while_typing=True,
             auto_suggest=AutoSuggestFromHistory(),

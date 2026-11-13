@@ -34,6 +34,7 @@ import changes
 import outline as outline_mod
 import runners
 import sandbox
+import trail as trail_mod
 import web
 
 if TYPE_CHECKING:
@@ -347,6 +348,8 @@ class Toolbox:
         self.approver = approver
         self.limits = limits or Limits()
         self.log_dir = Path(log_dir) if log_dir else self.ws.root / ".arborist-logs"
+        # What this session writes under log_dir, for /private to take back.
+        self.trail = trail_mod.Trail()
         self.on_output = on_output or (lambda line: None)
         self.on_notice = on_notice or (lambda msg: None)
         # Files the model wrote this session -> sha256 of the content you were
@@ -450,10 +453,8 @@ class Toolbox:
 
     def _log_internal_error(self, name: str, args: dict) -> Path | str:
         try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
             path = self.log_dir / "tool-errors.log"
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(f"--- {name} {json.dumps(args)[:500]}\n{traceback.format_exc()}\n")
+            self.trail.append(path, f"--- {name} {json.dumps(args)[:500]}\n{traceback.format_exc()}\n")
             return path
         except OSError:
             return "(couldn't write the error log)"
@@ -837,9 +838,18 @@ class Toolbox:
         self._checkpoint()  # a script can change files too
         skip = (spec.protect + spec.hide) if spec is not None else self.ws.hidden
         before = changes.snapshot(self.ws.root, skip)
-        outcome = runners.execute(plan, self.log_dir, timeout, self.on_output, name=name,
-                                  spec=spec, env_keep=self.limits.run_env_keep,
-                                  display=self.limits.run_display)
+        for step in plan.steps:  # compiled output (rustc -o OUT)
+            if "-o" in step[:-1]:
+                self.trail.file(Path(step[step.index("-o") + 1]))
+        runs = self.log_dir / "runs"
+        logs_before = set(runs.iterdir()) if runs.is_dir() else set()
+        try:
+            outcome = runners.execute(plan, self.log_dir, timeout, self.on_output, name=name,
+                                      spec=spec, env_keep=self.limits.run_env_keep,
+                                      display=self.limits.run_display)
+        finally:  # the log exists even when Ctrl-C stopped the run
+            for log in sorted(set(runs.iterdir()) - logs_before if runs.is_dir() else ()):
+                self.trail.file(log)
         found = changes.compare(before, changes.snapshot(self.ws.root, skip))
         self.on_changes(found)
         if not found:
