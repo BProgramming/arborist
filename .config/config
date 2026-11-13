@@ -1,7 +1,20 @@
-# .config/config — settings for arborist.sh / chat.py (TOML; /config opens it)
+# Settings for arborist.sh / chat.py (TOML).
 #
-# Lines tagged  PERF  change speed or memory use. Defaults are tuned for an
-# AMD RX 9070 (16 GB VRAM, RDNA4 / gfx1201) on Linux Mint.
+# This is the example shipped with arborist. The first run copies it to
+# ~/.config/arborist/config, which is the file arborist reads and /config
+# opens; edit that one, not this.
+#
+# Lines tagged  PERF  change speed or memory use.
+#
+# THE VALUES HERE ARE ONE WORKING SETUP, not universal defaults: PrismML's
+# Bonsai 2 27B on an AMD RX 9070 (16 GB VRAM) through Vulkan. To make it yours:
+#
+#   Another GPU    [build] backend (vulkan runs on AMD, NVIDIA and Intel; cuda
+#                  and hip are the vendor routes), then size [server] ctx_size
+#                  to your VRAM: see the note there.
+#   Another model  [model] repo, file and efforts, and clear [options]
+#                  server_args. Nothing else has to change: the llama.cpp fork
+#                  in [build] runs ordinary GGUF models too.
 
 [paths]
 # Everything (source, build, weights, logs, chat history, memory) lives under
@@ -10,26 +23,32 @@ root = "~/.local/share/arborist"
 
 [build]
 # PERF: GPU backend for the C++ build.
-#   "vulkan" — Mesa RADV driver, no ROCm install needed. Community reports say
-#              it's the less painful route on RDNA4. Default.
-#   "hip"    — ROCm. Can be faster for prompt processing once it works, but
-#              needs the ROCm toolkit (hipcc) installed and matching your kernel.
+#   "vulkan" — any GPU with a Vulkan driver (AMD, NVIDIA, Intel); no vendor
+#              toolkit to install. Default.
+#   "cuda"   — NVIDIA, with the CUDA toolkit (nvcc) installed. Usually the
+#              fastest route on NVIDIA cards.
+#   "hip"    — AMD, with ROCm. Can be faster than Vulkan for prompt processing
+#              once it works, but needs the ROCm toolkit (hipcc) installed and
+#              matching your kernel.
 #   "cpu"    — fallback only; expect a few tokens/sec.
 backend = "vulkan"
 
-# PrismML's fork — stock llama.cpp can't run Bonsai 2 weights.
+# PrismML's fork — stock llama.cpp can't run Bonsai 2 weights. It runs
+# ordinary GGUF models as well, so it can stay when you change the model; for
+# stock llama.cpp use https://github.com/ggml-org/llama.cpp.git and "master",
+# and clear [options] server_args (its flags exist only in the fork).
 repo = "https://github.com/PrismML-Eng/llama.cpp.git"
 # Branch, tag or commit. "prism" tracks their latest; pin a commit hash here
 # once you find a build you're happy with.
 ref = "prism"
 
-# PERF: AMD GPU architecture for the HIP backend. RX 9070 / 9070 XT = gfx1201.
-# Ignored for vulkan/cpu.
+# PERF: AMD GPU architecture for the HIP backend; `rocminfo` shows yours
+# (RX 9070 / 9070 XT = gfx1201). Only used when backend = "hip".
 hip_target = "gfx1201"
 
-# PERF: -march=native for the CPU code paths (AVX-512 on the 9800X3D).
-# Only matters for layers you don't offload; leave on unless you copy the
-# binary to another machine.
+# PERF: -march=native for the CPU code paths (uses whatever your CPU has,
+# e.g. AVX-512). Only matters for layers you don't offload; leave on unless
+# you copy the binary to another machine.
 native = true
 
 # Parallel compile jobs. 0 = all cores.
@@ -41,7 +60,8 @@ jobs = 0
 name = "Bonsai 2 27B"
 
 # Hugging Face repo and the .gguf file in it to download and serve. Point
-# these at any GGUF model the llama.cpp build above can run.
+# these at any GGUF model the llama.cpp build above can run, then set
+# `efforts` below and clear [options] server_args.
 repo = "prism-ml/Ternary-Bonsai-2-27B-gguf"
 # PERF: for Bonsai 2 the packing is in the file name. Same weights either way.
 #   Ternary-Bonsai-2-27B-PQ2_0.gguf  — 7.21 GB, faster prompt processing. PrismML's default.
@@ -74,14 +94,19 @@ server_args = "--reasoning-effort-allow {efforts} --reasoning-effort-fallback {e
 host = "127.0.0.1"   # keep on loopback; there's no auth
 port = 8091
 
-# PERF: layers on the GPU. 99 = all of them. The whole model fits in 16 GB,
-# so lower this only if you hit out-of-memory.
+# PERF: layers on the GPU. 99 = all of them. Lower it only if the model
+# doesn't fit: layers left on the CPU are many times slower. At startup the
+# launcher prints how many made it onto the GPU and warns if some didn't.
 gpu_layers = 99
 
-# PERF: context window in tokens (max 262144). FP16 KV cache costs ~64 KiB per
-# token: 65536 ≈ 4 GiB, which sits comfortably next to the 7.2 GB weights on a
-# 16 GB card. Raise it if you paste whole repos; lower it if the desktop
-# starts stuttering for VRAM.
+# PERF: context window in tokens (max 262144). Sizing it: the model file, plus
+# the KV cache for this many tokens, plus 1-2 GB for the desktop, has to fit
+# in your VRAM. For Bonsai 2 27B the f16 KV cache costs ~64 KiB per token, so
+# 65536 ≈ 4 GiB next to 7.2 GB of weights: comfortable on a 16 GB card. By the
+# same arithmetic (untested): 12 GB, 32768; 8 GB, 8192 with the smaller
+# PTQ1_0 file. Other models
+# cost more or less per token: watch the offload line at startup, and lower
+# this (or set the KV cache to q8_0 below) if layers end up on the CPU.
 ctx_size = 65536
 
 # PERF: KV cache precision. "f16" is lossless. "q8_0" halves KV memory

@@ -595,10 +595,12 @@ def test_config_command_opens_nano_and_applies_tools(load_toml, ws_root, monkeyp
     def fake_nano(cmd, *_a, **_k):
         opened.append(cmd)
         path.write_text(path.read_text().replace("run_timeout = 120", "run_timeout = 30"))
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.delenv("EDITOR", raising=False)
     monkeypatch.setattr(chat.shutil, "which", lambda name: "/usr/bin/nano" if name == "nano" else None)
     monkeypatch.setattr(chat.subprocess, "run", fake_nano)
     c.command("/config")
-    assert opened == [["/usr/bin/nano", str(path)]]
+    assert opened == [["nano", str(path)]]
     assert c.toolbox.limits.run_timeout == 30 and "applied" in capsys.readouterr().out
 
     def broken(*_a, **_k):

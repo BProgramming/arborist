@@ -188,3 +188,55 @@ def test_exit_leaves_the_server_up_while_another_session_is_attached(env, tmp_pa
     finally:
         other.kill()
         server.kill()
+
+
+# ---- other distros, other GPUs -------------------------------------------------------
+
+def _only(tmp_path, *commands: str) -> str:
+    """A PATH holding just these (empty) commands, for `command -v`."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    for old in bin_dir.iterdir():
+        old.unlink()
+    for name in commands:
+        (bin_dir / name).write_text("#!/bin/sh\n")
+        (bin_dir / name).chmod(0o755)
+    return str(bin_dir)
+
+
+@pytest.mark.parametrize("manager, expected", [
+    ("apt-get", "sudo apt install build-essential cmake ninja-build git curl libvulkan-dev glslc"),
+    ("dnf", "sudo dnf install gcc-c++ make cmake ninja-build git curl vulkan-headers"),
+    ("pacman", "sudo pacman -S base-devel cmake ninja git curl vulkan-headers"),
+])
+def test_install_hints_name_this_distros_packages(env, tmp_path, manager, expected):
+    r = functions(f'PATH="{_only(tmp_path, manager)}"; install_hint base vulkan', env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith(expected), r.stdout
+
+
+def test_install_hint_on_an_unknown_distro_lists_what_to_look_for(env, tmp_path):
+    r = functions(f'PATH="{_only(tmp_path)}"; install_hint bwrap pip', env)
+    assert r.stdout.strip() == "install with your package manager (Debian/Ubuntu names): bubblewrap python3-pip"
+
+
+def test_missing_cuda_toolkit_is_reported_with_where_to_get_it(env, tmp_path):
+    path = _only(tmp_path, "dnf", "git", "cmake", "curl", "c++", "ninja", "bwrap")
+    r = functions(f'PATH="{path}"; CFG_BACKEND=cuda; check_deps', env)
+    assert r.returncode == 1
+    assert "CUDA toolkit (nvcc)" in r.stderr and "developer.nvidia.com" in r.stderr
+    assert "sudo dnf install gcc-c++" in r.stderr
+
+
+def test_first_run_creates_your_config_from_the_example(env, tmp_path):
+    env = {k: v for k, v in env.items() if k != "ARBORIST_CONFIG"}
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    env["HOME"] = str(tmp_path / "home")  # paths.root in the example is under ~
+    r = subprocess.run(["bash", str(SCRIPT), "status"], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    mine = tmp_path / "xdg" / "arborist" / "config"
+    assert mine.read_text() == (HERE / ".config" / "config").read_text()
+    assert f"Created your config: {mine}" in r.stderr
+    assert f"config   {mine}" in r.stdout
+    again = subprocess.run(["bash", str(SCRIPT), "status"], capture_output=True, text=True, env=env)
+    assert "Created your config" not in again.stderr and f"config   {mine}" in again.stdout

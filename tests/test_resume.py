@@ -151,7 +151,7 @@ def test_server_without_cache_saving_still_parks_the_messages(load_toml, ws_root
     c.messages = list(CONVO)
     c.park()
     out = capsys.readouterr().out
-    assert "cache not saved" in out and "agent stop" in out
+    assert "cache not saved" in out and "./arborist.sh stop" in out
     assert store.load(c.session_key)["kv"] is None
     assert not store.kv_path(c.session_key).exists()  # a stale cache is removed
 
@@ -264,7 +264,7 @@ def test_slot_action_talks_to_the_slots_endpoint():
     try:
         client = chat.Client(f"http://127.0.0.1:{server.server_port}")
         assert client.slot_action(0, "save", "k.bin")["n_saved"] == 7
-        with pytest.raises(chat.SlotError, match="does not support slots action.*agent stop"):
+        with pytest.raises(chat.SlotError, match="does not support slots action.*arborist.sh stop"):
             client.slot_action(0, "restore", "k.bin")
     finally:
         server.shutdown()

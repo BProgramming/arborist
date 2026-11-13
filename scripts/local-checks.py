@@ -317,7 +317,8 @@ def run_suite() -> None:
                        cwd=ROOT, env=env, capture_output=True, text=True)
     if "No module named pytest" in r.stderr:
         report("FAIL", "pytest", f"pytest isn't installed for {sys.executable}: "
-               "sudo apt install python3-pytest, or pip install -r requirements-dev.txt in a venv")
+               "pip install -r requirements-dev.txt in a venv, or your distro's pytest package "
+               "(python3-pytest; python-pytest on Arch)")
         return
     tail = ((r.stdout.strip() or r.stderr.strip()).splitlines() or ["(no output)"])[-1]
     check("pytest", r.returncode == 0, tail)

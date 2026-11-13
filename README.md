@@ -7,28 +7,54 @@ model can read, search and edit files in the current directory, run code and
 tests, and look things up on the web, asking you before anything that changes
 a file, runs code, or goes online.
 
-This is a personal project, built over a few days for my own PC (Linux Mint,
-AMD RX 9070 16 GB, running PrismML's Bonsai 2 27B). It's here in case you want
+This is a personal project, built over a few days. It's here in case you want
 to fiddle with your own version, see [License](#license).
+
+## What it runs on
+
+**Linux only.** Code the model writes runs in a bubblewrap sandbox, which is
+a Linux feature, and the launcher is bash. macOS and native Windows aren't
+supported; WSL2 is Linux and should work, but is untested.
+
+| | Tested | Should work, untested |
+|---|---|---|
+| Distro | Linux Mint (Ubuntu base) | Other Debian/Ubuntu, Fedora, Arch: the launcher prints install commands for `apt`, `dnf` and `pacman` |
+| GPU | AMD RX 9070 (16 GB) through Vulkan | Any GPU with a Vulkan driver; NVIDIA through CUDA (`build.backend = "cuda"`); AMD through ROCm (`"hip"`); CPU only, slowly |
+| Model | PrismML's Bonsai 2 27B | Any GGUF model llama.cpp can run (see [Another model](#another-model)) |
+
+The shipped settings are that tested setup. Anything in the right-hand
+column is a config change away, but nobody has run it: expect to adjust
+things.
 
 ## Requirements
 
-- Linux (the launcher is bash and the install hints are for Debian/Ubuntu/Mint)
-- Python 3.11+, plus [`prompt_toolkit`](https://github.com/prompt-toolkit/python-prompt-toolkit)
+- Python 3.11 or newer (Ubuntu 22.04's `python3` is 3.10, which is too old),
+  plus [`prompt_toolkit`](https://github.com/prompt-toolkit/python-prompt-toolkit)
   for the chat prompt (listed in `pyproject.toml`). The launcher installs it with
   `pip install --target` into arborist's data folder (`~/.local/share/arborist/python-packages`)
-  if it isn't already importable, so the system Python is left alone; that needs `pip`
-  (`sudo apt install python3-pip`). Without it the chat still works, with a plain
-  `input()` prompt. `pytest` for the tests.
+  if it isn't already importable, so the system Python is left alone; that needs `pip`.
+  Without it the chat still works, with a plain `input()` prompt. `pytest` for the tests.
 - `bubblewrap` (`bwrap`) to run code the model writes
 - `git`, `cmake`, `curl`, a C++ compiler; `ninja` optional but faster
-- A GPU backend: **Vulkan** (default; `libvulkan-dev glslc spirv-headers
-  mesa-vulkan-drivers`) or **ROCm/HIP**. CPU works, slowly.
+- For your GPU backend: Vulkan headers and `glslc` (the default), or the CUDA
+  toolkit, or ROCm
 - Disk for the build plus the model (~10 GB for the default)
 
+If something is missing, the launcher names it and prints the install command
+for your distro. For the default (Vulkan) setup, all at once:
+
 ```sh
-sudo apt install build-essential cmake ninja-build git curl bubblewrap \
+# Debian, Ubuntu, Mint
+sudo apt install build-essential cmake ninja-build git curl bubblewrap python3-pip \
   libvulkan-dev glslc spirv-headers mesa-vulkan-drivers
+
+# Fedora
+sudo dnf install gcc-c++ make cmake ninja-build git curl bubblewrap python3-pip \
+  vulkan-headers vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers
+
+# Arch (plus your GPU's Vulkan driver: vulkan-radeon, nvidia-utils or vulkan-intel)
+sudo pacman -S base-devel cmake ninja git curl bubblewrap python-pip \
+  vulkan-headers vulkan-icd-loader shaderc spirv-headers
 ```
 
 ## Quick start
@@ -39,9 +65,15 @@ cd ~/some/project            # the model's tools work on this folder
 ~/arborist/arborist.sh
 ```
 
-The first run clones and builds llama.cpp, downloads and checksums the model,
-starts the server and opens the chat. Later runs reuse all of that. When you
-leave the chat, a server the script started is stopped.
+The first run creates your config (`~/.config/arborist/config`, a copy of the
+[example](.config/config)), clones and builds llama.cpp, downloads and
+checksums the model, starts the server and opens the chat. Later runs reuse
+all of that. When you leave the chat, a server the script started is stopped.
+
+On anything but a 16 GB card, stop after the config is created
+(`./arborist.sh status` is enough to create it) and read
+[Configuration](#configuration) before the first real run: the example's
+context size assumes 16 GB of VRAM.
 
 ### Run it from anywhere with one word
 
@@ -84,24 +116,52 @@ its own config wherever it's called from. (On zsh, use `~/.zshrc` instead.)
 
 ## Configuration
 
-Everything is in [`.config/config`](.config/config) (TOML), commented line by line;
-lines tagged `PERF` affect speed or memory. Point `ARBORIST_CONFIG` at another
-file to keep your own copy outside the repo.
+Your settings are in `~/.config/arborist/config` (TOML), commented line by
+line; lines tagged `PERF` affect speed or memory. `/config` in the chat opens
+it in `$VISUAL` or `$EDITOR` (else `nano` or `vi`), and `./arborist.sh status`
+prints which file is in use. Arborist looks in three places, in this order:
 
-**The shipped toml is tuned for my machine.** For anything else, look at:
+1. the file `ARBORIST_CONFIG` names, if that variable is set;
+2. `~/.config/arborist/config` (under `$XDG_CONFIG_HOME` if you've set one).
+   The first run creates it as a copy of the example;
+3. the example itself, [`.config/config`](.config/config) in the repo.
 
-- `build.backend`: `vulkan`, `hip` or `cpu`. With `hip`, set
-  `build.hip_target` to your GPU's architecture (`rocminfo` shows it).
-- `server.ctx_size` and `server.gpu_layers`: the main VRAM levers. After
-  loading, the launcher prints how many layers made it onto the GPU, and warns
-  if some didn't.
+So your settings are never edits to a file git tracks, and pulling a new
+arborist doesn't touch them. A setting added later that your copy doesn't
+mention takes its built-in default; the example shows what's new.
 
-**Another model:** set `model.repo` and `model.file` to any GGUF on Hugging
-Face. Then set `model.efforts` to the reasoning levels its chat template
-accepts (or `[]`), clear `options.server_args`, and set `build.repo`/`ref` to
-stock llama.cpp. The Bonsai-specific values (the PrismML fork, the effort list,
-the sampling settings) exist only because Bonsai 2 needs them. The code
-defaults are stock llama.cpp `master`.
+**The example is one working setup** (Bonsai 2 27B on a 16 GB AMD card
+through Vulkan), not a set of universal defaults.
+
+### Another GPU
+
+- `build.backend`: `vulkan` (any GPU with a Vulkan driver; the default),
+  `cuda` (NVIDIA, needs the CUDA toolkit), `hip` (AMD through ROCm; also set
+  `build.hip_target` to your GPU's architecture, which `rocminfo` shows) or
+  `cpu`. Each backend builds into its own folder, so switching back doesn't
+  rebuild.
+- `server.ctx_size`: the main VRAM lever. The model file, plus the KV cache
+  for that many tokens, plus 1-2 GB for the desktop, has to fit. The example
+  config's comment works the numbers for Bonsai 2 and suggests values for
+  12 GB and 8 GB cards.
+- `server.gpu_layers`: lower it only as a last resort. After loading, the
+  launcher prints how many layers made it onto the GPU, and warns if some
+  didn't.
+
+### Another model
+
+Set `model.repo` and `model.file` to any GGUF on Hugging Face. Then set
+`model.efforts` to the reasoning levels its chat template accepts (or `[]`
+for a model with no effort control), and clear `options.server_args`: its
+flags are specific to Bonsai, and arborist won't start with `{efforts}` in
+them while `model.efforts` is empty. Check the `[chat]` sampling values
+against what the model's authors recommend.
+
+`build.repo` can stay as it is. It points at PrismML's fork of llama.cpp,
+which Bonsai 2 needs and which runs ordinary GGUF models too. To build stock
+llama.cpp instead, set `build.repo` to
+`https://github.com/ggml-org/llama.cpp.git` and `build.ref` to `master`; the
+next start switches the source and rebuilds.
 
 Everything arborist keeps lives under `paths.root` (default
 `~/.local/share/arborist`): the llama.cpp source and build, model weights,
@@ -256,7 +316,7 @@ be taken back, it says what. The toolbar shows `PRIVATE` while it's on.
 | `/checkpoints` | list workspace checkpoints, newest first |
 | `/compact` | shrink the conversation now: stub old tool output, then summarise older turns |
 | `/diff [-f] [PATH…]` | files changed since this session started, in the workspace or under `PATH` (`-f`/`--full`: the whole diff) |
-| `/config` | open `.config/config` in nano; `[tools]` changes apply right away, the rest after a restart |
+| `/config` | open your config in `$VISUAL` or `$EDITOR` (else nano or vi); `[tools]` changes apply right away, the rest after a restart |
 | `/private` | keep nothing from this session once you leave, taking back what it has written so far (see [Private sessions](#private-sessions)) |
 
 ### The prompt
