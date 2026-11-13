@@ -12,6 +12,12 @@ Safety, since this hands outside text to a model that can edit your files:
     can need its own approval (see Toolbox._allow).
   * Crawls stay on one host under one path prefix, obey robots.txt, pause
     between requests and stop at a page cap.
+
+A page's links come in two lists. `links` are the ones in its content.
+`nav_links` are the ones in its navigation (sidebar, menus, header, footer),
+whose text is dropped: on most documentation sites that's where the table of
+contents lives, so a crawl follows both. Links in parts of a page that are
+hidden outright (aria-hidden, templates, forms) are in neither.
 """
 from __future__ import annotations
 
@@ -52,7 +58,8 @@ class Page:
     url: str
     title: str
     text: str
-    links: list[str] = field(default_factory=list)
+    links: list[str] = field(default_factory=list)      # in the page's content
+    nav_links: list[str] = field(default_factory=list)  # in its navigation only
 
 
 # ---------------------------------------------------------------- urls ---
@@ -124,15 +131,22 @@ class _TextExtractor(HTMLParser):
     VOID = {"br", "hr", "img", "input", "meta", "link", "area", "base", "col", "embed",
             "source", "track", "wbr"}
     MAIN = {"main", "article"}
+    # Skipped for their text, but their links are where a site's table of
+    # contents usually is.
+    NAV = {"nav", "header", "footer", "aside"}
+    NAV_ROLES = ("navigation", "banner", "contentinfo", "complementary")
 
     def __init__(self, base_url: str):
         super().__init__(convert_charrefs=True)
         self.base = base_url
         self.title = ""
         self.links: list[str] = []
+        self.nav_links: list[str] = []
         self._seen_links: set[str] = set()
-        self._stack: list[tuple[str, bool, bool]] = []  # (tag, skips, is_main)
-        self._skip = 0
+        self._seen_nav: set[str] = set()
+        self._stack: list[tuple[str, bool, bool, bool]] = []  # (tag, skips, is_main, hides)
+        self._skip = 0   # inside this many skipped elements...
+        self._hide = 0   # ...of which this many aren't navigation
         self._in_title = False
         self._pre = 0
         self._main_depth = 0
@@ -157,22 +171,28 @@ class _TextExtractor(HTMLParser):
         href = a.get("href")
         if tag == "base" and href:
             self.base = urljoin(self.base, href)
-        if tag == "a" and href and not self._skip:
+        if tag == "a" and href and not self._hide:
             link = normalize(href, self.base)
-            if link and link not in self._seen_links:
-                self._seen_links.add(link)
-                self.links.append(link)
+            found, seen = (self.nav_links, self._seen_nav) if self._skip else \
+                (self.links, self._seen_links)
+            if link and link not in seen:
+                seen.add(link)
+                found.append(link)
         if tag in self.VOID:
             if tag in ("br", "hr"):
                 self._newline()
             return
         # Pages sometimes mark the main column with a role instead of <main>.
-        skips = tag in self.SKIP or a.get("role") in ("navigation", "banner", "contentinfo") \
-            or a.get("aria-hidden") == "true"
+        hidden = a.get("aria-hidden") == "true"
+        nav = (tag in self.NAV or a.get("role") in self.NAV_ROLES) and not hidden
+        skips = tag in self.SKIP or nav or hidden
+        hides = skips and not nav
         is_main = tag in self.MAIN or a.get("role") == "main"
-        self._stack.append((tag, skips, is_main))
+        self._stack.append((tag, skips, is_main, hides))
         if skips:
             self._skip += 1
+        if hides:
+            self._hide += 1
         if is_main:
             self._main_depth += 1
         if re.fullmatch(r"h[1-6]", tag):
@@ -199,12 +219,12 @@ class _TextExtractor(HTMLParser):
         # Close back to the matching open tag; HTML often leaves tags unclosed.
         for i in range(len(self._stack) - 1, -1, -1):
             if self._stack[i][0] == tag:
-                for t, skips, is_main in reversed(self._stack[i:]):
-                    self._close(t, skips, is_main)
+                for t, skips, is_main, hides in reversed(self._stack[i:]):
+                    self._close(t, skips, is_main, hides)
                 del self._stack[i:]
                 break
 
-    def _close(self, tag: str, skips: bool, is_main: bool):
+    def _close(self, tag: str, skips: bool, is_main: bool, hides: bool):
         if re.fullmatch(r"h[1-6]", tag):
             self._newline()
         elif tag == "pre":
@@ -219,6 +239,8 @@ class _TextExtractor(HTMLParser):
             self._newline()
         if skips:
             self._skip -= 1
+        if hides:
+            self._hide -= 1
         if is_main:
             self._main_depth -= 1
 
@@ -258,7 +280,8 @@ def html_to_page(html: str, url: str) -> Page:
     main, everything = _tidy(p.main), _tidy(p.all)
     # Prefer the main column when the page marks one and it has real content.
     text = main if len(main) >= 200 else everything
-    return Page(url=url, title=re.sub(r"\s+", " ", p.title).strip() or url, text=text, links=p.links)
+    return Page(url=url, title=re.sub(r"\s+", " ", p.title).strip() or url, text=text, links=p.links,
+                nav_links=[link for link in p.nav_links if link not in p._seen_links])
 
 
 # --------------------------------------------------------------- fetching ---
@@ -370,7 +393,8 @@ class Fetcher:
 
     def crawl(self, start: str, max_pages: int, max_depth: int,
               progress: Callable[[str], None] = lambda s: None) -> tuple[list[Page], list[str]]:
-        """Breadth-first crawl of `start`'s directory on its host."""
+        """Breadth-first crawl of `start`'s directory on its host, following
+        each page's content links first, then the ones in its navigation."""
         start = normalize(start)
         if start is None:
             raise WebError("not an http(s) URL")
@@ -393,7 +417,7 @@ class Fetcher:
             pages.append(page)
             progress(f"{len(pages)}/{max_pages}  {page.url}")
             if depth < max_depth:
-                for link in page.links:
+                for link in page.links + page.nav_links:
                     if link not in seen and in_scope(link, start, prefix):
                         seen.add(link)
                         queue.append((link, depth + 1))
