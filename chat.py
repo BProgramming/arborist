@@ -47,8 +47,8 @@ import runners
 import sessions
 import trail as trail_mod
 from checkpoints import CheckpointError, Checkpoints, prune_store
-from tools import (IGNORED_DIRS, Decision, Limits, MemoryChoice, ToolError, ToolResult, Toolbox,
-                   Workspace)
+from tools import (IGNORED_DIRS, NO_ANSWER, Decision, Limits, MemoryChoice, ToolError, ToolResult,
+                   Toolbox, Workspace)
 
 # ---------------------------------------------------------------- terminal ---
 
@@ -831,7 +831,7 @@ def _block_name(folder: Path) -> str:
 class Memory:
     """memory.toml: notes the model keeps across sessions, in a [general]
     block and one block per folder. A session sees [general] plus the blocks
-    for its own folder and the folders below it."""
+    for its own folder, the folders above it and the folders below it."""
 
     def __init__(self, path: str | os.PathLike, scope: Path | None = None):
         self.path = Path(path)
@@ -1131,6 +1131,12 @@ class AgentTools:
     def call(self, name: str, raw_args: str | dict) -> ToolResult:
         if name != "remember":
             return self.toolbox.call(name, raw_args)
+        try:
+            return self._remember(raw_args)
+        except EOFError:  # Ctrl-D at the prompt about a similar note
+            return ToolResult(NO_ANSWER)
+
+    def _remember(self, raw_args: str | dict) -> ToolResult:
         if not self.can_remember:
             return ToolResult("error: this is a private session; nothing can be saved to memory")
         try:
@@ -1914,6 +1920,10 @@ class Chat:
         # The model still remembers its edits; tell it, and make it re-read.
         if self.toolbox:
             self.toolbox.ws.forget()
+            # You put these files back yourself: the next run prompt shouldn't
+            # report them as changed behind your back.
+            for c in reverted:
+                self.toolbox.model_writes.pop(self.toolbox.ws.root / c.path, None)
         names = ", ".join(c.path for c in reverted[:20]) + (" …" if len(reverted) > 20 else "")
         self.pending_notes.append(
             f"The user restored the workspace files to how they were before \"{cp.label}\" "
@@ -2099,6 +2109,13 @@ class Chat:
         if "tools" in changed and self.toolbox is not None:
             self.toolbox.apply_limits(Limits.from_config(new["tools"]))
             print(dim("[tools] applied to this session"))
+            # Read once, when the session was set up.
+            startup = [f"tools.{k}" for k in ("enabled", "checkpoints", "checkpoint_days")
+                       if new["tools"][k] != self.cfg["tools"][k]]
+            if startup:
+                print(yellow(f"except {', '.join(startup)}: restart arborist for "
+                             f"{'that' if len(startup) == 1 else 'those'} (/tools toggles the "
+                             "tools for this session)"))
         self.cfg["tools"] = new["tools"]
         later = [k for k in changed if k != "tools"]
         if later:

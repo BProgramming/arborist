@@ -265,3 +265,19 @@ def test_ctrl_c_at_the_offer_is_a_no(chat_with_failing_tests, monkeypatch):
 
     monkeypatch.setattr("builtins.input", interrupt)
     assert c.offer_fix() is False and not c.fix_offer
+
+
+def test_no_tests_collected_is_not_a_failure(ws_root, make_toolbox):
+    try:
+        import pytest as _pytest  # noqa: F401
+    except ImportError:  # pragma: no cover
+        pytest.skip("pytest isn't importable by the interpreter runs use")
+    write(ws_root, "pyproject.toml", "")
+    write(ws_root, "tests/test_empty.py", "X = 1\n")
+    tb = make_toolbox()
+    res = tb.call("run_tests", {"path": "tests"})
+    if "pytest isn't installed" in res.content:
+        pytest.skip("the run interpreter has no pytest")
+    assert "found no tests to run" in res.content, res.content
+    assert "No tests were collected" in res.content and "present the bugs" not in res.content
+    assert res.hard_stop and tb.tests_failed is False

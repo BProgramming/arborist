@@ -73,9 +73,16 @@ def host_of(url: str) -> str:
 
 
 def scope_prefix(url: str) -> str:
-    """The directory a crawl is limited to: /docs/guide/intro.html -> /docs/guide/."""
+    """The directory a crawl is limited to: /docs/guide/intro.html -> /docs/guide/.
+
+    A last segment with no extension (/docs/guide, /3) is taken to be a
+    section, not a page: its scope is itself, /docs/guide/, never its parent
+    (which for /3 would be the whole site)."""
     path = urlsplit(url).path or "/"
-    return path if path.endswith("/") else path.rsplit("/", 1)[0] + "/"
+    if path.endswith("/"):
+        return path
+    parent, last = path.rsplit("/", 1)
+    return f"{path}/" if "." not in last else f"{parent}/"
 
 
 def in_scope(url: str, start: str, prefix: str) -> bool:
@@ -293,7 +300,11 @@ class Fetcher:
 
     def _open(self, url: str):
         self._check(url)
-        opener = urllib.request.build_opener(_CheckedRedirects(self._check))
+        # No proxy from the environment (http_proxy and friends): the request
+        # would go to the proxy, and the private-address check above would
+        # have vetted a host this machine never connects to.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                             _CheckedRedirects(self._check))
         req = urllib.request.Request(url, headers={
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
@@ -327,6 +338,8 @@ class Fetcher:
                 data = resp.read(self.max_bytes + 1)
         except (TimeoutError, socket.timeout):
             raise WebError(f"timed out after {self.timeout:g}s reading {norm}") from None
+        except (OSError, http.client.HTTPException) as e:  # reset or cut short mid-read
+            raise WebError(f"couldn't read {norm}: {e or type(e).__name__}") from None
         truncated = len(data) > self.max_bytes
         try:
             body = data[: self.max_bytes].decode(charset, errors="replace")

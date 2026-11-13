@@ -358,3 +358,48 @@ def test_web_tools_can_be_disabled(web_toolbox):
     names = {t["function"]["name"] for t in tb.schemas}
     assert "fetch_url" not in names and "crawl_docs" not in names and "read_file" in names
     assert "unknown tool" in tb.call("fetch_url", {"url": "https://example.com"}).content
+
+
+def test_scope_of_an_extensionless_url_is_itself_not_its_parent():
+    assert web.scope_prefix("https://docs.python.org/3") == "/3/"
+    assert web.scope_prefix("https://h/docs/guide") == "/docs/guide/"
+    assert web.scope_prefix("https://h") == "/"
+    assert web.scope_prefix("https://h/index.html") == "/"
+
+
+def test_proxy_settings_in_the_environment_are_ignored(site, monkeypatch):
+    base, _hits = site
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")  # nothing listens there
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    f = web.Fetcher(lambda url: None, allow_private=True)
+    assert "Welcome" in f.fetch(f"{base}/docs/index.html").text
+
+
+@pytest.mark.parametrize("failure", [ConnectionResetError("reset by peer"),
+                                     __import__("http.client").client.IncompleteRead(b"par")])
+def test_a_connection_dropped_mid_read_is_a_web_error(failure, monkeypatch):
+    class Dropped:
+        headers = __import__("email").message_from_string("Content-Type: text/html\n\n")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        @staticmethod
+        def geturl():
+            return "http://h/docs/a.html"
+
+        @staticmethod
+        def read(_n):
+            raise failure
+
+    f = web.Fetcher(lambda url: None, allow_private=True)
+    monkeypatch.setattr(f, "_open", lambda url: Dropped())
+    with pytest.raises(web.WebError, match="couldn't read http://h/docs/a.html"):
+        f.fetch("http://h/docs/a.html")
+    # In a crawl that's one page's problem, not the end of the crawl.
+    monkeypatch.setattr(f, "robots_allows", lambda url: True)
+    with pytest.raises(web.WebError):  # ...unless it's the start page itself
+        f.crawl("http://h/docs/a.html", 5, 1)

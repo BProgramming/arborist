@@ -26,7 +26,8 @@ def env(tmp_path):
 
 def functions(body: str, env: dict, **variables: str) -> subprocess.CompletedProcess:
     """Run `body` with arborist.sh's functions defined (everything but its last line, the call to main)."""
-    script = f'source <(sed \'$ d\' "{SCRIPT}")\n{body}\n'
+    # Sourced from a pipe, the script can't tell where it lives: say so.
+    script = f'source <(sed \'$ d\' "{SCRIPT}")\nHERE="{HERE}"\n{body}\n'
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                           env={**env, **variables}, timeout=60)
 
@@ -112,3 +113,78 @@ def test_local_checks_start_without_a_terminal():
     r = subprocess.run([sys.executable, str(HERE / "scripts" / "local-checks.py"), "--help"],
                        capture_output=True, text=True)
     assert r.returncode == 0 and "ValueError" not in r.stderr
+
+
+# ---- downloads --------------------------------------------------------------------
+
+DOWNLOAD = """
+curl() {{  # stands in for the real download: writes 4 bytes to the -o file
+  local out=""
+  while (($#)); do [[ "$1" == -o ]] && out="$2"; shift; done
+  printf 'data' >"$out"
+}}
+remote_info() {{ {remote}; }}
+df() {{ printf 'Filesystem 1024-blocks Used Available Capacity Mounted\\n/dev/x 0 0 {avail_kb} 0%% /\\n'; }}
+download "https://example.invalid/m.gguf" "$DEST"
+"""
+SHA_OF_DATA = "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"
+
+
+def download(env, tmp_path, remote: str, avail_kb: int = 10**9):
+    dest = tmp_path / "models" / "m.gguf"
+    dest.parent.mkdir(exist_ok=True)
+    r = functions(DOWNLOAD.format(remote=remote, avail_kb=avail_kb), env, DEST=str(dest))
+    return r, dest
+
+
+def test_download_is_marked_verified_only_when_it_was(env, tmp_path):
+    r, dest = download(env, tmp_path, "true")  # no checksum available
+    assert r.returncode == 0, r.stderr
+    assert dest.read_text() == "data" and "unverified" in r.stderr
+    assert not Path(f"{dest}.verified").exists()
+    # Next start: the checksum can be fetched now, so the same file gets checked.
+    r, dest = download(env, tmp_path, f"echo {SHA_OF_DATA} 4")
+    assert r.returncode == 0, r.stderr
+    assert Path(f"{dest}.verified").exists() and "SHA256 ok" in r.stdout
+
+
+def test_download_with_a_wrong_checksum_is_set_aside(env, tmp_path):
+    r, dest = download(env, tmp_path, f"echo {'0' * 64} 4")
+    assert r.returncode == 1 and "Checksum mismatch" in r.stderr
+    assert not dest.exists() and Path(f"{dest}.bad").exists()
+
+
+def test_free_space_is_checked_against_the_files_real_size(env, tmp_path):
+    two_gb = 2 * 1024**3
+    r, dest = download(env, tmp_path, f"echo {SHA_OF_DATA} {two_gb}", avail_kb=1024 * 1024)  # 1 GB free
+    assert r.returncode == 1 and "needs 3 GB" in r.stderr and not dest.exists()
+    # A small file no longer needs 10 GB free.
+    r, dest = download(env, tmp_path, f"echo {SHA_OF_DATA} 4", avail_kb=1024 * 1024)
+    assert r.returncode == 0, r.stderr
+
+
+# ---- a server other sessions are using ------------------------------------------------
+
+def test_exit_leaves_the_server_up_while_another_session_is_attached(env, tmp_path):
+    # Another session, in a process of its own, registered for this config's server.
+    code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import config, presence\n"
+            "p = presence.Presence(presence.folder(config.load())); p.start()\n"
+            "print('up', flush=True); time.sleep(60)")
+    other = subprocess.Popen([sys.executable, "-c", code, str(HERE)], stdout=subprocess.PIPE,
+                             text=True, env=env)
+    fake = tmp_path / "llama-server"
+    server = subprocess.Popen(["bash", "-c", f'exec -a "{fake}" sleep 60'])
+    leave = f'load_config; SERVER_PID={server.pid}; stop_server_unless_shared'
+    try:
+        assert other.stdout.readline().strip() == "up"
+        r = functions(leave, env)
+        assert r.returncode == 0, r.stderr
+        assert "1 other session(s) still use it" in r.stdout and server.poll() is None
+        other.kill()
+        other.wait()
+        r = functions(leave, env)  # the last one out stops it
+        assert r.returncode == 0, r.stderr
+        assert server.wait(timeout=10) != 0
+    finally:
+        other.kill()
+        server.kill()

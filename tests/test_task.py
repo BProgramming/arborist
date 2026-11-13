@@ -282,3 +282,9 @@ def test_status_with_no_tasks_or_a_bad_id(cfg):
         task.task_status(c)
     with pytest.raises(task.TaskError):
         task.task_status(c, "../../etc")
+
+
+def test_task_compaction_notices_reach_the_tasks_own_ui(repo, cfg, tmp_path):
+    c = task.make_copy(repo, tmp_path / "copy")
+    session = task.TaskChat(cfg(), c, repo, "auto", tmp_path / "taskdir")
+    assert session.compactor.notice == session.ui.notice

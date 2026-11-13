@@ -339,6 +339,7 @@ class TaskChat(chat.Chat):
             on_notice=self.ui.notice, checkpoints=None,
             on_changes=self._record_run_changes)
         self.compactor.forget_file = toolbox.ws.unsee
+        self.compactor.notice = self.ui.notice  # was bound to the UI Chat.__init__ made
         # The project's memories, as a chat started in the real folder sees them.
         self.memory = chat.Memory(cfg["derived"]["memory_path"], source)
         self.memory_block = self._memory_block()

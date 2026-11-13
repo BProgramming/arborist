@@ -215,16 +215,17 @@ build() {
 }
 
 # ------------------------------------------------------------- download ---
-expected_sha256() {
-  # LFS hash from the Hugging Face tree API; empty if unavailable.
+remote_info() {
+  # "SHA256 BYTES" for a file, from the Hugging Face tree API; empty if unavailable.
   local file="$1"
-  curl -fsSL "https://huggingface.co/api/models/$CFG_MODEL_REPO/tree/main" 2>/dev/null | "$PY" -c '
+  curl -fsSL --connect-timeout 5 --max-time 20 \
+      "https://huggingface.co/api/models/$CFG_MODEL_REPO/tree/main" 2>/dev/null | "$PY" -c '
 import json, sys
 name = sys.argv[1]
 try:
     for f in json.load(sys.stdin):
         if f.get("path") == name and f.get("lfs"):
-            print(f["lfs"]["oid"]); break
+            print(f["lfs"]["oid"], int(f["lfs"].get("size") or f.get("size") or 0)); break
 except Exception:
     pass
 ' "$file" || true
@@ -236,10 +237,21 @@ download() {
   ok_marker="$dest.verified"
   [[ -f "$dest" && -f "$ok_marker" ]] && { info "$name present"; return; }
 
+  local want="" size=0 remote
+  remote="$(remote_info "$name")"
+  [[ -n "$remote" ]] && read -r want size <<<"$remote"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
   if [[ ! -f "$dest" ]]; then
-    local avail_gb
-    avail_gb="$(df -Pk "$(dirname "$dest")" | awk 'NR==2 { print int($4 / 1048576) }')"
-    ((avail_gb >= 10)) || die "Only ${avail_gb} GB free in $(dirname "$dest"); need ~10 GB."
+    if ((size > 0)); then
+      # Room for what's left to fetch, plus 100 MB to spare.
+      local avail_kb have=0 need_kb
+      [[ -f "$dest.part" ]] && have="$(stat -c %s "$dest.part" 2>/dev/null || echo 0)"
+      avail_kb="$(df -Pk "$(dirname "$dest")" | awk 'NR==2 { print $4 }')"
+      need_kb=$(( (size > have ? size - have : 0) / 1024 + 102400 ))
+      ((avail_kb >= need_kb)) \
+        || die "Only $((avail_kb / 1048576)) GB free in $(dirname "$dest"); $name needs $((need_kb / 1048576 + 1)) GB."
+    fi
     step "Downloading $name..."
     # -C - resumes a partial .part file if a previous download was interrupted.
     curl -fL --retry 5 --retry-delay 3 -C - --progress-bar -o "$dest.part" "$url" \
@@ -247,8 +259,7 @@ download() {
     mv "$dest.part" "$dest"
   fi
 
-  local want got
-  want="$(expected_sha256 "$name")"
+  local got
   if [[ -n "$want" ]]; then
     step "Verifying $name..."
     got="$(sha256sum "$dest" | cut -d' ' -f1)"
@@ -257,10 +268,11 @@ download() {
       die "Checksum mismatch for $name (moved to $dest.bad); rerun to download again."
     fi
     info "SHA256 ok."
+    touch "$ok_marker"
   else
-    warn "Couldn't fetch a checksum for $name; skipping verification."
+    # No marker: it's checked on a later start, once the checksum can be fetched.
+    warn "Couldn't fetch a checksum for $name; using it unverified for now."
   fi
-  touch "$ok_marker"
 }
 
 fetch_models() {

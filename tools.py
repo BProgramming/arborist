@@ -48,6 +48,11 @@ IGNORED_DIRS = {
 MAX_TEXT_BYTES = 2 * 1024 * 1024  # files bigger than this aren't read or searched
 
 
+# Ctrl-D (or a closed terminal) at an approval prompt: no answer is a no.
+NO_ANSWER = ("error: there was no answer at the approval prompt (input was closed), so nothing "
+             "was done. Stop and tell the user.")
+
+
 class ToolError(Exception):
     """A problem the model caused and can fix (bad path, no match, …)."""
 
@@ -455,6 +460,8 @@ class Toolbox:
             return ToolResult(f"error: {e}")
         except TypeError as e:
             return ToolResult(f"error: bad arguments for {name}: {e}")
+        except EOFError:
+            return ToolResult(NO_ANSWER)
         except OSError as e:
             return ToolResult(f"error: {e.strerror or e} ({name})")
         except Exception as e:
@@ -821,7 +828,7 @@ class Toolbox:
                 notes.append(f"CHANGED: {rel} was written by the model, then changed after the "
                              "diff you were shown (by a run, or outside arborist)")
         changed = sorted(self.ws.rel(f) for f, h in self.model_writes.items()
-                         if f != target and _sha256(f) not in (h, None))
+                         if f != target and _sha256(f) != h)  # edited since, or deleted
         if changed:
             notes.append("CHANGED since you were shown them: " + ", ".join(changed[:10])
                          + (f" and {len(changed) - 10} more" if len(changed) > 10 else ""))
@@ -918,20 +925,28 @@ class Toolbox:
         outcome, changed = ran
         log = _read_log(outcome.log_path)
         passed = outcome.exit_code == 0 and not outcome.timed_out
+        # pytest exits with 5 when it collected no tests: nothing failed.
+        none_found = (outcome.exit_code == 5 and not outcome.timed_out
+                      and "pytest" in plan.steps[0])
         status = ("timed out after %ds" % self.limits.test_timeout) if outcome.timed_out \
+            else "found no tests to run (pytest exit code 5)" if none_found \
             else ("passed" if passed else f"failed (exit code {outcome.exit_code})")
         notes = "".join(f"note: {w}\n" for w in plan.warnings)
         header = (f"Tests for {rel} {status}, {outcome.duration:.1f}s. Full log: {outcome.log_path}\n"
-                  f"{notes}{changed}--- {'summary' if passed else 'failures and summary'} ---\n")
-        self.tests_failed = not passed
+                  f"{notes}{changed}--- {'summary' if passed or none_found else 'failures and summary'} ---\n")
+        self.tests_failed = not passed and not none_found
         if passed:
             footer = "\n--- end ---\nNow tell the user the result briefly. Don't call any more tools."
+        elif none_found:
+            footer = ("\n--- end ---\nNo tests were collected, so nothing passed or failed. Tell the "
+                      "user that (a wrong path, or no test_*.py files or test functions there). "
+                      "Don't call any more tools.")
         else:
             footer = ("\n--- end ---\nNow present the bugs to the user. For each failure: what's "
                       "wrong, where (file and line), and the fix you propose. Don't change anything "
                       "and don't call any more tools; the user will be asked whether you may fix them.")
         room = max(self.limits.max_output_chars - len(header) - len(footer), 200)
-        body = runners.focus_test_output(log, passed)
+        body = runners.focus_test_output(log, passed or none_found)
         return ToolResult(header + _truncate(body, room) + footer, hard_stop=True)
 
     # fetch_url / crawl_docs -----------------------------------------------

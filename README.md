@@ -170,9 +170,14 @@ new text the model has to read. `/stats` shows how much came from the cache
   and saving or loading it takes a few seconds). Parked chats are deleted after
   `chat.resume_days` (default 7). `chat.resume = false` turns it all off.
 - The cache is saved for the chat's slot (slot 0, the only one with
-  `server.parallel = 1`). If you run a delegated task on the same server while
-  the chat is open, the slot then holds the task, and the saved cache won't
-  match; nothing breaks, it just isn't reused.
+  `server.parallel = 1`). If you run a delegated task or a second chat on the
+  same server while the chat is open, the slot may hold the other session,
+  and the saved cache won't match; nothing breaks, it just isn't reused.
+  While another session is [private](#private-sessions), the cache isn't
+  saved at all (the messages still park).
+- **A server stays up while anyone is using it.** If the chat whose launcher
+  started the server leaves while another chat or task is still attached,
+  the server keeps running; `./arborist.sh stop` stops it afterwards.
 
 ## Private sessions
 
@@ -208,6 +213,22 @@ From then on:
   `paths.root`, deleted on exit. If arborist is killed before it can clean
   up, the next start deletes the folder.
 
+**Other sessions on the same server.** Every chat and delegated task uses the
+server's one cache slot, so a private session isn't alone with the model if
+another session is attached. Arborist keeps track of who is (a locked file
+per session under `active/` in `paths.root`; a session that crashes drops
+out on its own) and tells you:
+
+- a session that **starts while a private one is open** is warned at startup;
+- a session that **goes private while others are open** is warned then, and
+  again before your next message if another one has started since;
+- **no session saves the cache while another one is private**, so a normal
+  chat that parks can't write the private conversation to disk. It says so
+  when it parks.
+
+Only sessions sharing `paths.root` and the server's host and port see each
+other; some other program pointed at the same server is invisible to this.
+
 It lasts until you leave; `/clear` doesn't end it. What it can't take back:
 files the model changed in your workspace stay changed, `/save` writes the
 file you asked for, and a parked chat you `/resume`d is still parked (until
@@ -231,7 +252,7 @@ be taken back, it says what. The toolbar shows `PRIVATE` while it's on.
 | `/resume` | carry on with the chat parked when you last left one in this folder, KV cache included (see [Resuming](#resuming)) |
 | `/stats` | context usage and last-reply speed |
 | `/recall [-n] TERM` | search the memories this folder can see, outdated ones too, and attach the hits to your next message (`-n` only shows them) |
-| `/undo [ID]` | restore the workspace's files from before the model's last change (or checkpoint `ID`); previews and asks first |
+| `/undo [ID]` | restore the workspace's files from before the model's last change (or checkpoint `ID`); previews and asks first. Files in a separate git repository nested inside the workspace aren't covered (arborist says so at startup); start it inside that repository instead |
 | `/checkpoints` | list workspace checkpoints, newest first |
 | `/compact` | shrink the conversation now: stub old tool output, then summarise older turns |
 | `/diff [-f] [PATH…]` | files changed since this session started, in the workspace or under `PATH` (`-f`/`--full`: the whole diff) |
@@ -299,7 +320,8 @@ This runs a model that acts on your files with your permissions. The approval
 prompts are the main safety mechanism, so read them. Specifically:
 
 - **Everything in the workspace is readable without asking.** File tools are
-  confined to the folder you start from (symlinks out of it are refused), but
+  confined to the folder you start from (symlinks out of it are refused, by
+  `grep` and the listings as well as `read_file`), but
   inside it the model can read anything, including `.env` files, keys, and
   credential files in any subfolder. The search tools skip `.gitignore`d
   files, but `read_file` still opens one asked for by name. **Don't start
@@ -326,8 +348,11 @@ prompts are the main safety mechanism, so read them. Specifically:
   `env`), is read-only, so a run can't plant a git hook or poison an
   environment you use yourself. A run can still create a new repo or venv;
   if it does, arborist warns you and names the hooks and `.pth` files to check
-  before you use git or Python there. Dependency checks get a read-only
-  workspace.
+  before you use git or Python there; the same goes for a symlink it
+  points out of the workspace. Dependency checks get a read-only
+  workspace, and the one check that asks an interpreter where its packages
+  live (which may be the project's own `.venv/bin/python`) sees only `/usr`,
+  `/etc` and that interpreter's install folders.
   Every run asks first, says whether the model wrote the file this session
   and whether it changed after the diff you were shown (`[v]iew` shows it),
   warns when web content is in the conversation, and lists any folder

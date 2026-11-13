@@ -341,3 +341,26 @@ def test_edit_leaves_lf_files_and_explicit_crlf_alone(ws_root, make_toolbox):
     # The model spelled the \r\n out itself: nothing is converted twice.
     tb.call("edit_file", {"path": "crlf.txt", "old_string": "a\r\nb", "new_string": "x\r\ny"})
     assert (ws_root / "crlf.txt").read_bytes() == b"x\r\ny\r\n"
+
+
+# ---- no answer at a prompt ----------------------------------------------------------
+
+def test_ctrl_d_at_an_approval_prompt_is_a_no_not_a_tool_bug(ws_root, make_toolbox, tmp_path):
+    class Gone(FakeApprover):
+        def approve_change(self, rel_path, diff, is_new):
+            raise EOFError
+
+    tb = make_toolbox(Gone())
+    res = tb.call("write_file", {"path": "new.py", "content": "x = 1\n"}).content
+    assert res.startswith("error: there was no answer at the approval prompt")
+    assert "internal error" not in res and not (ws_root / "new.py").exists()
+    assert not (tmp_path / "logs" / "tool-errors.log").exists()
+
+
+def test_run_prompt_flags_files_deleted_since_they_were_shown(ws_root, make_toolbox):
+    tb = make_toolbox()
+    tb.call("write_file", {"path": "a.py", "content": "print(1)\n"})
+    tb.call("write_file", {"path": "b.py", "content": "print(2)\n"})
+    (ws_root / "b.py").unlink()
+    notes = tb._provenance(ws_root / "a.py")
+    assert any(n.startswith("CHANGED since you were shown them: b.py") for n in notes)
