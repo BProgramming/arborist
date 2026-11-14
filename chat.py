@@ -42,6 +42,7 @@ import chat_input
 import compaction
 import changes as changes_mod
 import config as model_config
+import mimic as mimic_mod
 import presence as presence_mod
 import runners
 import sessions
@@ -212,6 +213,10 @@ Commands:
                         logs, checkpoints; asks about memories), then no
                         parking, memory saves or history; lasts until you leave.
                         Warns if other sessions share the server
+  /mimic [LIMIT] PROMPT write PROMPT in the voice of this folder's files
+                        (newest first, up to half the context) into
+                        NAME.draft here; LIMIT caps the characters (one
+                        shortening pass if over). .draft files aren't read
 
 Input:
   Alt+Enter             new line in your message; Enter sends it (with
@@ -297,6 +302,25 @@ class Client:
                 detail = data["error"].get("message") or detail
             raise SlotError(resp.status, detail)
         return data if isinstance(data, dict) else {}
+
+    def tokenize(self, text: str) -> int:
+        """How many tokens the model's own tokenizer makes of `text`
+        (llama-server's /tokenize). Raises OSError or ValueError if the
+        server can't say."""
+        conn = self._conn(30)
+        try:
+            conn.request("POST", "/tokenize", body=json.dumps({"content": text}),
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            raw = resp.read()
+        finally:
+            conn.close()
+        if resp.status != 200:
+            raise ValueError(f"/tokenize returned HTTP {resp.status}")
+        tokens = json.loads(raw).get("tokens")
+        if not isinstance(tokens, list):
+            raise ValueError("/tokenize returned no token list")
+        return len(tokens)
 
     def stream_chat(self, body: dict):
         """Yield parsed SSE chunks from /v1/chat/completions."""
@@ -1362,6 +1386,8 @@ class Chat:
         # ones a private session has already been warned about.
         self.presence: presence_mod.Presence | None = None
         self._seen_sessions: set[str] = set()
+        # /mimic: set once the server's /tokenize fails, to estimate instead.
+        self._estimate_tokens = False
 
     def _memory_block(self) -> str:
         try:
@@ -1989,6 +2015,7 @@ class Chat:
             "diff": (lambda a, r: self._diff(a), None),
             "config": (self._cmd_config, 0),
             "private": (lambda a, r: self._cmd_private(), 0),
+            "mimic": (self._cmd_mimic, None),
         }
 
     # -- changes ------------------------------------------------------------
@@ -2182,6 +2209,67 @@ class Chat:
             print(red("[stopped]"))
         finally:
             self.busy = False
+
+    # -- /mimic ----------------------------------------------------------------
+
+    def _count_tokens(self, text: str) -> int:
+        """Tokens by the model's tokenizer; ~4 characters a token if the
+        server can't say (and then for the rest of the session)."""
+        if not self._estimate_tokens:
+            try:
+                return self.client.tokenize(text)
+            except (OSError, ValueError):
+                self._estimate_tokens = True
+        return max(1, len(text) // 4)
+
+    def _generate(self, messages: list[dict]) -> str:
+        """One tool-free request outside the conversation; the reply's text."""
+        ch = self.cfg["chat"]
+        body = {
+            "messages": messages,
+            "stream": True,
+            "max_tokens": ch["max_tokens"],
+            "temperature": ch["temperature"],
+            "top_p": ch["top_p"],
+            "top_k": ch["top_k"],
+            "min_p": ch["min_p"],
+            "presence_penalty": ch["presence_penalty"],
+            "cache_prompt": True,  # the shortening pass reuses the examples
+        }
+        if self.effort:
+            body["reasoning_effort"] = self.effort
+        text = []
+        for chunk in self.client.stream_chat(body):
+            for choice in chunk.get("choices") or []:
+                text.append((choice.get("delta") or {}).get("content") or "")
+        return "".join(text)
+
+    def _cmd_mimic(self, _args, raw) -> None:
+        try:
+            req = mimic_mod.parse(raw)
+        except ValueError as e:
+            print(red(str(e)))
+            return
+        folder = self.toolbox.ws.root if self.toolbox else self.memory.scope
+        if folder is None:
+            print(red("/mimic needs a folder to read: start arborist in one"))
+            return
+        self.busy = True
+        try:
+            result = mimic_mod.run(req, Path(folder), Path(self.cfg["derived"]["mimic_banned_path"]),
+                                   self.context_tokens, count=self._count_tokens,
+                                   generate=self._generate, notice=self.ui.notice)
+        except Interrupted:
+            print(red("[stopped]"))
+            return
+        except (mimic_mod.MimicError, OSError, RuntimeError) as e:
+            print(red(f"/mimic: {e}"))
+            return
+        finally:
+            self.busy = False
+        for line in result.lines():
+            print(yellow(line) if line.startswith(("contains", "skipped")) or "still over" in line
+                  else line)
 
     # -- other sessions on this server -----------------------------------------
 

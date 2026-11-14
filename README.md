@@ -318,6 +318,7 @@ be taken back, it says what. The toolbar shows `PRIVATE` while it's on.
 | `/diff [-f] [PATH…]` | files changed since this session started, in the workspace or under `PATH` (`-f`/`--full`: the whole diff) |
 | `/config` | open your config in `$VISUAL` or `$EDITOR` (else nano or vi); `[tools]` changes apply right away, the rest after a restart |
 | `/private` | keep nothing from this session once you leave, taking back what it has written so far (see [Private sessions](#private-sessions)) |
+| `/mimic [LIMIT] PROMPT` | write `PROMPT` in the voice of the files in this folder, into `NAME.draft` next to them (see [Writing in your voice](#writing-in-your-voice)) |
 
 ### The prompt
 
@@ -349,6 +350,43 @@ current reply, tool or run. A pasted path like `/etc/hosts` is sent as text,
 not treated as a command; `//help me` sends the literal `/help me`. Commands
 are handled by arborist and never reach the model. Arguments split like a
 shell's, so quote ones with spaces: `/file "my notes.md"`.
+
+### Writing in your voice
+
+`/mimic` writes something new in the style of the files in the folder you
+started arborist in: keep your past LinkedIn posts in one folder, say, and
+start arborist there.
+
+```text
+/mimic 3000 why I stopped hand-writing migrations: the schema drift that finally convinced me
+```
+
+- **References.** Files directly in the folder (not subfolders, hidden files,
+  symlinks or binaries), read newest first by modification time until they'd
+  fill half the context window, or all of them. They're given to the model
+  oldest first, so your recent writing sits right before the instruction.
+  Editing an old file makes it the newest.
+- **Output.** `NAME.draft` in the same folder, named from the prompt; an
+  existing file is never replaced (`NAME-2.draft` instead). `.draft` files are
+  never read as references, so the tool doesn't learn from its own output.
+  Edit the draft until it's yours, then drop the `.draft` and it joins the set.
+- **Length.** `LIMIT` is a ceiling in characters, and optional: leave it out,
+  or use `0` when the prompt starts with a number (`/mimic 0 3 things…`). The
+  model is asked for about that many; if the draft is longer, it gets one
+  request to shorten it to a word count that lands a little under. Then the
+  draft is written whatever its length, and the report says so:
+  `file why-i-stopped-hand-writing-migrations.draft generated, character count = 2814 (limit 3000)`.
+- **Phrases that sound machine-made.** Listed one per line in
+  `~/.local/share/arborist/memory/banned_phrases.txt`, created with a starter
+  list the first time. Any phrase found in the folder's files is yours, so it's
+  dropped from the list there. The rest are named to the model, and any that
+  turn up in the draft anyway are reported.
+- **What it put in.** The report starts `read 23/41 files (context limit)` or
+  `(all files)`: if a draft sounds off, check how much the model saw.
+
+Your prompt carries the point you want to make; the files carry the voice. A
+one-line topic gets you generic content in your rhythm, so give it your actual
+take.
 
 ## What the model can do
 
