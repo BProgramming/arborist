@@ -345,6 +345,8 @@ def load(path: str | os.PathLike | None = None) -> dict:
         "log_dir": str(root / "logs"),
         "history_dir": str(root / "history"),
         "memory_path": str(root / "memory" / "memory.toml"),
+        # /mimic's list of phrases to keep out of drafts (created on first use).
+        "mimic_banned_path": str(root / "memory" / "banned_phrases.txt"),
         "checkpoint_dir": str(root / "checkpoints"),
         # Parked conversations (/resume), and the KV caches llama-server saves
         # for them (its --slot-save-path).
