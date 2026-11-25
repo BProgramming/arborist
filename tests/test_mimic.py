@@ -3,11 +3,21 @@ context budget, banned phrases, the one shortening pass, and the draft file."""
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import pytest
 
 import mimic
+
+STAMP = "20260102030405"
+REAL_TIMESTAMP = mimic.timestamp  # saved before the autouse fixture patches it
+DRAFT = f"mimic_{STAMP}.draft"
+
+
+@pytest.fixture(autouse=True)
+def fixed_timestamp(monkeypatch):
+    monkeypatch.setattr(mimic, "timestamp", lambda: STAMP)
 
 
 def chars(text: str) -> int:
@@ -131,7 +141,7 @@ def test_run_writes_a_draft_and_shows_newest_last(tmp_path, banned_path):
     result = mimic.run(mimic.parse("write about indexes"), tmp_path, banned_path,
                        context_tokens=100_000, count=chars, generate=model)
 
-    assert result.path == tmp_path / "write-about-indexes.draft"
+    assert result.path == tmp_path / DRAFT
     assert result.path.read_text() == "A new post about indexes.\n"
     [messages] = model.requests
     user = messages[1]["content"]
@@ -141,7 +151,7 @@ def test_run_writes_a_draft_and_shows_newest_last(tmp_path, banned_path):
     # "delve" is the author's own word, so it isn't banned; the rest are listed.
     assert "- delve" not in user and "- let that sink in" in user
     assert result.lines() == ["read 2/2 files (all files)",
-                              "file write-about-indexes.draft generated, character count = 25"]
+                              f"file {DRAFT} generated, character count = 25"]
 
 
 def test_limit_is_asked_for_then_enforced_with_one_shortening_pass(tmp_path, banned_path):
@@ -172,7 +182,7 @@ def test_only_one_shortening_pass_and_the_report_says_still_over(tmp_path, banne
     assert len(model.requests) == 2
     assert result.path.read_text() == "y" * 400 + "\n"
     assert result.over
-    assert result.lines()[-1] == ("file a-post.draft generated, character count = 400 "
+    assert result.lines()[-1] == (f"file {DRAFT} generated, character count = 400 "
                                   "(limit 300, still over after one shortening pass)")
 
 
@@ -237,11 +247,14 @@ def test_binary_files_are_skipped_and_reported(tmp_path, banned_path):
 
 
 def test_drafts_never_replace_a_file(tmp_path):
-    (tmp_path / "a-post.draft").write_text("mine")
-    p = mimic.write_draft(tmp_path, "A post!", "new")
-    assert p.name == "a-post-2.draft" and (tmp_path / "a-post.draft").read_text() == "mine"
-    assert mimic.write_draft(tmp_path, "a post", "again").name == "a-post-3.draft"
-    assert mimic.write_draft(tmp_path, "!!!", "x").name == "mimic.draft"
+    (tmp_path / DRAFT).write_text("mine")
+    p = mimic.write_draft(tmp_path, "new")
+    assert p.name == f"mimic_{STAMP}-2.draft" and (tmp_path / DRAFT).read_text() == "mine"
+    assert mimic.write_draft(tmp_path, "again").name == f"mimic_{STAMP}-3.draft"
+
+
+def test_timestamp_is_sortable_to_the_second():
+    assert re.fullmatch(r"\d{14}", REAL_TIMESTAMP())
 
 
 # --- in the chat --------------------------------------------------------------
@@ -279,9 +292,9 @@ def test_mimic_command_writes_into_the_workspace(chat_for, ws_root, capsys):
     c, bodies = chat_for(ws_root)
     assert c.command("/mimic 500 a post about tests")
     out = capsys.readouterr().out
-    assert (ws_root / "a-post-about-tests.draft").read_text() == "Drafted in your voice.\n"
+    assert (ws_root / DRAFT).read_text() == "Drafted in your voice.\n"
     assert "read 1/1 file (all files)" in out
-    assert "file a-post-about-tests.draft generated, character count = 22 (limit 500)" in out
+    assert f"file {DRAFT} generated, character count = 22 (limit 500)" in out
     [body] = bodies
     assert "tools" not in body and c.messages == []  # outside the conversation
     banned = Path(c.cfg["derived"]["mimic_banned_path"])
@@ -293,7 +306,7 @@ def test_mimic_without_tools_uses_the_starting_folder(chat_for, ws_root, capsys)
     post(ws_root, "post.md", "An old post.", 100)
     c, _ = chat_for(None, scope=ws_root)
     c.command("/mimic a post")
-    assert (ws_root / "a-post.draft").is_file()
+    assert (ws_root / DRAFT).is_file()
 
 
 def test_mimic_errors_are_reported_not_raised(chat_for, ws_root, capsys):

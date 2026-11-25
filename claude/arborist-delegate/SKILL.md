@@ -1,11 +1,11 @@
 ---
 name: arborist-delegate
-description: Delegate a simple, checkable coding task to the local Bonsai 2 27B model through arborist (`~/Documents/arborist/arborist.sh task`), then act as overseer — review its report and patch, and apply it only if it's right. Use when the user asks to delegate, hand off or offload work to Bonsai, arborist, "the agent" or "the local model", or to save tokens by having their own PC do a task.
+description: Delegate a simple, checkable coding task to the local Bonsai 2.5 27B model through arborist (`~/Documents/arborist/arborist.sh task`), then act as overseer — review its report and patch, and apply it only if it's right. Use when the user asks to delegate, hand off or offload work to Bonsai, arborist, "the agent" or "the local model", or to save tokens by having their own PC do a task.
 ---
 
 # Delegating to arborist
 
-The user runs Bonsai 2 27B locally through arborist (`~/Documents/arborist`, aliased
+The user runs Bonsai 2.5 27B locally through arborist (`~/Documents/arborist`, aliased
 `agent`). `arborist.sh task run` gives it one task in a disposable git copy of the
 project and writes a report and a patch. You write the task, run it, review the
 result and decide what reaches the user's project. The point is to spend the user's

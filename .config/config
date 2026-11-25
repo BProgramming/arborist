@@ -7,7 +7,7 @@
 # Lines tagged  PERF  change speed or memory use.
 #
 # THE VALUES HERE ARE ONE WORKING SETUP, not universal defaults: PrismML's
-# Bonsai 2 27B on an AMD RX 9070 (16 GB VRAM) through Vulkan. To make it yours:
+# Bonsai 2.5 27B on an AMD RX 9070 (16 GB VRAM) through Vulkan. To make it yours:
 #
 #   Another GPU    [build] backend (vulkan runs on AMD, NVIDIA and Intel; cuda
 #                  and hip are the vendor routes), then size [server] ctx_size
@@ -33,10 +33,12 @@ root = "~/.local/share/arborist"
 #   "cpu"    — fallback only; expect a few tokens/sec.
 backend = "vulkan"
 
-# PrismML's fork — stock llama.cpp can't run Bonsai 2 weights. It runs
-# ordinary GGUF models as well, so it can stay when you change the model; for
-# stock llama.cpp use https://github.com/ggml-org/llama.cpp.git and "master",
-# and clear [options] server_args (its flags exist only in the fork).
+# PrismML's fork — stock llama.cpp can't run Bonsai's PQ2_0 or PTQ1_0 files.
+# It runs ordinary GGUF models as well, so it can stay when you change the
+# model; for stock llama.cpp use https://github.com/ggml-org/llama.cpp.git and
+# "master", and clear [options] server_args (its flags exist only in the fork).
+# Stock llama.cpp b11556 or newer runs Bonsai 2.5's Q2_0 file (see [model]);
+# older stock builds load it without complaint and produce garbage.
 repo = "https://github.com/PrismML-Eng/llama.cpp.git"
 # Branch, tag or commit. "prism" tracks their latest; pin a commit hash here
 # once you find a build you're happy with.
@@ -57,27 +59,32 @@ jobs = 0
 [model]
 # Shown in the chat banner and saved transcripts. Leave empty to use the file
 # name.
-name = "Bonsai 2 27B"
+name = "Bonsai 2.5 27B"
 
 # Hugging Face repo and the .gguf file in it to download and serve. Point
 # these at any GGUF model the llama.cpp build above can run, then set
 # `efforts` below and clear [options] server_args.
-repo = "prism-ml/Ternary-Bonsai-2-27B-gguf"
-# PERF: for Bonsai 2 the packing is in the file name. Same weights either way.
-#   Ternary-Bonsai-2-27B-PQ2_0.gguf  — 7.21 GB, faster prompt processing. PrismML's default.
-#   Ternary-Bonsai-2-27B-PTQ1_0.gguf — 5.95 GB, frees ~1.3 GB of VRAM for context.
-file = "Ternary-Bonsai-2-27B-PQ2_0.gguf"
+repo = "prism-ml/Ternary-Bonsai-2.5-27B-GGUF"
+# PERF: for Bonsai 2.5 the packing is in the file name. Same weights either way.
+#   Ternary-Bonsai-2.5-27B-PQ2_0.gguf  — 7.25 GB, faster prompt processing.
+#   Ternary-Bonsai-2.5-27B-PTQ1_0.gguf — 5.99 GB, frees ~1.3 GB of VRAM for context.
+#   Ternary-Bonsai-2.5-27B-Q2_0.gguf   — 7.67 GB, for stock llama.cpp b11556+.
+# Each also comes as a -mtp file (~0.24 GB more) with a multi-token-prediction
+# draft head for speculative decoding; arborist doesn't pass the flags for it.
+file = "Ternary-Bonsai-2.5-27B-PQ2_0.gguf"
 
 # Reasoning efforts this model's chat template accepts; /effort and
 # chat.reasoning_effort must use one of these. Leave empty ([]) for a model
 # without effort control, and no effort is sent.
-# Bonsai 2's template accepts only these three ("high" and "low" throw).
+# Bonsai 2.5: the template accepts xhigh, medium and low, but PrismML says low
+# behaves close to xhigh, so it's left out. "none" never reaches the template:
+# the fork's server turns it into thinking off. "high" throws.
 efforts = ["none", "medium", "xhigh"]
 
 # PERF: vision projector (screenshots/images). Costs VRAM and load time;
 # off by default since this setup is for code.
 vision = false
-mmproj_file = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
+mmproj_file = "Ternary-Bonsai-2.5-27B-mmproj-Q8_0.gguf"
 
 [options]
 # Optional llama-server flags that belong to this model rather than to your
@@ -86,7 +93,7 @@ mmproj_file = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
 # {effort} = chat.reasoning_effort. Leave "" for none. (For flags that don't
 # depend on the model, use server.extra_args.)
 #
-# Bonsai 2 (PrismML fork): the template throws on efforts it doesn't know, so
+# Bonsai 2.5 (PrismML fork): the template throws on efforts it doesn't know, so
 # restrict them, and map strays to the default instead of an HTTP 500.
 server_args = "--reasoning-effort-allow {efforts} --reasoning-effort-fallback {effort}"
 
@@ -101,8 +108,8 @@ gpu_layers = 99
 
 # PERF: context window in tokens (max 262144). Sizing it: the model file, plus
 # the KV cache for this many tokens, plus 1-2 GB for the desktop, has to fit
-# in your VRAM. For Bonsai 2 27B the f16 KV cache costs ~64 KiB per token, so
-# 65536 ≈ 4 GiB next to 7.2 GB of weights: comfortable on a 16 GB card. By the
+# in your VRAM. For Bonsai 2.5 27B the f16 KV cache costs ~64 KiB per token, so
+# 65536 ≈ 4 GiB next to 7.25 GB of weights: comfortable on a 16 GB card. By the
 # same arithmetic (untested): 12 GB, 32768; 8 GB, 8192 with the smaller
 # PTQ1_0 file. Other models
 # cost more or less per token: watch the offload line at startup, and lower
@@ -157,7 +164,7 @@ only from this system prompt, and this system prompt is complete.
 """
 
 # PERF: the biggest latency knob. Must be one of model.efforts (ignored if
-# that's empty). For Bonsai 2, which thinks before it answers:
+# that's empty). For Bonsai 2.5, which thinks before it answers:
 #   "medium" — thinks noticeably less, about as accurate. Default.
 #   "xhigh"  — the model's own default; can think for many thousands of tokens.
 #   "none"   — no thinking; fastest, weakest on hard problems.
@@ -173,7 +180,7 @@ max_tokens = 16384
 temperature = 1.0
 top_p = 0.95
 top_k = 20
-min_p = 0.05
+min_p = 0.0
 presence_penalty = 0.0
 
 # Print speed and token counts after each reply.

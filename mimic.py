@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 DRAFT_SUFFIX = ".draft"
@@ -37,8 +38,11 @@ USAGE = "usage: /mimic [LIMIT] PROMPT  (LIMIT: most characters; 0 or none for no
 SYSTEM = (
     "You write new pieces in the voice of one author, from examples of their writing. "
     "Match their vocabulary, sentence length, rhythm, punctuation, formatting and tone, "
-    "and how they open and close a piece. Don't copy their sentences. Reply with only the "
-    "piece itself: no preamble, no title unless their examples have titles, no notes after it."
+    "and how they open and close a piece. The examples show how the author writes, not what "
+    "to write about. Take no topics, stories or details from them. Reply with only the piece "
+    "itself: no preamble, no title unless their examples have titles, no notes after it. "
+    "Exclude references to files in your sandbox. For any URL, write [LINK TO <item>] rather "
+    "than the URL itself."
 )
 
 DEFAULT_BANNED = """\
@@ -250,15 +254,13 @@ def shorten_message(draft: str, limit: int) -> str:
 
 # ----------------------------------------------------------------- output ---
 
-def slug(prompt: str, words: int = 6, max_len: int = 50) -> str:
-    parts = re.findall(r"[a-z0-9]+", prompt.lower())[:words]
-    s = "-".join(parts)[:max_len].rstrip("-")
-    return s or "mimic"
+def timestamp() -> str:
+    return f"{datetime.now():%Y%m%d%H%M%S}"
 
 
-def write_draft(folder: Path, prompt: str, text: str) -> Path:
-    """NAME.draft in `folder`, never replacing a file: NAME-2.draft and so on."""
-    base = slug(prompt)
+def write_draft(folder: Path, text: str) -> Path:
+    """mimic_TIMESTAMP.draft in `folder`, never replacing a file: -2, -3 and so on."""
+    base = f"mimic_{timestamp()}"
     n = 1
     while True:
         name = f"{base}{'' if n == 1 else f'-{n}'}{DRAFT_SUFFIX}"
@@ -354,7 +356,7 @@ def run(req: Request, folder: Path, banned_path: Path, context_tokens: int,
         if retry:
             draft, shortened = retry, True
 
-    path = write_draft(folder, req.prompt, draft)
+    path = write_draft(folder, draft)
     return Result(path=path, chars=len(draft), limit=req.limit,
                   over=bool(req.limit and len(draft) > req.limit), shortened=shortened,
                   selection=sel, skipped=skipped, banned_hits=found_in(draft, banned))
