@@ -369,8 +369,9 @@ start arborist there.
   fill half the context window, or all of them. They're given to the model
   oldest first, so your recent writing sits right before the instruction.
   Editing an old file makes it the newest.
-- **Output.** `NAME.draft` in the same folder, named from the prompt; an
-  existing file is never replaced (`NAME-2.draft` instead). `.draft` files are
+- **Output.** `NAME.draft` in the same folder, named from the time it was
+  written (`mimic_20261125102108.draft`); an existing file is never replaced
+  (`NAME-2.draft` instead). `.draft` files are
   never read as references, so the tool doesn't learn from its own output.
   Edit the draft until it's yours, then drop the `.draft` and it joins the set.
 - **Length.** `LIMIT` is a ceiling in characters, and optional: leave it out,
