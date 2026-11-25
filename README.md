@@ -20,7 +20,7 @@ supported; WSL2 is Linux and should work, but is untested.
 |---|---|---|
 | Distro | Linux Mint (Ubuntu base) | Other Debian/Ubuntu, Fedora, Arch: the launcher prints install commands for `apt`, `dnf` and `pacman` |
 | GPU | AMD RX 9070 (16 GB) through Vulkan | Any GPU with a Vulkan driver; NVIDIA through CUDA (`build.backend = "cuda"`); AMD through ROCm (`"hip"`); CPU only, slowly |
-| Model | PrismML's Bonsai 2 27B | Any GGUF model llama.cpp can run (see [Another model](#another-model)) |
+| Model | PrismML's Bonsai 2.5 27B | Any GGUF model llama.cpp can run (see [Another model](#another-model)) |
 
 The shipped settings are that tested setup. Anything in the right-hand
 column is a config change away, but nobody has run it: expect to adjust
@@ -130,7 +130,7 @@ So your settings are never edits to a file git tracks, and pulling a new
 arborist doesn't touch them. A setting added later that your copy doesn't
 mention takes its built-in default; the example shows what's new.
 
-**The example is one working setup** (Bonsai 2 27B on a 16 GB AMD card
+**The example is one working setup** (Bonsai 2.5 27B on a 16 GB AMD card
 through Vulkan), not a set of universal defaults.
 
 ### Another GPU
@@ -142,7 +142,7 @@ through Vulkan), not a set of universal defaults.
   rebuild.
 - `server.ctx_size`: the main VRAM lever. The model file, plus the KV cache
   for that many tokens, plus 1-2 GB for the desktop, has to fit. The example
-  config's comment works the numbers for Bonsai 2 and suggests values for
+  config's comment works the numbers for Bonsai 2.5 and suggests values for
   12 GB and 8 GB cards.
 - `server.gpu_layers`: lower it only as a last resort. After loading, the
   launcher prints how many layers made it onto the GPU, and warns if some
@@ -158,10 +158,13 @@ them while `model.efforts` is empty. Check the `[chat]` sampling values
 against what the model's authors recommend.
 
 `build.repo` can stay as it is. It points at PrismML's fork of llama.cpp,
-which Bonsai 2 needs and which runs ordinary GGUF models too. To build stock
-llama.cpp instead, set `build.repo` to
+which Bonsai's PQ2_0 and PTQ1_0 files need and which runs ordinary GGUF models
+too. To build stock llama.cpp instead, set `build.repo` to
 `https://github.com/ggml-org/llama.cpp.git` and `build.ref` to `master`; the
-next start switches the source and rebuilds.
+next start switches the source and rebuilds. Stock llama.cpp (b11556 or newer)
+can run Bonsai 2.5 too, from its `Q2_0` file: set `model.file` to
+`Ternary-Bonsai-2.5-27B-Q2_0.gguf` and clear `options.server_args`. Older stock
+builds load that file without complaint and produce garbage.
 
 Everything arborist keeps lives under `paths.root` (default
 `~/.local/share/arborist`): the llama.cpp source and build, model weights,
