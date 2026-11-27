@@ -27,6 +27,11 @@ Two modes:
 Between turns the harness keeps the model going: after a run it gets the
 go-ahead to continue (or to fix failing tests), up to --max-turns turns. The
 stuck detection and step limit from the chat still apply, and end the task.
+
+The model plans with the update_plan tool (see plan.py). Each go-ahead shows
+it the plan and names the next step, so the plan survives compaction, and a
+reply that tries to finish with steps still open is sent back to work. A step
+that names a test is only marked done once that test has passed.
 """
 from __future__ import annotations
 
@@ -48,12 +53,13 @@ from typing import Any
 import agent
 import chat
 import config as model_config
+import plan as plan_mod
 import sandbox
 from tools import Decision, Limits, MemoryChoice, ToolResult, Toolbox, Workspace
 
 MODES = ("auto", "interactive")
-STATUSES = ("done", "tests_failing", "blocked", "out_of_steps", "out_of_turns", "stopped", "interrupted",
-            "timed_out", "error")
+STATUSES = ("done", "tests_failing", "plan_incomplete", "blocked", "out_of_steps", "out_of_turns",
+            "stopped", "interrupted", "timed_out", "error")
 
 GIT_IDENTITY = ["-c", "user.name=arborist", "-c", "user.email=arborist@localhost"]
 
@@ -61,6 +67,12 @@ TASK_GUIDE = """\
 This is a delegated task. {who} You're working in a disposable copy of the \
 project at {root}; nothing you change reaches the real project until it has been reviewed.
 - Do the task as written, and nothing more. Don't tidy, reformat or rename things it doesn't mention.
+- Start by calling update_plan with a short plan: the steps, in order, each small enough to \
+check on its own. Work through them one at a time, and call update_plan again whenever a step \
+starts or finishes.
+- Where a test can show a step works, give the step a test file. If that test doesn't exist yet, \
+write it first, from what the task says should happen, before the code it checks. A step with \
+a test is done only when run_tests on it passes; the harness checks this.
 - If something is unclear, or you're stuck, don't guess: stop and report RESULT: BLOCKED, \
 saying exactly what you need.
 - If the task names tests, run them before you finish. When they fail, fix the cause and \
@@ -84,6 +96,18 @@ CONTINUE = ("(You may carry on with the task now: edit and run as you need to. W
             "finished, reply with the report.)")
 FIX = ("(Fix the failures you found, then run the tests again. When the task is finished, "
        "reply with the report.)")
+STEPS_OPEN = ("(Your plan still has steps that aren't done, so the task isn't finished. Carry "
+              "on with the next one. If a step can't be done, or isn't needed after all, say why "
+              "and update the plan; if you're stuck, reply with RESULT: BLOCKED.)")
+# Replies in a row that ignore STEPS_OPEN (no tool calls) before the task ends.
+MAX_IDLE_NUDGES = 2
+
+
+def with_plan(message: str, p: plan_mod.Plan) -> str:
+    """A go-ahead, followed by the plan as it stands and the next step."""
+    if not p:
+        return message
+    return f"{message}\n\nYour plan:\n{p.render()}\n{p.next_line()}"
 
 
 class TaskError(Exception):
@@ -228,6 +252,24 @@ class AutoApprover:
         return MemoryChoice("skip", reason="memory is off for delegated tasks")
 
 
+class TaskToolbox(Toolbox):
+    """The chat's tools, plus update_plan."""
+
+    def __init__(self, *args, on_plan=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.plan = plan_mod.Plan()
+        self.on_plan = on_plan or (lambda p: None)
+
+    @property
+    def schemas(self) -> list[dict]:
+        return super().schemas + [plan_mod.SCHEMA]
+
+    def tool_update_plan(self, items=None, **extra) -> str:
+        out = plan_mod.update(self.plan, items if items is not None else extra, self)
+        self.on_plan(self.plan)
+        return out
+
+
 def task_tools(cfg_tools: dict, mode: str) -> dict:
     """The [tools] settings a task runs with."""
     t = dict(cfg_tools)
@@ -333,11 +375,12 @@ class TaskChat(chat.Chat):
         # The copy lives under paths.root, which the chat's toolbox hides, so
         # this one has its own: the whole copy is the model's, arborist's code
         # included when that's the project (changes to it are reviewed like any).
-        self.toolbox = toolbox = Toolbox(
+        self.toolbox = toolbox = TaskToolbox(
             Workspace(c.workspace), approver, Limits.from_config(cfg["tools"]),
             log_dir=task_dir / "logs", on_output=self.ui.run_output,
             on_notice=self.ui.notice, checkpoints=None,
-            on_changes=self._record_run_changes)
+            on_changes=self._record_run_changes,
+            on_plan=(lambda p: progress.update(plan=p.to_json())) if progress else None)
         self.compactor.forget_file = toolbox.ws.unsee
         self.compactor.notice = self.ui.notice  # was bound to the UI Chat.__init__ made
         # The project's memories, as a chat started in the real folder sees them.
@@ -392,7 +435,7 @@ def model_result(text: str) -> str | None:
     return m[1].upper() if m else None
 
 
-def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_turns: int = 6,
+def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_turns: int = 12,
              timeout: int = 1800, effort: str | None = None, client=None,
              ask=chat.ask) -> dict:
     """Run one task to the end and write its report. Returns the report."""
@@ -451,6 +494,8 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
     turns = steps = 0
     final = ""
     status = "error"
+    the_plan = toolbox.plan
+    idle_nudges = 0
 
     def on_signal(_signum, _frame):
         raise chat.Interrupted()
@@ -476,11 +521,25 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
                 report["harness"] = f"paused: {result.paused}"
                 break
             if not result.hard_stopped:
+                # The model replied without running anything: it thinks it's finished.
                 if result.steps >= t["max_steps"]:
                     status = "out_of_steps"
-                else:
-                    status = "blocked" if model_result(final) == "BLOCKED" else "done"
-                break
+                    break
+                if model_result(final) == "BLOCKED":
+                    status = "blocked"
+                    break
+                if not the_plan.open_steps():
+                    status = "done"
+                    break
+                # Steps are still open: send it back, unless it keeps ignoring that.
+                idle_nudges = idle_nudges + 1 if result.steps == 0 else 1
+                if idle_nudges > MAX_IDLE_NUDGES:
+                    status = "plan_incomplete"
+                    break
+                nudge = STEPS_OPEN
+            else:
+                idle_nudges = 0
+                nudge = FIX if toolbox.tests_failed else CONTINUE
             if turns >= max_turns:
                 status = "out_of_turns"
                 break
@@ -489,8 +548,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
                 if ans in ("n", "no"):
                     status = "stopped"
                     break
-            messages.append({"role": "user",
-                             "content": FIX if toolbox.tests_failed else CONTINUE})
+            messages.append({"role": "user", "content": with_plan(nudge, the_plan)})
     except chat.Interrupted:
         session.ui.end_message()
         timed_out = timeout and time.monotonic() - started >= timeout - 1
@@ -518,6 +576,18 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
     if status == "done" and tests and tests[-1] != "passed":
         # A small model will say it's done with the tests still failing.
         status = "tests_failing"
+    plan_report = None
+    if the_plan:
+        plan_report = {
+            "steps": the_plan.to_json(),
+            "open": [s.step for s in the_plan.open_steps()],
+            # Taken out of the plan before they were done.
+            "dropped": list(the_plan.dropped),
+            # Done with no test behind them: the reviewer's to check.
+            "unchecked": the_plan.unchecked(),
+            # Done on a test that passed, but files changed after, or a later run failed.
+            "stale": plan_mod.stale(the_plan, toolbox),
+        }
     report.update(
         status=status,
         model_result=model_result(final),
@@ -527,6 +597,7 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         patch=str(patch) if patch.exists() else None,
         apply=(f"git -C {c.repo} apply --3way {patch}" if patch.exists() else None),
         tests={"runs": len(tests), "last": tests[-1] if tests else "not run"},
+        plan=plan_report,
         run_changes=session.run_changes,
         warnings=session.warnings,
         turns=turns,
@@ -536,7 +607,8 @@ def run_task(cfg: dict, source: Path, task_text: str, mode: str = "auto", max_tu
         logs=str(task_dir / "logs"),
     )
     _write_report(task_dir, report)
-    progress.update(state=status, doing=None, turn=turns, steps=steps, tests=list(tests))
+    progress.update(state=status, doing=None, turn=turns, steps=steps, tests=list(tests),
+                    plan=the_plan.to_json())
     return report
 
 
@@ -621,6 +693,12 @@ def task_status(cfg: dict, task_id: str | None = None, now: float | None = None)
         lines.append(f"  now: {p.get('doing') or '?'} (for {_ago(now - p['updated'])})")
     if p.get("last"):
         lines.append(f"  last: {p['last']}")
+    if p.get("plan"):
+        shown = plan_mod.Plan()
+        shown.steps = [plan_mod.Step(**s) for s in p["plan"]]
+        done = len(shown.steps) - len(shown.open_steps())
+        lines.append(f"  plan: {done} of {len(shown.steps)} step(s) done")
+        lines += ["    " + line for line in shown.render().splitlines()]
     if state == "died":
         lines.append("  the task's process is gone without writing a report")
     elif state != "running":
@@ -651,8 +729,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="auto: no prompts, sandboxed runs (default); interactive: you approve "
                         "each edit and run")
     r.add_argument("--workspace", "-w", help="project folder (default: current directory)")
-    r.add_argument("--max-turns", type=int, default=6,
-                   help="times the model may be told to carry on after a run (default 6)")
+    r.add_argument("--max-turns", type=int, default=12,
+                   help="times the model may be told to carry on (default 12)")
     r.add_argument("--timeout", type=int, default=1800,
                    help="seconds before the task is stopped (default 1800; 0 = none)")
     r.add_argument("--effort", help="reasoning effort for this task (from model.efforts)")
@@ -703,6 +781,12 @@ def main(argv: list[str] | None = None) -> int:
     print(chat.bold(f"task {report['id']}: {report['status']}") +
           f" ({report['turns']} turn(s), {report['steps']} step(s), {report['seconds']}s)")
     print(report["diffstat"] or "no changes")
+    if report.get("plan"):
+        pr = report["plan"]
+        for label, key in (("open", "open"), ("dropped", "dropped"),
+                           ("done without a test", "unchecked"), ("passed, then changed", "stale")):
+            for step in pr[key]:
+                print(f"plan step {label}: {step}")
     print(f"report: {Path(report['task_dir']) / 'report.json'}")
     return 0 if report["status"] == "done" else 2
 

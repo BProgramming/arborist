@@ -529,19 +529,43 @@ The model never works on your project directly. It gets a copy under
 uncommitted (staged, unstaged and untracked, minus what `.gitignore` excludes).
 Runs use your project's `.venv`/`venv` read-only, since the copy has none. After
 a run, the harness tells the model to carry on (or to fix failing tests) until
-it finishes, gets stuck, or uses up `--max-turns` (default 6) or `--timeout`
+it finishes, gets stuck, or uses up `--max-turns` (default 12) or `--timeout`
 (default 30 minutes). Then the task folder holds:
 
 | File | What's in it |
 |---|---|
-| `report.json` | status, the model's final report, files changed, test results, warnings |
+| `report.json` | status, the model's final report, files changed, test results, the plan, warnings |
 | `changes.patch` | everything the task changed; `git -C REPO apply --3way changes.patch` |
 | `transcript.md` | the whole conversation, tool calls included |
 | `task.md`, `logs/` | the task as given, and output from every run |
 
 The status is `done`, `tests_failing` (the model said it was done but its last
-test run failed), `blocked`, `out_of_steps`, `out_of_turns`, `stopped`,
+test run failed), `plan_incomplete` (it kept trying to finish with steps of its
+plan still open), `blocked`, `out_of_steps`, `out_of_turns`, `stopped`,
 `interrupted`, `timed_out` or `error`.
+
+**The plan.** A task has one extra tool, `update_plan`. The model starts by
+writing a short plan (at most 10 steps), then marks each step `in_progress` and
+`done` as it goes. A step can name a test file. The model is told to write that
+test first, from what the task says should happen, and the harness won't mark
+the step done until `run_tests` has passed on that file (or a folder holding it)
+with no edits since. Until then it stays open, and the tool result says why. A
+small model will tick off work it hasn't done, so the harness checks instead of
+trusting it.
+
+Every go-ahead after a run repeats the plan and names the next step, so the
+plan survives compaction. A reply that tries to finish with steps still open
+is sent back; after two such replies in a row with no tool calls, the task
+ends as `plan_incomplete`. `report.json` has the plan under `plan`: every step,
+the ones still `open`, the ones `dropped` (taken out of the plan before they
+were done), the ones `unchecked` (done with no test behind them, so
+look at those yourself), and the ones gone `stale` (proven, then files changed
+after, or a later run covering them failed). `task status` shows the plan too.
+
+Compaction, in tasks and in the chat, keeps two tool results while they
+matter: the newest test report when it failed, and the newest read of the file
+the model last edited. If older turns get summarised, a failing report is
+carried into the summary as it was.
 
 **auto** asks nothing: edits apply in the copy, and runs go ahead only in the
 bwrap sandbox with every `[tools]` opening (`run_writable`, `run_env_keep`,

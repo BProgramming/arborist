@@ -155,3 +155,64 @@ def test_disabled_compaction_still_honours_force():
     c, _ = make(context_tokens=10, enabled=False, keep_turns=1)
     assert c.maybe_compact(msgs) is False
     assert c.maybe_compact(msgs, force=True) is True
+
+
+# ------------------------------------------------------------- what's pinned ---
+
+def fix_session(test_result: str) -> list[dict]:
+    """One turn: tests fail, then the model reads and edits app.py and reads more."""
+    msgs = [
+        {"role": "user", "content": "fix it"},
+        {"role": "assistant", "content": "", "tool_calls": [call("t", "run_tests", path=".")]},
+        {"role": "tool", "tool_call_id": "t", "content": test_result + "\n" + "E" * 4000},
+        {"role": "assistant", "content": "", "tool_calls": [call("a", "read_file", path="app.py")]},
+        {"role": "tool", "tool_call_id": "a", "content": "def add(a, b):\n" + "a" * 4000},
+        {"role": "assistant", "content": "", "tool_calls": [
+            call("e", "edit_file", path="./app.py", old_string="a - b", new_string="a + b")]},
+        {"role": "tool", "tool_call_id": "e", "content": "updated app.py (+1 -1)"},
+    ]
+    for n in range(4):
+        msgs += [{"role": "assistant", "content": "", "tool_calls": [call(f"g{n}", "grep", pattern=f"p{n}")]},
+                 {"role": "tool", "tool_call_id": f"g{n}", "content": f"match {n}\n" + "g" * 4000}]
+    return msgs
+
+
+FAILED = "Tests for . failed (exit code 1), 0.4s. Full log: /x"
+PASSED = "Tests for . passed, 0.4s. Full log: /x"
+
+
+def test_the_failing_report_and_the_file_being_edited_survive_stubbing():
+    msgs = fix_session(FAILED)
+    c, log = make(context_tokens=12_000, keep_tool_results=1)
+    c.maybe_compact(msgs)
+    by_id = {m["tool_call_id"]: m["content"] for m in msgs if m["role"] == "tool"}
+    assert by_id["t"].startswith(FAILED)
+    assert by_id["a"].startswith("def add")
+    assert all(by_id[f"g{n}"].startswith(compaction.STUB_PREFIX) for n in range(3))
+    assert "app.py" not in log["forgot"]  # it's still in view, so it can still be edited
+
+
+def test_a_passing_report_is_not_pinned():
+    msgs = fix_session(PASSED)
+    c, _ = make(context_tokens=12_000, keep_tool_results=1)
+    c.maybe_compact(msgs)
+    assert next(m for m in msgs if m.get("tool_call_id") == "t")["content"].startswith(compaction.STUB_PREFIX)
+
+
+def test_only_the_newest_test_report_counts():
+    msgs = fix_session(FAILED)
+    msgs += [{"role": "assistant", "content": "", "tool_calls": [call("t2", "run_tests", path=".")]},
+             {"role": "tool", "tool_call_id": "t2", "content": PASSED}]
+    assert 2 not in compaction.pinned(msgs)[0]
+
+
+def test_a_failing_report_in_summarised_turns_is_carried_into_the_summary():
+    msgs = fix_session(FAILED)
+    msgs += [{"role": "assistant", "content": "I see the bug."},
+             {"role": "user", "content": "go on"}, {"role": "assistant", "content": "x" * 3000},
+             {"role": "user", "content": "and?"}, {"role": "assistant", "content": "y" * 3000}]
+    c, _ = make(context_tokens=9_000, keep_turns=2, keep_tool_results=0)
+    c.maybe_compact(msgs)
+    first = msgs[0]["content"]
+    assert first.startswith(f"<{compaction.SUMMARY_TAG}>")
+    assert "still failing" in first and FAILED in first

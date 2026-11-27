@@ -117,6 +117,20 @@ class ToolResult:
     hard_stop: bool = False
 
 
+@dataclass(frozen=True)
+class TestRun:
+    """One run_tests call: what it covered, whether it passed, and the files
+    the model had written at that moment (path -> sha256), so a later check
+    can tell whether anything changed since."""
+    path: str  # workspace-relative file or directory ("." for everything)
+    passed: bool
+    writes: tuple[tuple[str, str | None], ...]
+    __test__ = False  # not a pytest test class, despite the name
+
+    def covers(self, rel: str) -> bool:
+        return self.path == "." or rel == self.path or rel.startswith(self.path.rstrip("/") + "/")
+
+
 # ------------------------------------------------------------- workspace ---
 
 class Workspace:
@@ -366,6 +380,8 @@ class Toolbox:
         # Did a test run fail in this turn? The chat then offers to let the
         # model fix it.
         self.tests_failed = False
+        # Every test run this session, oldest first (see TestRun).
+        self.test_runs: list[TestRun] = []
         self._turn_label = ""
         self._checkpointed = False  # this turn already has its snapshot
         self.approver = approver
@@ -406,6 +422,11 @@ class Toolbox:
         self.allowed_hosts = {h.lower() for h in limits.web_allowed_hosts}
         self.fetcher = web.Fetcher(self._allow, timeout=limits.web_timeout,
                                    allow_private=limits.web_allow_private)
+
+    def writes_snapshot(self) -> tuple[tuple[str, str | None], ...]:
+        """The files the model has written and their content hashes, comparable
+        between calls: equal snapshots mean no edit happened in between."""
+        return tuple(sorted((self.ws.rel(p), h) for p, h in self.model_writes.items()))
 
     def reset(self) -> None:
         """Forget what the model has read, checked and fetched (e.g. after /clear)."""
@@ -935,6 +956,7 @@ class Toolbox:
         header = (f"Tests for {rel} {status}, {outcome.duration:.1f}s. Full log: {outcome.log_path}\n"
                   f"{notes}{changed}--- {'summary' if passed or none_found else 'failures and summary'} ---\n")
         self.tests_failed = not passed and not none_found
+        self.test_runs.append(TestRun(rel, passed, self.writes_snapshot()))
         if passed:
             footer = "\n--- end ---\nNow tell the user the result briefly. Don't call any more tools."
         elif none_found:
