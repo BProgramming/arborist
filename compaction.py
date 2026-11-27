@@ -18,12 +18,19 @@ and most faithful first, stopping as soon as it's under `target`:
 3. If that still isn't enough (one enormous turn), the newest tool results
    are cut down to the last two.
 
+Two tool results are kept through all of this while they matter: the newest
+test report, when it failed (the model is fixing exactly that), and the newest
+read of the file the model last edited (the file it's working on). Tier 2
+carries a failing report over into the summary.
+
 Token counts are estimated from characters, with the ratio recalibrated
 from the server's reported prompt size after every request.
 """
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, fields
 from typing import Callable
 
@@ -31,6 +38,7 @@ STUB_PREFIX = "[compacted]"
 SUMMARY_TAG = "earlier_conversation_summary"
 _BIG_ARGS = ("content", "old_string", "new_string")
 _KEEP_SHORT = 300  # results shorter than this ("updated a.py (+3 -1)") are kept
+_FAILING = re.compile(r"Tests for .* (failed|timed out)")
 
 SUMMARY_INSTRUCTIONS = """\
 Above is the earlier part of a coding session between a user and an AI \
@@ -141,7 +149,8 @@ class Compactor:
     def _stub_tool_results(self, messages: list[dict], keep: int) -> int:
         calls = _calls_by_id(messages)
         tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-        old = tool_idx[:-keep] if keep else tool_idx
+        pins, pinned_file = pinned(messages)
+        old = [i for i in (tool_idx[:-keep] if keep else tool_idx) if i not in pins]
         count = 0
         for i in old:
             m = messages[i]
@@ -152,7 +161,8 @@ class Compactor:
             messages[i] = {**m, "content": f"{STUB_PREFIX} The output of {_describe(name, args)} "
                                            "was removed to save context. Call it again if you "
                                            "need it."}
-            if name == "read_file" and isinstance(args.get("path"), str):
+            if name == "read_file" and isinstance(args.get("path"), str) \
+                    and _norm(args["path"]) != pinned_file:
                 self.forget_file(args["path"])
             count += 1
         # Big arguments (whole files in write_file, long edits) in old calls.
@@ -184,6 +194,8 @@ class Compactor:
             return 0
         cut = starts[len(starts) - self.s.keep_turns]
         old, kept = messages[:cut], messages[cut:]
+        failing = next((messages[i].get("content") or "" for i in pinned(messages)[0]
+                        if i < cut and _FAILING.match(messages[i].get("content") or "")), "")
 
         self._collect_changed_files(old)
         for name, args in _calls_by_id(old).values():
@@ -204,6 +216,9 @@ class Compactor:
         files = ""
         if self.files_changed:
             files = "\n\nFiles changed earlier in this session: " + ", ".join(self.files_changed)
+        if failing:
+            files += ("\n\nThe latest test run, which is still failing, as it was:\n"
+                      + _clip(failing, budget // 4))
         block = (f"<{SUMMARY_TAG}>\n(Earlier turns of this conversation were compressed to save "
                  "context. Read a file again before editing it.)\n\n"
                  f"{summary}{files}\n</{SUMMARY_TAG}>")
@@ -221,6 +236,41 @@ class Compactor:
 
 
 # ------------------------------------------------------------------ helpers ---
+
+def _norm(path: str) -> str:
+    return os.path.normpath(path.strip())
+
+
+def pinned(messages: list[dict]) -> tuple[set[int], str | None]:
+    """Tool results compaction keeps: the newest test report if it failed, and
+    the newest read of the file edited last. Returns (indices, that file)."""
+    calls = _calls_by_id(messages)
+    keep: set[int] = set()
+    tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    runs = [i for i in tool_idx if calls.get(messages[i].get("tool_call_id"), ("",))[0] == "run_tests"]
+    if runs and _FAILING.match(messages[runs[-1]].get("content") or ""):
+        keep.add(runs[-1])
+    edited = None
+    for m in reversed(messages):
+        for tc in reversed(m.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            path = _parse(fn.get("arguments")).get("path")
+            if fn.get("name") in ("edit_file", "write_file") and isinstance(path, str):
+                edited = _norm(path)
+                break
+        if edited:
+            break
+    if edited:
+        for i in reversed(tool_idx):
+            m = messages[i]
+            name, args = calls.get(m.get("tool_call_id"), ("", {}))
+            if name == "read_file" and isinstance(args.get("path"), str) \
+                    and _norm(args["path"]) == edited:
+                if not (m.get("content") or "").startswith(STUB_PREFIX):
+                    keep.add(i)
+                break
+    return keep, edited
+
 
 def turn_starts(messages: list[dict]) -> list[int]:
     """Indices of the user's own messages. The harness's notes to the model

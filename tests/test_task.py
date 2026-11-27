@@ -230,6 +230,79 @@ def test_the_task_ends_after_max_turns(repo, cfg):
     assert report["status"] == "out_of_turns" and report["turns"] == 2
 
 
+# -------------------------------------------------------------------- plan ---
+
+@sandboxed
+def test_a_planned_task_writes_the_test_first_and_cant_tick_off_unproven_steps(repo, cfg):
+    test_file = "from app import add\n\ndef test_add():\n    assert add(2, 2) == 4\n"
+    write_test = {"step": "write the test", "status": "done"}
+    fix = {"step": "fix add()", "test": "test_app.py"}
+    client = FakeClient(
+        tool_reply(("update_plan", {"items": [{**write_test, "status": "in_progress"},
+                                              {**fix, "status": "pending"}]})),
+        tool_reply(("write_file", {"path": "test_app.py", "content": test_file})),
+        tool_reply(("update_plan", {"items": [write_test, {**fix, "status": "done"}]})),  # too early
+        tool_reply(("run_tests", {"path": "test_app.py"})),
+        text_reply("add() subtracts."),
+        tool_reply(("read_file", {"path": "app.py"})),
+        tool_reply(("edit_file", {"path": "app.py", "old_string": "a - b", "new_string": "a + b"})),
+        tool_reply(("run_tests", {"path": "test_app.py"})),
+        text_reply("Passes now."),
+        tool_reply(("update_plan", {"items": [write_test, {**fix, "status": "done"}]})),
+        text_reply(REPORT),
+    )
+    report = task.run_task(cfg(), repo, "Fix add() in app.py; add a test.", client=client)
+
+    msgs = client.requests[-1]["messages"]
+    plan_results = [m["content"] for m in msgs if m["role"] == "tool" and "Plan updated" in m["content"]]
+    assert "step 2 is still open: run_tests hasn't been run on test_app.py yet" in plan_results[1]
+    assert "Every step is done" in plan_results[2]
+    users = [m["content"] for m in msgs if m["role"] == "user"]
+    # Each go-ahead carries the plan and names the next step.
+    assert users[1].startswith(task.FIX) and "Your plan:" in users[1]
+    assert "Next: step 2, fix add(). It's done when run_tests on test_app.py passes." in users[1]
+    assert report["status"] == "done"
+    assert report["plan"]["open"] == [] and report["plan"]["stale"] == []
+    assert report["plan"]["dropped"] == []
+    assert report["plan"]["unchecked"] == ["write the test"]
+    assert [s["passed"] for s in report["plan"]["steps"]] == [False, True]
+
+
+def test_finishing_with_steps_open_is_sent_back_then_reported(repo, cfg, no_sandbox_check):
+    client = FakeClient(
+        tool_reply(("update_plan", {"items": [{"step": "a", "status": "in_progress"},
+                                              {"step": "b", "status": "pending"}]})),
+        text_reply(REPORT),
+        text_reply(REPORT),
+        text_reply(REPORT),
+    )
+    report = task.run_task(cfg(), repo, "Do a and b.", client=client)
+    users = [m["content"] for m in client.requests[-1]["messages"] if m["role"] == "user"]
+    assert sum(u.startswith(task.STEPS_OPEN) for u in users) == task.MAX_IDLE_NUDGES
+    assert report["status"] == "plan_incomplete"
+    assert report["plan"]["open"] == ["a", "b"]
+
+
+def test_a_task_without_a_plan_finishes_as_before(repo, cfg, no_sandbox_check):
+    report = task.run_task(cfg(), repo, "Say hi.", client=FakeClient(text_reply(REPORT)))
+    assert report["status"] == "done" and report["plan"] is None
+
+
+def test_status_shows_the_plan(repo, cfg, no_sandbox_check):
+    c = cfg()
+    client = FakeClient(
+        tool_reply(("update_plan", {"items": [{"step": "a", "status": "done"},
+                                              {"step": "b", "status": "in_progress"}]})),
+        text_reply("RESULT: BLOCKED\nNOTES: b needs a decision"),
+    )
+    report = task.run_task(c, repo, "Do a and b.", client=client)
+    assert report["status"] == "blocked"
+    out = task.task_status(c, report["id"])
+    assert "plan: 1 of 2 step(s) done" in out
+    assert "1. [x] a  (no test)" in out and "2. [>] b" in out
+    assert "update_plan" in {t["function"]["name"] for t in client.requests[0]["tools"]}
+
+
 # ---------------------------------------------------------------- commands ---
 
 def test_list_and_clean(repo, cfg, no_sandbox_check):
